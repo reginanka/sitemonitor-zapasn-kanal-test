@@ -1838,7 +1838,7 @@
       "queue_key": "3.1",
       "date": "01.07.2026",
       "span": "18:00-18:30",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 3,
@@ -1846,7 +1846,7 @@
       "queue_key": "3.1",
       "date": "01.07.2026",
       "span": "18:30-19:00",
-      "color": "red"
+      "color": "white"
     },
     {
       "cherga": 3,
