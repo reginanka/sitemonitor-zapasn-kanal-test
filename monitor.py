@@ -402,7 +402,7 @@ def build_changes_notification(
             
             parts.append("")  # Порожній рядок після КОЖНОЇ черги
         
-        parts.append("======\n")
+        parts.append("\n")
     
     # Посилання
     parts.append(
