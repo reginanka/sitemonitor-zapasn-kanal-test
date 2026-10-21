@@ -1,0 +1,51 @@
+name: Monitor Ukrenergo 2
+
+on:
+  schedule:
+    # Кожні 5 хвилин (окремий від офіційного ukrenergo.yml)
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ukrenergo2:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+      TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
+      SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
+      # обов'язково: URL на regions.json
+      UKRENERGO2_REGIONS_URL: ${{ secrets.UKRENERGO2_REGIONS_URL }}
+      # опційно: за замовчуванням zhytomyr
+      UKRENERGO2_REGION_SLUG: ${{ secrets.UKRENERGO2_REGION_SLUG }}
+      UKRENERGO2_REGION_NAME: ${{ secrets.UKRENERGO2_REGION_NAME }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests python-telegram-bot==20.8 pytz
+
+      - name: Run Ukrenergo 2 monitor
+        run: python ukrenergo2_monitor.py
+
+      - name: Commit state
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/ukrenergo2_state.json || true
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update Ukrenergo2 state [skip ci]"
+
+      - name: Push changes
+        run: git push || true
