@@ -1,9 +1,6 @@
 name: Monitor Ukrenergo 2
 
 on:
-  schedule:
-    # Кожні 5 хвилин (окремий від офіційного ukrenergo.yml)
-    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
