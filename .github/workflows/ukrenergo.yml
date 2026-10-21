@@ -1,0 +1,49 @@
+name: Monitor Ukrenergo
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ukrenergo:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      UKRENERGO_API_BASE: ${{ secrets.UKRENERGO_API_BASE }}
+      UKRENERGO_MATRIX_KEY: ${{ secrets.UKRENERGO_MATRIX_KEY }}
+      UKRENERGO_REGION_ID: ${{ secrets.UKRENERGO_REGION_ID }}
+      UKRENERGO_REGION_NAME: ${{ secrets.UKRENERGO_REGION_NAME }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+      TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
+      SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Ukrenergo monitor
+        run: python ukrenergo_monitor.py
+
+      - name: Commit state
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/ukrenergo_state.json || true
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update Ukrenergo state [skip ci]"
+
+      - name: Push changes
+        run: git push || true
