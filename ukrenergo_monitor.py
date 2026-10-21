@@ -2,7 +2,7 @@
 
 Порівнює знімок (код стану + version + текст + рекомендація + заплановані зміни)
 з data/ukrenergo_state.json. Публічне сповіщення лише якщо знімок змінився.
-Перший запуск лише зберігає базовий стан.
+Перший запуск лише зберігає базовий стан. 
 """
 
 import html
@@ -32,8 +32,6 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 STATE_FILE = DATA_DIR / "ukrenergo_state.json"
 
-# Запасний довідник, якщо getStates не повернув цей id.
-# Актуальні назви все одно беруться з API.
 FALLBACK_STATES = {
     3: ("Електроенергії достатньо", "Споживання в межах можливостей енергосистеми."),
     4: ("Будь ласка, споживайте електроенергію ощадливо", "Енергосистема працює з дефіцитом."),
@@ -63,7 +61,6 @@ def api_get(path: str, params: Optional[Dict] = None) -> Any:
             timeout=25,
         )
     except requests.RequestException as e:
-        # не світимо хост у логах репозиторію
         raise RuntimeError(f"{endpoint}: мережева помилка ({type(e).__name__})") from None
     if resp.status_code >= 400:
         raise RuntimeError(f"{endpoint}: HTTP {resp.status_code}")
