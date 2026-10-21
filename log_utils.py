@@ -20,13 +20,13 @@ def log_to_buffer(message: str) -> None:
     print(line)
     log_messages.append(line)
 
-def send_log_to_channel() -> None:
+def send_log_to_channel(title: str = "📊 ЛОГ ВИКОНАННЯ СКРИПТА · ЖОЕ") -> None:
     if not TELEGRAM_LOG_CHANNEL_ID or not TELEGRAM_BOT_TOKEN or not log_messages:
         return
     
     try:
         # Формуємо повний текст логу
-        header = "📊 ЛОГ ВИКОНАННЯ СКРИПТА\n\n"
+        header = f"{title}\n\n"
         footer = (
             f"\n\n⏰ Завершено: "
             f"{get_ukraine_time().strftime('%d.%m.%Y %H:%M:%S')} (Київський час)"
