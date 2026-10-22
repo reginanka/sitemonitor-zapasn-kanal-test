@@ -3,15 +3,17 @@
 URL regions.json береться з секрету UKRENERGO2_REGIONS_URL (не хардкодиться).
 
 Окремий скрипт від офіційного ukrenergo_monitor.py (API з Matrix-ключем).
-Порівнює status + status_code для обраного регіону з data/ukrenergo2_state.json.
+Порівнює status + status_code для обраного регіону з MongoDB (колекція ukrenergo2_states).
 Публічне сповіщення лише при зміні. Перший запуск лише зберігає базовий стан.
+
+Файл data/ukrenergo2_state.json більше НЕ використовується і НЕ комітиться в git.
 """
 
+from __future__ import annotations
+
 import html
-import json
 import os
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
@@ -27,9 +29,25 @@ REGION_NAME_OVERRIDE = (os.getenv("UKRENERGO2_REGION_NAME") or "").strip()
 SUBSCRIBE = os.getenv("SUBSCRIBE", "")
 STALE_HOURS = 2
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-STATE_FILE = DATA_DIR / "ukrenergo2_state.json"
+# Mongo: той самий URI, що для Маячка (або окремий)
+MONGO_URI = (
+    os.getenv("MAYACHOK_MONGO_URI")
+    or os.getenv("MONGO_URI")
+    or ""
+).strip()
+MONGO_DB = (
+    os.getenv("MAYACHOK_MONGO_DB")
+    or os.getenv("MONGO_DB_NAME")
+    or "powerbot"
+).strip()
+# Колекція стану Укренерго 2
+COLLECTION = "ukrenergo2_states"
+# Опційно дублюємо в regionstatuses (схема бота Маячок)
+SYNC_REGIONSTATUS = (os.getenv("UKRENERGO2_SYNC_REGIONSTATUS") or "1").strip() not in (
+    "0",
+    "false",
+    "no",
+)
 
 # Коди збігаються з офіційним dictionary/getStates і з FALLBACK_STATES у ukrenergo_monitor.py
 STATUS_META = {
@@ -65,23 +83,82 @@ def esc(value: Any) -> str:
     return html.escape("" if value is None else str(value))
 
 
+def _get_db():
+    if not MONGO_URI:
+        raise RuntimeError(
+            "MAYACHOK_MONGO_URI (або MONGO_URI) не задано — "
+            "стан Укренерго 2 зберігається в MongoDB"
+        )
+    from pymongo import MongoClient
+
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+    client.admin.command("ping")
+    return client[MONGO_DB]
+
+
 def load_state() -> Dict:
-    if not STATE_FILE.exists():
-        return {}
+    """Читає попередній знімок з Mongo по slug."""
     try:
-        with STATE_FILE.open(encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        db = _get_db()
+        doc = db[COLLECTION].find_one({"slug": REGION_SLUG}, {"_id": 0})
+        if not doc:
+            log_to_buffer(f"📋 Mongo: стану для slug={REGION_SLUG} ще немає")
+            return {}
+        log_to_buffer(
+            f"📋 Mongo: завантажено стан "
+            f"{doc.get('status')}/{doc.get('status_code')} "
+            f"(checked_at={doc.get('checked_at')})"
+        )
+        return doc
     except Exception as e:
-        log_to_buffer(f"⚠️ Не вдалось прочитати {STATE_FILE.name}: {e}")
+        log_to_buffer(f"⚠️ Не вдалось прочитати стан з Mongo: {e}")
         return {}
 
 
 def save_state(snapshot: Dict) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with STATE_FILE.open("w", encoding="utf-8") as f:
-        json.dump(snapshot, f, ensure_ascii=False, indent=2)
-    log_to_buffer(f"💾 Стан збережено в {STATE_FILE.name}")
+    """Upsert знімка в Mongo (+ опційно regionstatuses для бота)."""
+    db = _get_db()
+    doc = dict(snapshot)
+    doc["slug"] = REGION_SLUG
+    doc["updatedAt"] = datetime.utcnow()
+
+    db[COLLECTION].update_one(
+        {"slug": REGION_SLUG},
+        {"$set": doc},
+        upsert=True,
+    )
+    log_to_buffer(
+        f"💾 Mongo: стан збережено в {COLLECTION} "
+        f"(slug={REGION_SLUG}, status={doc.get('status')})"
+    )
+
+    if SYNC_REGIONSTATUS:
+        try:
+            period = doc.get("period") or {}
+            region_doc = {
+                "slug": REGION_SLUG,
+                "status": doc.get("status") or "",
+                "statusCode": doc.get("status_code"),
+                "emoji": doc.get("emoji"),
+                "title": doc.get("title_uk") or doc.get("title"),
+                "since": doc.get("since"),
+                "period": {
+                    "start": period.get("start") if isinstance(period, dict) else None,
+                    "end": period.get("end") if isinstance(period, dict) else None,
+                },
+                "generatedAt": doc.get("generated_at"),
+                "changedAt": doc.get("changed_at"),
+                "fetchedAt": datetime.utcnow(),
+                "updatedAt": datetime.utcnow(),
+            }
+            db["regionstatuses"].update_one(
+                {"slug": REGION_SLUG},
+                {"$set": region_doc},
+                upsert=True,
+            )
+            log_to_buffer("💾 Mongo: regionstatuses синхронізовано")
+        except Exception as e:
+            log_to_buffer(f"⚠️ regionstatuses sync: {e}")
 
 
 def is_stale(generated_at: Optional[str]) -> bool:
@@ -100,9 +177,9 @@ def fetch_regions() -> Dict[str, Any]:
             "UKRENERGO2_REGIONS_URL не задано "
             "(потрібен секрет з посиланням на regions.json)"
         )
-    # У лог — лише хост, без повного шляху
     try:
         from urllib.parse import urlparse
+
         host = urlparse(REGIONS_URL).netloc or "…"
     except Exception:
         host = "…"
@@ -129,10 +206,9 @@ def fmt_kyiv(iso: Optional[str]) -> str:
         return ""
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        # Europe/Kyiv ≈ UTC+2/+3; для відображення достатньо +3 у більшості випадків,
-        # точніше через pytz якщо треба
         try:
             import pytz
+
             dt = dt.astimezone(pytz.timezone("Europe/Kyiv"))
         except Exception:
             dt = dt.astimezone(timezone(timedelta(hours=3)))
@@ -177,24 +253,24 @@ def slug_title(slug: str) -> str:
 
 def comparable(snapshot: Dict) -> Dict:
     """Що порівнюємо для рішення «чи змінилось»."""
+    period = snapshot.get("period") or {}
     return {
         "status": snapshot.get("status"),
         "status_code": snapshot.get("status_code"),
         "title_uk": snapshot.get("title_uk"),
         "since": snapshot.get("since"),
-        "period": snapshot.get("period"),
+        "period_start": period.get("start") if isinstance(period, dict) else None,
+        "period_end": period.get("end") if isinstance(period, dict) else None,
     }
 
 
 def format_message(prev: Dict, cur: Dict, stale: bool) -> str:
     lines = [
-        "⚡️ <b>Укренерго 2</b> <i>(неофіційне джерело)</i>",
-        f"📍 {esc(cur.get('name_uk'))}",
+        f"{cur.get('emoji') or '⚡️'} <b>Укренерго</b>",
+        f"📍 {esc(cur.get('name_uk') or REGION_SLUG)}",
         "",
-        f"Було: {esc(prev.get('emoji') or '')} {esc(prev.get('title_uk') or '—')} "
-        f"(код {esc(prev.get('status_code'))})",
-        f"Стало: {esc(cur.get('emoji') or '')} <b>{esc(cur.get('title_uk'))}</b> "
-        f"(код {esc(cur.get('status_code'))})",
+        f"Було: {esc(prev.get('title_uk') or prev.get('status') or '—')}",
+        f"Стало: <b>{esc(cur.get('title_uk') or cur.get('status'))}</b>",
     ]
 
     since_str = fmt_kyiv(cur.get("since"))
@@ -243,10 +319,19 @@ def main() -> None:
         previous = load_state()
         if not previous:
             save_state(current)
-            log_to_buffer("📋 Базовий стан збережено, сповіщення не шлю")
+            log_to_buffer("📋 Базовий стан збережено в Mongo, сповіщення не шлю")
             return
 
         if comparable(previous) == comparable(current):
+            # Оновлюємо лише checked_at, без сповіщення
+            try:
+                db = _get_db()
+                db[COLLECTION].update_one(
+                    {"slug": REGION_SLUG},
+                    {"$set": {"checked_at": current.get("checked_at")}},
+                )
+            except Exception:
+                pass
             log_to_buffer("✅ Статус регіону не змінився")
             return
 
@@ -260,7 +345,7 @@ def main() -> None:
             log_to_buffer("❌ Не вдалось надіслати сповіщення, стан не перезаписую")
             return
         save_state(current)
-        log_to_buffer("✅ Сповіщення надіслано, стан збережено")
+        log_to_buffer("✅ Сповіщення надіслано, стан збережено в Mongo")
     except Exception as e:
         log_to_buffer(f"❌ Критична помилка Укренерго 2: {e}")
     finally:
