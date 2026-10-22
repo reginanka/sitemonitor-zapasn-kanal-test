@@ -49,34 +49,50 @@ SYNC_REGIONSTATUS = (os.getenv("UKRENERGO2_SYNC_REGIONSTATUS") or "1").strip() n
     "no",
 )
 
-# Коди збігаються з офіційним dictionary/getStates і з FALLBACK_STATES у ukrenergo_monitor.py
-STATUS_META = {
-    "normal": {
-        "code": 3,
-        "emoji": "🟢",
-        "title_uk": "Електроенергії достатньо",
-    },
-    "shortage": {
-        "code": 4,
-        "emoji": "🟡",
-        "title_uk": "Будь ласка, споживайте електроенергію ощадливо",
-    },
-    "outage_schedules": {
-        "code": 9,
-        "emoji": "🔴",
-        "title_uk": "Застосовані графіки погодинних відключень",
-    },
-    "emergency_outages": {
-        "code": 10,
-        "emoji": "🚨",
-        "title_uk": "Застосовані аварійні відключення",
-    },
-    "grid_damage": {
-        "code": 11,
-        "emoji": "⚫️",
-        "title_uk": "Знеструмлення – наслідок пошкодження мережі",
-    },
+# Коди + тексти для каналу (стиль офіційних повідомлень Укренерго)
+# code -> (title, body). body може містити {region}
+STATUS_BY_CODE = {
+    3: (
+        "Електроенергії достатньо",
+        "Користуйтеся електроприладами у звичайному режимі.",
+    ),
+    4: (
+        "Будь ласка, споживайте електроенергію ощадливо",
+        "Через пошкодження мереж та об'єктів генерації – енергосистемі складно "
+        "забезпечити потреби всіх споживачів у вашому регіоні. Будь ласка, не вмикайте "
+        "кілька потужних електроприладів одночасно. Кондиціонер, обігрівач, чайник, "
+        "фен, пилосос, електроплиту та праску - використовуйте почергово.",
+    ),
+    9: (
+        "Застосовані графіки погодинних відключень",
+        "Внаслідок складної ситуації в енергосистемі – вимушено запроваджені графіки "
+        "погодинних відключень. Будь ласка, не користуйтесь потужними електроприладами "
+        "до скасування обмежень.",
+    ),
+    10: (
+        "Застосовані аварійні відключення",
+        "Ситуація в енергосистемі є дуже складною. У вашому регіоні застосовані аварійні "
+        "відключення. Раніше оприлюднені графіки погодинних відключень наразі не діють. "
+        "Якщо зараз у вас є електроенергія – споживайте її максимально ощадливо.",
+    ),
+    11: (
+        "Знеструмлення – наслідок пошкодження мережі",
+        "Живлення відсутнє через пошкодження мережі. Раніше оприлюднені графіки "
+        "погодинних відключень наразі не діють. Якщо зараз у вас є електроенергія – "
+        "споживайте її максимально ощадливо.",
+    ),
 }
+
+# slug / API status key -> code + emoji (для snapshot)
+STATUS_META = {
+    "normal": {"code": 3, "emoji": "🟢", "title_uk": STATUS_BY_CODE[3][0]},
+    "shortage": {"code": 4, "emoji": "🟡", "title_uk": STATUS_BY_CODE[4][0]},
+    "outage_schedules": {"code": 9, "emoji": "🔴", "title_uk": STATUS_BY_CODE[9][0]},
+    "emergency_outages": {"code": 10, "emoji": "🚨", "title_uk": STATUS_BY_CODE[10][0]},
+    "grid_damage": {"code": 11, "emoji": "⚫️", "title_uk": STATUS_BY_CODE[11][0]},
+}
+
+UKRENERGO_SITE_URL = (os.getenv("UKRENERGO_SITE_URL") or "https://ua.energy").strip()
 
 
 def esc(value: Any) -> str:
@@ -265,37 +281,134 @@ def comparable(snapshot: Dict) -> Dict:
 
 
 def format_message(prev: Dict, cur: Dict, stale: bool) -> str:
+    """Повідомлення в канал у стилі офіційних інфо Укренерго."""
+    code = cur.get("status_code")
+    try:
+        code = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code = None
+
+    # fallback через status key
+    if code not in STATUS_BY_CODE:
+        meta = STATUS_META.get(cur.get("status") or "", {})
+        code = meta.get("code")
+
+    region = cur.get("name_uk") or slug_title(REGION_SLUG)
+
+    if code in STATUS_BY_CODE:
+        title, body = STATUS_BY_CODE[code]
+    else:
+        title = cur.get("title_uk") or cur.get("status") or "Оновлення статусу"
+        body = "Стан енергосистеми оновлено."
+
+    # Для кодів 3 і 9 у заголовку згадуємо область (як у твоєму прикладі)
+    if code == 3:
+        title_line = f"Електроенергії для {region} достатньо"
+    elif code == 9:
+        title_line = f"Застосовані графіки погодинних відключень для {region}."
+    else:
+        title_line = title
+
     lines = [
-        f"{cur.get('emoji') or '⚡️'} <b>Укренерго</b>",
-        f"📍 {esc(cur.get('name_uk') or REGION_SLUG)}",
+        "Укренерго інформує -",
+        esc(title_line),
         "",
-        f"Було: {esc(prev.get('title_uk') or prev.get('status') or '—')}",
-        f"Стало: <b>{esc(cur.get('title_uk') or cur.get('status'))}</b>",
+        esc(body),
     ]
 
-    since_str = fmt_kyiv(cur.get("since"))
-    if since_str:
-        lines.append(f"🕐 Діє з: {esc(since_str)} (Київ)")
-
-    period = cur.get("period") or {}
-    if isinstance(period, dict) and (period.get("start") or period.get("end")):
-        p_parts = []
-        if period.get("start"):
-            p_parts.append(f"з {fmt_kyiv(period['start'])}")
-        if period.get("end"):
-            p_parts.append(f"до {fmt_kyiv(period['end'])}")
-        if p_parts:
-            lines.append(f"📅 Період: {esc(' '.join(p_parts))}")
+    # Прогнозований період — не для «достатньо» (код 3)
+    if code != 3:
+        period_block = _format_period_block(cur.get("period"))
+        if period_block:
+            lines.append("")
+            lines.extend(period_block)
 
     lines.append("")
-    lines.append("Джерело: Укренерго 2 (неофіційно, без гарантій) · НЕК «Укренерго»")
-    if stale:
-        lines.append(
-            f"⚠️ Дані можуть бути застарілими (generated_at={esc(cur.get('generated_at'))})"
+    footer_parts = []
+    if UKRENERGO_SITE_URL:
+        footer_parts.append(
+            f'<a href="{esc(UKRENERGO_SITE_URL)}">Сайт НЕК «Укренерго»</a>'
         )
     if SUBSCRIBE:
-        lines.append(f'<a href="{esc(SUBSCRIBE)}">⚡️ ПІДПИСАТИСЯ</a>')
+        footer_parts.append(f'<a href="{esc(SUBSCRIBE)}">⚡️ ПІДПИСАТИСЯ</a>')
+    if footer_parts:
+        lines.append(" | ".join(footer_parts))
+
+    # Час повідомлення (Київ)
+    now_str = _now_kyiv_hm()
+    if now_str:
+        lines.append(f"🕐 {esc(now_str)}")
+
+    if stale:
+        lines.append("")
+        lines.append(
+            f"⚠️ Дані можуть бути застарілими "
+            f"(generated_at={esc(cur.get('generated_at'))})"
+        )
+
     return "\n".join(lines)
+
+
+def _now_kyiv_hm() -> str:
+    try:
+        import pytz
+
+        now = datetime.now(pytz.timezone("Europe/Kyiv"))
+    except Exception:
+        now = datetime.now(timezone(timedelta(hours=3)))
+    return now.strftime("%H:%M %d.%m")
+
+
+def _format_period_block(period) -> list:
+    """
+    Один день:  Прогнозований період: 06:00-23:59
+    Різні дні:  Прогнозований період:
+                з 22:00 (16.10)
+                до 01:00 (17.10)
+    """
+    if not isinstance(period, dict):
+        return []
+    start = period.get("start")
+    end = period.get("end")
+    if not start and not end:
+        return []
+
+    def _parts(iso: str):
+        if not iso:
+            return None, None
+        try:
+            dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+            try:
+                import pytz
+
+                dt = dt.astimezone(pytz.timezone("Europe/Kyiv"))
+            except Exception:
+                dt = dt.astimezone(timezone(timedelta(hours=3)))
+            return dt.strftime("%H:%M"), dt.strftime("%d.%m")
+        except Exception:
+            return None, None
+
+    sh, sd = _parts(start) if start else (None, None)
+    eh, ed = _parts(end) if end else (None, None)
+
+    if not sh and not eh:
+        return []
+
+    # один календарний день
+    if sd and ed and sd == ed and sh and eh:
+        return [f"Прогнозований період: {sh}-{eh}"]
+
+    lines = ["Прогнозований період:"]
+    if sh and sd:
+        lines.append(f"з {sh} ({sd})")
+    elif sh:
+        lines.append(f"з {sh}")
+    if eh and ed:
+        lines.append(f"до {eh} ({ed})")
+    elif eh:
+        lines.append(f"до {eh}")
+    return lines
+
 
 
 def main() -> None:
