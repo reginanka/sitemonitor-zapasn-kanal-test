@@ -52,47 +52,56 @@ SYNC_REGIONSTATUS = (os.getenv("UKRENERGO2_SYNC_REGIONSTATUS") or "1").strip() n
 # Коди + тексти для каналу (стиль офіційних повідомлень Укренерго)
 # code -> (title, body). body може містити {region}
 STATUS_BY_CODE = {
+    # code: (emoji, title_template with {region_gen}/{region_loc}, body)
     3: (
-        "Електроенергії достатньо",
+        "🟢",
+        "Електроенергії для {region_gen} достатньо",
         "Користуйтеся електроприладами у звичайному режимі.",
     ),
     4: (
-        "Будь ласка, споживайте електроенергію ощадливо",
+        "🟡",
+        "Будь ласка, споживайте електроенергію ощадливо в {region_loc}",
         "Через пошкодження мереж та об'єктів генерації – енергосистемі складно "
         "забезпечити потреби всіх споживачів у вашому регіоні. Будь ласка, не вмикайте "
         "кілька потужних електроприладів одночасно. Кондиціонер, обігрівач, чайник, "
         "фен, пилосос, електроплиту та праску - використовуйте почергово.",
     ),
     9: (
-        "Застосовані графіки погодинних відключень",
+        "🟠",
+        "Застосовані графіки погодинних відключень для {region_gen}.",
         "Внаслідок складної ситуації в енергосистемі – вимушено запроваджені графіки "
         "погодинних відключень. Будь ласка, не користуйтесь потужними електроприладами "
         "до скасування обмежень.",
     ),
     10: (
-        "Застосовані аварійні відключення",
+        "🔴",
+        "Застосовані аварійні відключення в {region_loc}",
         "Ситуація в енергосистемі є дуже складною. У вашому регіоні застосовані аварійні "
         "відключення. Раніше оприлюднені графіки погодинних відключень наразі не діють. "
         "Якщо зараз у вас є електроенергія – споживайте її максимально ощадливо.",
     ),
     11: (
-        "Знеструмлення – наслідок пошкодження мережі",
-        "Живлення відсутнє через пошкодження мережі. Раніше оприлюднені графіки "
-        "погодинних відключень наразі не діють. Якщо зараз у вас є електроенергія – "
-        "споживайте її максимально ощадливо.",
+        "🚨",
+        "Знеструмлення – наслідок пошкодження мережі в {region_loc}",
+        "Значна кількість абонентів – знеструмлена внаслідок пошкодження елементів "
+        "мережі, що забезпечували живлення побутових споживачів та об'єктів "
+        "інфраструктури. Раніше оприлюднені графіки погодинних відключень за командою "
+        "«Укренерго» наразі не діють. Тривалість відновлювальних робіт залежить від "
+        "безпекової ситуації у регіоні. Якщо зараз у вас є електроенергія – споживайте "
+        "її максимально ощадливо.",
     ),
 }
 
-# slug / API status key -> code + emoji (для snapshot)
+# slug / API status key -> code (emoji/title беруться з STATUS_BY_CODE)
 STATUS_META = {
-    "normal": {"code": 3, "emoji": "🟢", "title_uk": STATUS_BY_CODE[3][0]},
-    "shortage": {"code": 4, "emoji": "🟡", "title_uk": STATUS_BY_CODE[4][0]},
-    "outage_schedules": {"code": 9, "emoji": "🔴", "title_uk": STATUS_BY_CODE[9][0]},
-    "emergency_outages": {"code": 10, "emoji": "🚨", "title_uk": STATUS_BY_CODE[10][0]},
-    "grid_damage": {"code": 11, "emoji": "⚫️", "title_uk": STATUS_BY_CODE[11][0]},
+    "normal": {"code": 3, "emoji": "🟢", "title_uk": "Електроенергії достатньо"},
+    "shortage": {"code": 4, "emoji": "🟡", "title_uk": "Будь ласка, споживайте електроенергію ощадливо"},
+    "outage_schedules": {"code": 9, "emoji": "🟠", "title_uk": "Застосовані графіки погодинних відключень"},
+    "emergency_outages": {"code": 10, "emoji": "🔴", "title_uk": "Застосовані аварійні відключення"},
+    "grid_damage": {"code": 11, "emoji": "🚨", "title_uk": "Знеструмлення – наслідок пошкодження мережі"},
 }
 
-UKRENERGO_SITE_URL = (os.getenv("UKRENERGO_SITE_URL") or "https://ua.energy").strip()
+UKRENERGO_SITE_URL = (os.getenv("UKRENERGO_SITE_URL") or "").strip()
 
 
 def esc(value: Any) -> str:
@@ -267,6 +276,58 @@ def slug_title(slug: str) -> str:
     return mapping.get(slug, slug)
 
 
+
+def region_forms(name_uk: str, slug: str) -> tuple:
+    """(називний, родовий для «для …», місцевий для «в …»)."""
+    # slug → (genitive, locative)
+    by_slug = {
+        "zhytomyr": ("Житомирської області", "Житомирській області"),
+        "kyiv": ("м. Києва", "м. Києві"),
+        "kyiv-oblast": ("Київської області", "Київській області"),
+        "vinnytsia": ("Вінницької області", "Вінницькій області"),
+        "volyn": ("Волинської області", "Волинській області"),
+        "dnipro": ("Дніпропетровської області", "Дніпропетровській області"),
+        "donetsk": ("Донецької області", "Донецькій області"),
+        "zhytomyrska": ("Житомирської області", "Житомирській області"),
+        "zakarpattia": ("Закарпатської області", "Закарпатській області"),
+        "zaporizhzhia": ("Запорізької області", "Запорізькій області"),
+        "ivano-frankivsk": ("Івано-Франківської області", "Івано-Франківській області"),
+        "kirovohrad": ("Кіровоградської області", "Кіровоградській області"),
+        "luhansk": ("Луганської області", "Луганській області"),
+        "lviv": ("Львівської області", "Львівській області"),
+        "mykolaiv": ("Миколаївської області", "Миколаївській області"),
+        "odesa": ("Одеської області", "Одеській області"),
+        "poltava": ("Полтавської області", "Полтавській області"),
+        "rivne": ("Рівненської області", "Рівненській області"),
+        "sumy": ("Сумської області", "Сумській області"),
+        "ternopil": ("Тернопільської області", "Тернопільській області"),
+        "kharkiv": ("Харківської області", "Харківській області"),
+        "kherson": ("Херсонської області", "Херсонській області"),
+        "khmelnytskyi": ("Хмельницької області", "Хмельницькій області"),
+        "cherkasy": ("Черкаської області", "Черкаській області"),
+        "chernihiv": ("Чернігівської області", "Чернігівській області"),
+        "chernivtsi": ("Чернівецької області", "Чернівецькій області"),
+    }
+    if slug in by_slug:
+        gen, loc = by_slug[slug]
+        return name_uk, gen, loc
+    # евристика: «...ська область» → «...ської області» / «...ській області»
+    n = (name_uk or "").strip()
+    if n.endswith("ська область"):
+        base = n[: -len("ська область")]
+        return n, f"{base}ської області", f"{base}ській області"
+    if n.endswith("зька область"):
+        base = n[: -len("зька область")]
+        return n, f"{base}зької області", f"{base}зькій області"
+    if n.endswith("цька область"):
+        base = n[: -len("цька область")]
+        return n, f"{base}цької області", f"{base}цькій області"
+    if n.endswith("а область"):
+        base = n[: -len("а область")]
+        return n, f"{base}ої області", f"{base}ій області"
+    return n, n, n
+
+
 def comparable(snapshot: Dict) -> Dict:
     """Що порівнюємо для рішення «чи змінилось»."""
     period = snapshot.get("period") or {}
@@ -293,25 +354,21 @@ def format_message(prev: Dict, cur: Dict, stale: bool) -> str:
         meta = STATUS_META.get(cur.get("status") or "", {})
         code = meta.get("code")
 
-    region = cur.get("name_uk") or slug_title(REGION_SLUG)
+    name_uk = cur.get("name_uk") or slug_title(REGION_SLUG)
+    _, region_gen, region_loc = region_forms(name_uk, REGION_SLUG)
 
     if code in STATUS_BY_CODE:
-        title, body = STATUS_BY_CODE[code]
+        emoji, title_tpl, body = STATUS_BY_CODE[code]
+        title_line = f"{emoji} {title_tpl.format(region_gen=region_gen, region_loc=region_loc)}"
     else:
-        title = cur.get("title_uk") or cur.get("status") or "Оновлення статусу"
+        emoji = cur.get("emoji") or "⚡️"
+        title_line = f"{emoji} {cur.get('title_uk') or cur.get('status') or 'Оновлення статусу'}"
         body = "Стан енергосистеми оновлено."
 
-    # Для кодів 3 і 9 у заголовку згадуємо область (як у твоєму прикладі)
-    if code == 3:
-        title_line = f"Електроенергії для {region} достатньо"
-    elif code == 9:
-        title_line = f"Застосовані графіки погодинних відключень для {region}."
-    else:
-        title_line = title
-
+    # Читабельність: жирний заголовок статусу, підпис періоду; текст без змін
     lines = [
         "Укренерго інформує -",
-        esc(title_line),
+        f"<b>{esc(title_line)}</b>",
         "",
         esc(body),
     ]
@@ -321,7 +378,15 @@ def format_message(prev: Dict, cur: Dict, stale: bool) -> str:
         period_block = _format_period_block(cur.get("period"))
         if period_block:
             lines.append("")
-            lines.extend(period_block)
+            # перший рядок — підпис, решта значення
+            if len(period_block) == 1 and period_block[0].startswith("Прогнозований період:"):
+                # "Прогнозований період: 06:00-23:59"
+                label, _, rest = period_block[0].partition(":")
+                lines.append(f"<b>{esc(label.strip())}:</b> {esc(rest.strip())}")
+            else:
+                lines.append(f"<b>{esc(period_block[0])}</b>")
+                for row in period_block[1:]:
+                    lines.append(esc(row))
 
     lines.append("")
     footer_parts = []
@@ -330,7 +395,7 @@ def format_message(prev: Dict, cur: Dict, stale: bool) -> str:
             f'<a href="{esc(UKRENERGO_SITE_URL)}">Сайт НЕК «Укренерго»</a>'
         )
     if SUBSCRIBE:
-        footer_parts.append(f'<a href="{esc(SUBSCRIBE)}">⚡️ ПІДПИСАТИСЯ</a>')
+        footer_parts.append(f'<a href="{esc(SUBSCRIBE)}"><b>⚡️ ПІДПИСАТИСЯ</b></a>')
     if footer_parts:
         lines.append(" | ".join(footer_parts))
 
