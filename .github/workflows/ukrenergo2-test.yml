@@ -1,7 +1,5 @@
 name: Test Ukrenergo 2 (channel message only)
 
-# Лише вручну. Читає Mongo + live, шле приклад сповіщення в канал.
-# Нічого не пише в базу і не комітить у git.
 on:
   workflow_dispatch:
 
@@ -21,6 +19,7 @@ jobs:
       UKRENERGO2_REGION_NAME: ${{ secrets.UKRENERGO2_REGION_NAME }}
       MAYACHOK_MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
       MAYACHOK_MONGO_DB: ${{ secrets.MAYACHOK_MONGO_DB }}
+      UKRENERGO_SITE_URL: ${{ secrets.UKRENERGO_SITE_URL }}
 
     steps:
       - name: Checkout repository

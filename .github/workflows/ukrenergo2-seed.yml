@@ -1,7 +1,5 @@
 name: Seed Ukrenergo 2 (Mongo + notify)
 
-# Тільки вручну: один раз «засіяти» Mongo і одразу кинути статус у канал.
-# Далі використовуй звичайний workflow Monitor Ukrenergo 2.
 on:
   workflow_dispatch:
 
@@ -21,6 +19,7 @@ jobs:
       UKRENERGO2_REGION_NAME: ${{ secrets.UKRENERGO2_REGION_NAME }}
       MAYACHOK_MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
       MAYACHOK_MONGO_DB: ${{ secrets.MAYACHOK_MONGO_DB }}
+      UKRENERGO_SITE_URL: ${{ secrets.UKRENERGO_SITE_URL }}
       UKRENERGO2_SYNC_REGIONSTATUS: "1"
 
     steps:
