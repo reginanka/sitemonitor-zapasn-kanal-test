@@ -11,6 +11,7 @@ from __future__ import annotations
 from log_utils import log_to_buffer, send_log_to_channel
 from telegram_handler import send_notification
 from ukrenergo2_monitor import (
+    get_status_image,
     REGION_SLUG,
     build_snapshot,
     fetch_regions,
@@ -52,7 +53,8 @@ def main() -> None:
         else:
             message = "🔁 <b>Примусове оновлення статусу</b>\n\n" + message
 
-        ok = send_notification(message)
+        image_path = get_status_image(current.get("status_code"))
+        ok = send_notification(message, image_path=image_path)
         if not ok:
             log_to_buffer("❌ Не вдалось надіслати в канал — стан у Mongo НЕ змінюю")
             return

@@ -31,6 +31,7 @@ SUBSCRIBE = os.getenv("SUBSCRIBE", "")
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 STATE_FILE = DATA_DIR / "ukrenergo_state.json"
+IMAGES_DIR = Path("assets/ukrenergo2")  # спільні картинки зі статусами 3/4/9/10/11
 
 FALLBACK_STATES = {
     3: ("Електроенергії достатньо", "Споживання в межах можливостей енергосистеми."),
@@ -186,32 +187,117 @@ def esc(value: Any) -> str:
     return html.escape("" if value is None else str(value))
 
 
+
+STATUS_BY_CODE = {
+    3: (
+        "🟢",
+        "Електроенергії для {region_gen} достатньо",
+        "Користуйтеся електроприладами у звичайному режимі.",
+    ),
+    4: (
+        "🟡",
+        "Будь ласка, споживайте електроенергію ощадливо в {region_loc}",
+        "Через пошкодження мереж та об'єктів генерації – енергосистемі складно "
+        "забезпечити потреби всіх споживачів у вашому регіоні. Будь ласка, не вмикайте "
+        "кілька потужних електроприладів одночасно. Кондиціонер, обігрівач, чайник, "
+        "фен, пилосос, електроплиту та праску - використовуйте почергово.",
+    ),
+    9: (
+        "🟠",
+        "Застосовані графіки погодинних відключень для {region_gen}.",
+        "Внаслідок складної ситуації в енергосистемі – вимушено запроваджені графіки "
+        "погодинних відключень. Будь ласка, не користуйтесь потужними електроприладами "
+        "до скасування обмежень.",
+    ),
+    10: (
+        "🔴",
+        "Застосовані аварійні відключення в {region_loc}",
+        "Ситуація в енергосистемі є дуже складною. У вашому регіоні застосовані аварійні "
+        "відключення. Раніше оприлюднені графіки погодинних відключень наразі не діють. "
+        "Якщо зараз у вас є електроенергія – споживайте її максимально ощадливо.",
+    ),
+    11: (
+        "🚨",
+        "Знеструмлення – наслідок пошкодження мережі в {region_loc}",
+        "Значна кількість абонентів – знеструмлена внаслідок пошкодження елементів "
+        "мережі, що забезпечували живлення побутових споживачів та об'єктів "
+        "інфраструктури. Раніше оприлюднені графіки погодинних відключень за командою "
+        "«Укренерго» наразі не діють. Тривалість відновлювальних робіт залежить від "
+        "безпекової ситуації у регіоні. Якщо зараз у вас є електроенергія – споживайте "
+        "її максимально ощадливо.",
+    ),
+}
+
+
+def region_forms(name: str) -> tuple:
+    """(називний, родовий, місцевий) — проста евристика для офіційного монітора."""
+    n = (name or "").strip()
+    if n.endswith("ська область"):
+        base = n[: -len("ська область")]
+        return n, f"{base}ської області", f"{base}ській області"
+    if n.endswith("зька область"):
+        base = n[: -len("зька область")]
+        return n, f"{base}зької області", f"{base}зькій області"
+    if n.endswith("цька область"):
+        base = n[: -len("цька область")]
+        return n, f"{base}цької області", f"{base}цькій області"
+    if "Київ" in n and "област" not in n.lower():
+        return n, "м. Києва", "м. Києві"
+    return n, n, n
+
+
+def get_status_image(status_code) -> Path | None:
+    try:
+        code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        code = None
+    if code is None:
+        return None
+    for ext in (".jpg", ".png"):
+        path = IMAGES_DIR / f"{code}{ext}"
+        if path.exists():
+            return path
+    return None
+
+
 def format_message(prev: Dict, cur: Dict) -> str:
+    """Повідомлення в стилі ukrenergo2 (офіційні формулювання)."""
+    code = cur.get("state_id")
+    try:
+        code = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code = None
+
+    name = cur.get("region_name") or REGION_NAME or ""
+    _, region_gen, region_loc = region_forms(name)
+
+    if code in STATUS_BY_CODE:
+        emoji, title_tpl, body = STATUS_BY_CODE[code]
+        title_line = f"{emoji} {title_tpl.format(region_gen=region_gen, region_loc=region_loc)}"
+    else:
+        title_line = f"⚡️ {cur.get('name') or 'Оновлення статусу'}"
+        body = cur.get("desc") or "Стан енергосистеми оновлено."
+
     lines = [
-        "⚡️ <b>Укренерго</b>",
-        f"📍 {esc(REGION_NAME)}",
+        "Укренерго інформує -",
+        f"<b>{esc(title_line)}</b>",
         "",
-        f"Було: {esc(prev.get('name') or '—')} (код {esc(prev.get('state_id'))})",
-        f"Стало: <b>{esc(cur.get('name'))}</b> (код {esc(cur.get('state_id'))})",
+        esc(body),
     ]
-    if cur.get("desc"):
-        lines.append(esc(cur["desc"]))
+
+    # Рекомендація з API (якщо є і відрізняється)
     rec = cur.get("recommendation") or {}
-    if rec.get("name") or rec.get("desc"):
+    if rec.get("desc") and code not in STATUS_BY_CODE:
         lines.append("")
-        lines.append("💡 <b>Рекомендація</b>")
-        if rec.get("name"):
-            lines.append(esc(rec["name"]))
-        if rec.get("desc"):
-            lines.append(esc(rec["desc"]))
-    scheduled = cur.get("scheduled") or []
-    if scheduled != (prev.get("scheduled") or []):
-        lines.append("")
-        lines.append(f"🗓 Запланованих змін у відповіді API: {len(scheduled)}")
+        lines.append(esc(rec["desc"]))
+
     lines.append("")
-    lines.append("Джерело: НЕК «Укренерго»")
+    footer = []
+    footer.append("Джерело: НЕК «Укренерго»")
     if SUBSCRIBE:
-        lines.append(f'<a href="{esc(SUBSCRIBE)}">⚡️ ПІДПИСАТИСЯ</a>')
+        footer.append(f'<a href="{esc(SUBSCRIBE)}"><b>⚡️ ПІДПИСАТИСЯ</b></a>')
+    lines.append(" | ".join(footer) if len(footer) > 1 else footer[0])
+
     return "\n".join(lines)
 
 
@@ -236,7 +322,10 @@ def main() -> None:
             f"→ {current.get('state_id')}/{current.get('name')}"
         )
         message = format_message(previous, current)
-        ok = send_notification(message)
+        image_path = get_status_image(current.get("state_id"))
+        if image_path:
+            log_to_buffer(f"🖼 Картинка: {image_path.name}")
+        ok = send_notification(message, image_path=image_path)
         if not ok:
             log_to_buffer("❌ Не вдалось надіслати сповіщення, стан не перезаписую")
             return

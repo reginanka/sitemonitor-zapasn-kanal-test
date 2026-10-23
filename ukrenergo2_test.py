@@ -16,6 +16,7 @@ from __future__ import annotations
 import html
 import os
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
@@ -35,6 +36,7 @@ MONGO_DB = (
     os.getenv("MAYACHOK_MONGO_DB") or os.getenv("MONGO_DB_NAME") or "powerbot"
 ).strip()
 COLLECTION = "ukrenergo2_states"
+IMAGES_DIR = Path("assets/ukrenergo2")
 STALE_HOURS = 2
 
 # --- Шаблони каналу (як ти задала) ---
@@ -278,6 +280,20 @@ def is_stale(generated_at: Optional[str]) -> bool:
         return True
 
 
+def get_status_image(status_code) -> Path | None:
+    try:
+        code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        code = None
+    if code is None:
+        return None
+    for ext in (".jpg", ".png"):
+        path = IMAGES_DIR / f"{code}{ext}"
+        if path.exists():
+            return path
+    return None
+
+
 def main() -> None:
     log_to_buffer("=" * 40)
     log_to_buffer(f"🧪 TEST УКРЕНЕРГО 2 · slug={REGION_SLUG} (без запису в Mongo, свої шаблони)")
@@ -303,7 +319,8 @@ def main() -> None:
             + body
         )
 
-        ok = send_notification(message)
+        image_path = get_status_image(current.get("status_code"))
+        ok = send_notification(message, image_path=image_path)
         log_to_buffer("✅ Тест надіслано в канал" if ok else "❌ Не вдалось надіслати")
     except Exception as e:
         log_to_buffer(f"❌ Test: {e}")

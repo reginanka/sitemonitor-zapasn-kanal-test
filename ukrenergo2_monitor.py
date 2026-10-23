@@ -14,6 +14,7 @@ from __future__ import annotations
 import html
 import os
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
@@ -42,6 +43,7 @@ MONGO_DB = (
 ).strip()
 # Колекція стану Укренерго 2
 COLLECTION = "ukrenergo2_states"
+IMAGES_DIR = Path("assets/ukrenergo2")
 # Опційно дублюємо в regionstatuses (схема бота Маячок)
 SYNC_REGIONSTATUS = (os.getenv("UKRENERGO2_SYNC_REGIONSTATUS") or "1").strip() not in (
     "0",
@@ -476,6 +478,24 @@ def _format_period_block(period) -> list:
 
 
 
+def get_status_image(status_code) -> Path | None:
+    """Повертає шлях до картинки статусу або None."""
+    try:
+        code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        code = None
+    if code is None:
+        return None
+    path = IMAGES_DIR / f"{code}.jpg"
+    if path.exists():
+        return path
+    # fallback png
+    path_png = IMAGES_DIR / f"{code}.png"
+    if path_png.exists():
+        return path_png
+    return None
+
+
 def main() -> None:
     log_to_buffer("=" * 40)
     log_to_buffer(f"🚀 СТАРТ УКРЕНЕРГО 2 · slug={REGION_SLUG}")
@@ -518,7 +538,12 @@ def main() -> None:
             f"→ {current.get('status')}/{current.get('status_code')}"
         )
         message = format_message(previous, current, stale)
-        ok = send_notification(message)
+        image_path = get_status_image(current.get("status_code"))
+        if image_path:
+            log_to_buffer(f"🖼 Картинка: {image_path.name}")
+        else:
+            log_to_buffer("ℹ️ Картинки для цього статусу немає — шлю тільки текст")
+        ok = send_notification(message, image_path=image_path)
         if not ok:
             log_to_buffer("❌ Не вдалось надіслати сповіщення, стан не перезаписую")
             return
