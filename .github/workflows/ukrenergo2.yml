@@ -8,7 +8,6 @@ on:
 jobs:
   ukrenergo2:
     runs-on: ubuntu-latest
-    # contents: read достатньо — стан більше не комітимо в git
     permissions:
       contents: read
     env:
@@ -17,15 +16,12 @@ jobs:
       TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
       TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
       SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
-      # обов'язково: URL на regions.json
       UKRENERGO2_REGIONS_URL: ${{ secrets.UKRENERGO2_REGIONS_URL }}
-      # опційно: за замовчуванням zhytomyr
       UKRENERGO2_REGION_SLUG: ${{ secrets.UKRENERGO2_REGION_SLUG }}
       UKRENERGO2_REGION_NAME: ${{ secrets.UKRENERGO2_REGION_NAME }}
-      # Mongo (стан замість data/ukrenergo2_state.json)
       MAYACHOK_MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
       MAYACHOK_MONGO_DB: ${{ secrets.MAYACHOK_MONGO_DB }}
-      # 1 = дублювати в regionstatuses для бота Маячок
+      UKRENERGO_SITE_URL: ${{ secrets.UKRENERGO_SITE_URL }}
       UKRENERGO2_SYNC_REGIONSTATUS: "1"
 
     steps:
