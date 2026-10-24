@@ -31,8 +31,13 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("ztoe_outages_monitor")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-API_BASE = "https://api-ztoe-poweron.inneti.net/api"
+API_BASE = os.getenv("ZTOE_API_BASE") or os.getenv("API_BASE") or ""
+if not API_BASE:
+    # не друкуємо дефолтний URL у логах публічного репо
+    raise SystemExit("Немає ZTOE_API_BASE (базовий URL API відключень)")
 
 TYPE_LABELS = {
     0: ("Планове", "заплановані роботи (ремонт, обслуговування)"),
