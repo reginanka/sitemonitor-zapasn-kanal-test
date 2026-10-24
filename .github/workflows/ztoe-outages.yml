@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # Кожні 15 хвилин
-    - cron: "*/15 * * * *"
+    #- cron: "*/15 * * * *"
 
 concurrency:
   group: ztoe-outages
