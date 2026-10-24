@@ -32,6 +32,12 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
           SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
+          # Спільна Mongo з ботом ztoe (queue_schedules + GridFS PNG)
+          MAYACHOK_MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
+          ZTOE_MONGO_DB: ${{ secrets.ZTOE_MONGO_DB }}
+          MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
+          MONGO_DB: ${{ secrets.ZTOE_MONGO_DB }}
+          RENDER_SCHEDULE_IMAGES: "1"
         run: python monitor.py
 
       - name: Commit changes
