@@ -3,7 +3,7 @@
 Тижнева перевірка черг ГПВ для адрес підписників бота Житомиробленерго.
 
 Читає колекцію queue_directory (унікальні адреси з чергами),
-оновлює чергу з https://www.ztoe.com.ua/unhooking-search.php,
+оновлює чергу з URL з секрету ZTOE_QUEUE_URL,
 якщо змінилася — сповіщає користувачів з users (notify=true) і оновлює їх addresses.
 
 Secrets / env:
@@ -14,6 +14,7 @@ Secrets / env:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -34,7 +35,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("ztoe_queue_monitor")
 
-BASE = "https://www.ztoe.com.ua/unhooking-search.php"
+BASE = os.getenv("ZTOE_QUEUE_URL") or os.getenv("QUEUE_SEARCH_URL")
+if not BASE:
+    raise SystemExit("Немає ZTOE_QUEUE_URL (URL сторінки пошуку черг)")
 REQUEST_PAUSE_SEC = float(os.getenv("ZTOE_REQUEST_PAUSE", "0.8"))
 
 HEADERS = {
