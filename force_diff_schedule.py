@@ -3,15 +3,17 @@
 
 Що робить:
   1. Читає data/current.json
-  2. Інвертує кілька кольорів (white ↔ red) у вибраних чергах
+  2. Інвертує кольори (white ↔ red) у КОЖНІЙ черзі
   3. Перераховує main_hashes / span_hashes
   4. Записує current.json + last_hash.json
 
 Після цього просто запусти звичайний workflow «Monitor Schedule Updates».
 
 Env (опційно):
-  FORCE_QUEUES   — коми-розділений список черг, напр. "1.1,2.1" (за замовч. 1.1)
-  FORCE_MAX_FLIP — скільки інтервалів максимум перевернути (за замовч. 8)
+  FORCE_QUEUES   — коми-розділений список черг, напр. "1.1,2.1"
+                   порожньо / "all" = усі черги з current.json
+  FORCE_MAX_FLIP — скільки інтервалів максимум перевернути НА КОЖНУ чергу
+                   (за замовч. 8)
 """
 
 from __future__ import annotations
@@ -26,6 +28,9 @@ from typing import Any, Dict, List
 DATA_DIR = Path("data")
 CURRENT_FILE = DATA_DIR / "current.json"
 HASH_FILE = DATA_DIR / "last_hash.json"
+
+# Усі черги монітора (1.1 … 6.2)
+ALL_QUEUES = [f"{i}.{j}" for i in range(1, 7) for j in (1, 2)]
 
 
 def calculate_hash(obj: Any) -> str:
@@ -49,18 +54,21 @@ def save_json(data: Any, path: Path) -> None:
 def flip_colors(
     norm_by_queue: Dict[str, List[Dict]],
     queues: List[str],
-    max_flip: int,
-) -> int:
-    """Інвертує white↔red. Повертає кількість змінених записів."""
-    flipped = 0
+    max_flip_per_queue: int,
+) -> Dict[str, int]:
+    """Інвертує white↔red. Повертає {черга: кількість змін}."""
+    result: Dict[str, int] = {}
+
     for q in queues:
         items = norm_by_queue.get(q)
         if not items:
             print(f"⚠️  Черга {q} відсутня в current.json — пропускаю")
             continue
+
+        flipped = 0
         for rec in items:
-            if flipped >= max_flip:
-                return flipped
+            if flipped >= max_flip_per_queue:
+                break
             color = (rec.get("color") or "").strip().lower()
             if color == "red":
                 rec["color"] = "white"
@@ -68,7 +76,11 @@ def flip_colors(
             elif color == "white":
                 rec["color"] = "red"
                 flipped += 1
-    return flipped
+
+        result[q] = flipped
+        print(f"  ✓ {q}: перевернуто {flipped}")
+
+    return result
 
 
 def rebuild_hashes(
@@ -100,24 +112,31 @@ def main() -> None:
     print("=" * 50)
 
     if not CURRENT_FILE.exists():
-        raise SystemExit(f"❌ Немає файлу {CURRENT_FILE}. Спочатку запусти звичайний monitor.")
+        raise SystemExit(
+            f"❌ Немає файлу {CURRENT_FILE}. Спочатку запусти звичайний monitor."
+        )
 
-    raw_queues = (os.getenv("FORCE_QUEUES") or "1.1").strip()
-    queues = [q.strip() for q in raw_queues.split(",") if q.strip()]
+    raw_queues = (os.getenv("FORCE_QUEUES") or "all").strip().lower()
+    if not raw_queues or raw_queues in ("all", "*"):
+        queues = ALL_QUEUES
+    else:
+        queues = [q.strip() for q in raw_queues.split(",") if q.strip()]
+
     max_flip = int(os.getenv("FORCE_MAX_FLIP") or "8")
 
     print(f"🎯 Черги: {queues}")
-    print(f"🔢 Макс. переворотів: {max_flip}")
+    print(f"🔢 Макс. переворотів на чергу: {max_flip}")
 
     norm_by_queue: Dict[str, List[Dict]] = load_json(CURRENT_FILE)
     if not norm_by_queue:
         raise SystemExit("❌ current.json порожній")
 
-    flipped = flip_colors(norm_by_queue, queues, max_flip)
-    if flipped == 0:
+    per_queue = flip_colors(norm_by_queue, queues, max_flip)
+    total = sum(per_queue.values())
+    if total == 0:
         raise SystemExit("❌ Нічого не змінено (немає записів white/red)")
 
-    print(f"✅ Перевернуто кольорів: {flipped}")
+    print(f"✅ Всього перевернуто кольорів: {total} у {len(per_queue)} чергах")
 
     main_hashes, span_hashes = rebuild_hashes(norm_by_queue)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -128,7 +147,7 @@ def main() -> None:
             "timestamp": timestamp,
             "main_hashes": main_hashes,
             "span_hashes": span_hashes,
-            "note": f"force-diff: flipped {flipped} colors in {queues}",
+            "note": f"force-diff: flipped {total} colors in {list(per_queue.keys())}",
         },
         HASH_FILE,
     )
