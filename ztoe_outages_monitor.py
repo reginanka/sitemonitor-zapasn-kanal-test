@@ -119,19 +119,25 @@ def matches_street(outage: dict, street_id, street_name: str) -> bool:
 
 
 
-def send_log(bot: Bot, text: str) -> None:
-    """Пише підсумок у лог-канал, якщо задано TELEGRAM_LOG_CHANNEL_ID."""
+def send_log(text: str) -> None:
+    """Пише підсумок у лог-канал ботом репо (TELEGRAM_BOT_TOKEN), не ботом відключень."""
     channel = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or os.getenv("ZTOE_LOG_CHANNEL_ID")
+    log_token = os.getenv("TELEGRAM_BOT_TOKEN")  # той самий, що в інших monitor'ах
     if not channel:
         log.info("TELEGRAM_LOG_CHANNEL_ID не задано — пропуск лог-каналу")
         return
+    if not log_token:
+        log.info("TELEGRAM_BOT_TOKEN не задано — пропуск лог-каналу")
+        return
     try:
+        log_bot = Bot(token=log_token)
         async def _send():
-            await bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
+            await log_bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
         asyncio.run(_send())
         log.info("Лог надіслано в %s", channel)
     except Exception as e:
         log.error("Не вдалося надіслати в лог-канал: %s", e)
+
 
 
 def main() -> int:
@@ -158,7 +164,7 @@ def main() -> int:
     if not users:
         log.info("Немає кого перевіряти")
         bot = Bot(token=bot_token)
-        send_log(bot, f"✅ <b>ZTOE outages</b>\ndb: <code>{mongo_db}</code>\nusers: 0\n(немає підписників)")
+        send_log(f"✅ <b>ZTOE outages</b>\ndb: <code>{mongo_db}</code>\nusers: 0\n(немає підписників)")
         return 0
 
     # groups[(otg_id, city_id)] = [(user, addr), ...]
@@ -252,7 +258,7 @@ def main() -> int:
         "Готово: users=%s groups=%s notifications=%s",
         len(users), groups_checked, sent,
     )
-    send_log(bot, summary)
+    send_log(summary)
     return 0
 
 

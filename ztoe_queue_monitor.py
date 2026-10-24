@@ -270,18 +270,25 @@ def addr_matches_doc(addr: dict, doc: dict) -> bool:
 
 
 
-def send_log(bot: Bot, text: str) -> None:
+def send_log(text: str) -> None:
+    """Пише підсумок у лог-канал ботом репо (TELEGRAM_BOT_TOKEN), не ботом відключень."""
     channel = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or os.getenv("ZTOE_LOG_CHANNEL_ID")
+    log_token = os.getenv("TELEGRAM_BOT_TOKEN")  # той самий, що в інших monitor'ах
     if not channel:
         log.info("TELEGRAM_LOG_CHANNEL_ID не задано — пропуск лог-каналу")
         return
+    if not log_token:
+        log.info("TELEGRAM_BOT_TOKEN не задано — пропуск лог-каналу")
+        return
     try:
+        log_bot = Bot(token=log_token)
         async def _send():
-            await bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
+            await log_bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
         asyncio.run(_send())
         log.info("Лог надіслано в %s", channel)
     except Exception as e:
         log.error("Не вдалося надіслати в лог-канал: %s", e)
+
 
 
 def main() -> int:
@@ -307,7 +314,7 @@ def main() -> int:
     if not docs:
         log.info("Немає адрес для перевірки — вихід")
         bot = Bot(token=bot_token)
-        send_log(bot, f"✅ <b>ZTOE queues</b>\ndb: <code>{mongo_db}</code>\nchecked: 0\n(немає адрес у queue_directory)")
+        send_log(f"✅ <b>ZTOE queues</b>\ndb: <code>{mongo_db}</code>\nchecked: 0\n(немає адрес у queue_directory)")
         return 0
 
     bot = Bot(token=bot_token)
@@ -460,7 +467,7 @@ def main() -> int:
         "Готово: checked=%s changed=%s notified=%s temp=%s errors=%s",
         checked, changed, notified_users, skipped_temp, errors,
     )
-    send_log(bot, summary)
+    send_log(summary)
     return 0
 
 
