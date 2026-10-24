@@ -1,0 +1,45 @@
+name: Force Diff Schedule
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_queues:
+        description: "Черги через кому (напр. 1.1,2.1). За замовч. 1.1"
+        required: false
+        default: "1.1"
+        type: string
+      force_max_flip:
+        description: "Скільки інтервалів максимум перевернути (white↔red)"
+        required: false
+        default: "8"
+        type: string
+
+jobs:
+  force-diff:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Force different state into data/
+        env:
+          FORCE_QUEUES: ${{ inputs.force_queues }}
+          FORCE_MAX_FLIP: ${{ inputs.force_max_flip }}
+        run: python force_diff_schedule.py
+
+      - name: Commit forced state
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/current.json data/last_hash.json
+          git diff --quiet && git diff --staged --quiet && echo "No changes" && exit 0
+          git commit -m "Force diff schedule [skip ci]"
+          git push
