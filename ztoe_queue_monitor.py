@@ -266,6 +266,21 @@ def addr_matches_doc(addr: dict, doc: dict) -> bool:
     )
 
 
+
+def send_log(bot: Bot, text: str) -> None:
+    channel = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or os.getenv("ZTOE_LOG_CHANNEL_ID")
+    if not channel:
+        log.info("TELEGRAM_LOG_CHANNEL_ID не задано — пропуск лог-каналу")
+        return
+    try:
+        async def _send():
+            await bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
+        asyncio.run(_send())
+        log.info("Лог надіслано в %s", channel)
+    except Exception as e:
+        log.error("Не вдалося надіслати в лог-канал: %s", e)
+
+
 def main() -> int:
     mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
     mongo_db = os.getenv("ZTOE_MONGO_DB") or os.getenv("MONGO_DB") or "vidkluchennya"
@@ -288,6 +303,8 @@ def main() -> int:
 
     if not docs:
         log.info("Немає адрес для перевірки — вихід")
+        bot = Bot(token=bot_token)
+        send_log(bot, f"✅ <b>ZTOE queues</b>\ndb: <code>{mongo_db}</code>\nchecked: 0\n(немає адрес у queue_directory)")
         return 0
 
     bot = Bot(token=bot_token)
@@ -427,10 +444,20 @@ def main() -> int:
             # перший успішний запис без сповіщення (щоб не спамити історією)
             log.info("Перша фіксація черги (без notify): %s", label)
 
+    summary = (
+        f"✅ <b>ZTOE queues</b>\n"
+        f"db: <code>{mongo_db}</code>\n"
+        f"checked: {checked}\n"
+        f"changed: {changed}\n"
+        f"notified: {notified_users}\n"
+        f"temporary_skip: {skipped_temp}\n"
+        f"errors: {errors}"
+    )
     log.info(
         "Готово: checked=%s changed=%s notified=%s temp=%s errors=%s",
         checked, changed, notified_users, skipped_temp, errors,
     )
+    send_log(bot, summary)
     return 0
 
 

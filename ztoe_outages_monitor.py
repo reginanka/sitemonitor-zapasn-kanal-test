@@ -118,6 +118,22 @@ def matches_street(outage: dict, street_id, street_name: str) -> bool:
     return False
 
 
+
+def send_log(bot: Bot, text: str) -> None:
+    """Пише підсумок у лог-канал, якщо задано TELEGRAM_LOG_CHANNEL_ID."""
+    channel = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or os.getenv("ZTOE_LOG_CHANNEL_ID")
+    if not channel:
+        log.info("TELEGRAM_LOG_CHANNEL_ID не задано — пропуск лог-каналу")
+        return
+    try:
+        async def _send():
+            await bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
+        asyncio.run(_send())
+        log.info("Лог надіслано в %s", channel)
+    except Exception as e:
+        log.error("Не вдалося надіслати в лог-канал: %s", e)
+
+
 def main() -> int:
     mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
     mongo_db = os.getenv("ZTOE_MONGO_DB") or os.getenv("MONGO_DB") or "vidkluchennya"
@@ -141,6 +157,8 @@ def main() -> int:
 
     if not users:
         log.info("Немає кого перевіряти")
+        bot = Bot(token=bot_token)
+        send_log(bot, f"✅ <b>ZTOE outages</b>\ndb: <code>{mongo_db}</code>\nusers: 0\n(немає підписників)")
         return 0
 
     # groups[(otg_id, city_id)] = [(user, addr), ...]
@@ -223,10 +241,18 @@ def main() -> int:
         except Exception as e:
             log.error("Send fail %s: %s", tid, e)
 
+    summary = (
+        f"✅ <b>ZTOE outages</b>\n"
+        f"db: <code>{mongo_db}</code>\n"
+        f"users: {len(users)}\n"
+        f"groups: {groups_checked}\n"
+        f"notifications: {sent}"
+    )
     log.info(
         "Готово: users=%s groups=%s notifications=%s",
         len(users), groups_checked, sent,
     )
+    send_log(bot, summary)
     return 0
 
 
