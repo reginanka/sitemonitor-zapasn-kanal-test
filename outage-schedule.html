@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Графік відключень</title>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#0b1630;--card:#13234a;--border:rgba(255,255,255,.14);--border-strong:rgba(255,255,255,.28);--border-stronger:rgba(255,255,255,.55);
+  --text:#eef2fb;--text2:#aab6d3;--text3:#7886a8;
+  --ok:#3fbf6f;--bad:#f2564f;--wait:#34456f;
+  --planned:#f5a524;--emerg:#b86bf2;
+  --bad-bg:#3a1b2b;--bad-border:#a8343a;--bad-text:#ffc5c2;
+  --warn-bg:#3d3320;--warn-text:#ffd58a;
+  --ok-bg:#16382f;--ok-text:#a6e8c0;
+  --pl-bg:#3d3320;--pl-text:#ffd58a;
+  --em-bg:#33214f;--em-text:#e2c4ff;
+}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.5}
+.wrap{max-width:420px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin:0 0 12px}
+.status{background:var(--bad-bg);border-color:var(--bad-border)}
+.status .t{display:flex;align-items:center;gap:8px;font-weight:500;font-size:15px;color:var(--bad-text)}
+.dot{width:12px;height:12px;border-radius:50%;background:var(--bad);display:inline-block}
+.status .s{font-size:14px;margin-top:6px}
+.status .p{font-size:13px;margin-top:4px;color:var(--text2)}
+.head{display:flex;justify-content:space-between;align-items:center}
+.head b{font-weight:500;font-size:15px}
+.head span{font-size:12px;color:var(--text2)}
+.day{margin-top:18px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.day:first-of-type{margin-top:16px}
+.day .d{font-size:13px;color:var(--text2)}
+.pill{font-size:12px;padding:3px 10px;border-radius:8px;white-space:nowrap}
+.pill.bad{background:var(--bad-bg);color:var(--bad-text)}
+.pill.warn{background:var(--warn-bg);color:var(--warn-text)}
+.pill.ok{background:var(--ok-bg);color:var(--ok-text)}
+.rowb{display:flex;align-items:center}
+.body{flex:1;display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:2px;padding:3px;border:1.5px solid var(--border-stronger);border-radius:8px}
+.cap{width:5px;height:16px;background:var(--border-stronger);border-radius:0 3px 3px 0;margin-left:2px}
+.capx{width:5px;margin-left:2px}
+.hr{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:2px;padding:0 3px;margin:3px 7px 10px 1.5px;font-size:11px;color:var(--text);font-weight:500;text-align:center}
+.c{display:flex;height:34px;border-radius:3px;overflow:hidden;gap:1px}
+.c i{flex:1;background:var(--ok);opacity:.88}
+.c i.off{background:var(--bad);opacity:1}
+.c i.planned{background:var(--planned);opacity:1}
+.c i.emerg{background:var(--emerg);opacity:1}
+.c i.wait{background:var(--wait);opacity:1}
+.c.now{outline:2px solid var(--text);outline-offset:1px}
+.ev{display:flex;gap:10px;align-items:flex-start;padding:8px 10px;border-radius:8px;margin-top:8px;font-size:13px}
+.ev.schedule{background:var(--bad-bg)}
+.ev.planned{background:var(--pl-bg)}
+.ev.emerg{background:var(--em-bg)}
+.ev .k{width:10px;height:10px;border-radius:2px;margin-top:6px;flex:none}
+.ev.schedule .k{background:var(--bad)}
+.ev.planned .k{background:var(--planned)}
+.ev.emerg .k{background:var(--emerg)}
+.ev b{font-weight:500}
+.ev .tm{color:var(--text2);white-space:nowrap}
+.ev .tx{color:var(--text2);font-size:12px;margin-top:1px}
+.ev .top{display:flex;justify-content:space-between;gap:8px}
+.lg{display:flex;gap:6px 14px;font-size:12px;color:var(--text2);flex-wrap:wrap}
+.lg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}
+.note{font-size:12px;color:var(--text3);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="card status">
+    <div class="t"><span class="dot"></span><span id="st-title"></span></div>
+    <div class="s" id="st-sub"></div>
+    <div class="p" id="st-period"></div>
+  </div>
+
+  <div class="card" id="queue"></div>
+
+  <div class="lg">
+    <span><i style="background:var(--ok)"></i>Світло є</span>
+    <span><i style="background:var(--bad)"></i>За графіком</span>
+    <span><i style="background:var(--planned)"></i>Планове</span>
+    <span><i style="background:var(--emerg)"></i>Аварійне</span>
+    <span><i style="background:var(--wait)"></i>Невідомо</span>
+  </div>
+  <div class="note">Клітинка — година, кожна половинка — 30 хвилин. Рамка — поточна година.</div>
+
+</div>
+
+<script>
+/* ================= ДАНІ (міняти тут) =================
+   type: 'schedule' — за графіком (червоний)
+         'planned'  — планове відключення (жовтий)
+         'emerg'    — аварійне відключення (фіолетовий)
+   from/to — "ГГ:ХХ" (можна не вказувати, тоді це просто повідомлення)
+   text    — пояснення (необов'язково)
+   known   — чи вже опублікований графік на цей день
+   Події нижче — ПРИКЛАД, заміни своїми. */
+var DATA = {
+  statusTitle: 'Статус Житомирської області',
+  statusSub:   'Застосовані графіки погодинних відключень',
+  period:      'Період: 21.10, 06:00 — 21.10, 23:59',
+  queue:       '4.2',
+  operator:    'Житомиробленерго',
+  days: [
+    { label:'Сьогодні', offset:0, known:true, events:[
+      { type:'planned',  from:'10:00', to:'14:00', text:'Планові ремонтні роботи на мережах' },
+      { type:'emerg',    from:'16:20', to:'17:45', text:'Пошкодження лінії, бригада працює на місці' },
+      { type:'schedule', from:'19:30', to:'22:00' }
+    ]},
+    { label:'Завтра', offset:1, known:false, events:[] }
+  ]
+};
+
+var TYPE_NAME = { schedule:'Відключення за графіком', planned:'Планове відключення', emerg:'Аварійне відключення' };
+var PRIORITY  = { schedule:1, planned:2, emerg:3 };
+var CLASS     = { schedule:'off', planned:'planned', emerg:'emerg' };
+
+function toMin(s){ var p=s.split(':'); return (+p[0])*60+(+p[1]); }
+function pad(n){ return (n<10?'0':'')+n; }
+function fmtDate(d){ return pad(d.getDate())+'.'+pad(d.getMonth()+1); }
+function fmtDur(m){ var h=Math.floor(m/60), r=m%60; return (h?h+' год':'')+(h&&r?' ':'')+(r?r+' хв':''); }
+
+function slotState(day, slot){
+  var a=slot*30, b=a+30, best=null;
+  day.events.forEach(function(e){
+    if(!e.from||!e.to) return;
+    var f=toMin(e.from), t=toMin(e.to);
+    var overlap=Math.min(b,t)-Math.max(a,f);
+    if(overlap>=15 && (!best || PRIORITY[e.type]>PRIORITY[best])) best=e.type;
+  });
+  if(best) return CLASS[best];
+  return day.known ? '' : 'wait';
+}
+
+function outageMinutes(day){
+  var n=0;
+  for(var s=0;s<48;s++){
+    var a=s*30, b=a+30, hit=false;
+    day.events.forEach(function(e){
+      if(!e.from||!e.to) return;
+      var o=Math.min(b,toMin(e.to))-Math.max(a,toMin(e.from));
+      if(o>=15) hit=true;
+    });
+    if(hit) n+=30;
+  }
+  return n;
+}
+
+function renderBar(root, day, markNow){
+  var nowH=new Date().getHours();
+  for(var r=0;r<2;r++){
+    var wrap=document.createElement('div'); wrap.className='rowb';
+    var body=document.createElement('div'); body.className='body';
+    var lab=document.createElement('div'); lab.className='hr';
+    for(var k=0;k<12;k++){
+      var h=r*12+k;
+      var c=document.createElement('div');
+      c.className='c'+(markNow&&h===nowH?' now':'');
+      for(var s=0;s<2;s++){
+        var i=document.createElement('i'); i.className=slotState(day,h*2+s); c.appendChild(i);
+      }
+      body.appendChild(c);
+      var sp=document.createElement('span'); sp.textContent=h; lab.appendChild(sp);
+    }
+    wrap.appendChild(body);
+    var cap=document.createElement('div'); cap.className=(r===1?'cap':'capx'); wrap.appendChild(cap);
+    root.appendChild(wrap); root.appendChild(lab);
+  }
+}
+
+function renderEvents(root, day){
+  var list=day.events.slice().sort(function(x,y){
+    return (x.from?toMin(x.from):0)-(y.from?toMin(y.from):0);
+  });
+  list.forEach(function(e){
+    var el=document.createElement('div'); el.className='ev '+e.type;
+    var k=document.createElement('span'); k.className='k';
+    var box=document.createElement('div'); box.style.flex='1';
+    var top=document.createElement('div'); top.className='top';
+    var b=document.createElement('b'); b.textContent=TYPE_NAME[e.type];
+    top.appendChild(b);
+    if(e.from&&e.to){
+      var tm=document.createElement('span'); tm.className='tm'; tm.textContent=e.from+'–'+e.to;
+      top.appendChild(tm);
+    }
+    box.appendChild(top);
+    if(e.text){
+      var tx=document.createElement('div'); tx.className='tx'; tx.textContent=e.text;
+      box.appendChild(tx);
+    }
+    el.appendChild(k); el.appendChild(box); root.appendChild(el);
+  });
+}
+
+function build(){
+  document.getElementById('st-title').textContent=DATA.statusTitle;
+  document.getElementById('st-sub').textContent=DATA.statusSub;
+  document.getElementById('st-period').textContent=DATA.period;
+
+  var q=document.getElementById('queue');
+  var head=document.createElement('div'); head.className='head';
+  head.innerHTML='<b>⚡ Черга '+DATA.queue+'</b><span>'+DATA.operator+'</span>';
+  q.appendChild(head);
+
+  DATA.days.forEach(function(day, idx){
+    var d=new Date(); d.setDate(d.getDate()+day.offset);
+    var row=document.createElement('div'); row.className='day';
+    row.innerHTML='<span class="d">'+day.label+' · '+fmtDate(d)+'</span>';
+    var pill=document.createElement('span'); pill.className='pill';
+    var mins=outageMinutes(day);
+    if(!day.known){ pill.className+=' warn'; pill.textContent='Чекаємо на графік'; }
+    else if(mins>0){ pill.className+=' bad'; pill.textContent=fmtDur(mins)+' без світла'; }
+    else { pill.className+=' ok'; pill.textContent='Відключень немає'; }
+    row.appendChild(pill);
+    q.appendChild(row);
+
+    var bar=document.createElement('div'); q.appendChild(bar);
+    renderBar(bar, day, day.offset===0);
+
+    var evs=document.createElement('div'); q.appendChild(evs);
+    renderEvents(evs, day);
+  });
+}
+build();
+</script>
+</body>
+</html>
