@@ -3,7 +3,7 @@ import json
 import hashlib
 import shutil
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import requests
@@ -14,6 +14,10 @@ from telegram_handler import send_notification
 API_BASE_URL = os.getenv("API_BASE_URL")
 URL = os.environ.get('URL')
 SUBSCRIBE = os.environ.get('SUBSCRIBE')
+# Якщо 1/true — рендерити PNG графіків у GridFS (потрібен playwright)
+RENDER_SCHEDULE_IMAGES = os.getenv("RENDER_SCHEDULE_IMAGES", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 QUEUES = [(i, j) for i in range(1, 7) for j in range(1, 2 + 1)]
 
@@ -525,6 +529,146 @@ def send_notification_safe(message: str, img_path=None) -> bool:
     return send_notification(message, img_path)
 
 
+def records_to_slots_for_date(records: List[Dict], date: str) -> List[Dict]:
+    """Червоні інтервали за дату → [{from, to, type}] (сусідні злиті через group_spans)."""
+    outages = [
+        r for r in (records or [])
+        if r.get("date") == date and (r.get("color") or "").strip().lower() == "red"
+    ]
+    if not outages:
+        return []
+    grouped = group_spans(
+        [{"span": o["span"], "change": "added"} for o in outages]
+    )
+    slots: List[Dict] = []
+    for g in grouped:
+        start = g.get("start") or ""
+        end = g.get("end") or ""
+        if start and end:
+            slots.append({"from": start, "to": end, "type": "schedule"})
+    return slots
+
+
+def sync_schedules_to_mongo(norm_by_queue: Dict[str, List[Dict]]) -> None:
+    """
+    Пише слоти (і за можливості PNG) у спільну Mongo для бота ztoe:
+      queue_schedules + GridFS schedule_images.
+    Викликається на КОЖНОМУ успішному прогоні, навіть без змін у diff.
+    """
+    mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
+    if not mongo_uri:
+        log_to_buffer("⚠️ MONGO_URI / MAYACHOK_MONGO_URI не задано — пропуск запису графіків у БД")
+        return
+
+    try:
+        from mongo_store import upsert_queue_schedule, save_schedule_png
+    except Exception as e:
+        log_to_buffer(f"⚠️ Не вдалося імпортувати mongo_store: {e}")
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    render_ok = False
+    if RENDER_SCHEDULE_IMAGES:
+        try:
+            from render_schedule import (
+                build_data,
+                events_from_slots,
+                render_to_png,
+            )
+            render_ok = True
+        except Exception as e:
+            log_to_buffer(f"⚠️ render_schedule недоступний (PNG не буде): {e}")
+
+    saved = 0
+    images = 0
+    errors = 0
+
+    for queue_key, records in sorted(norm_by_queue.items()):
+        try:
+            parts = queue_key.split(".")
+            if len(parts) != 2:
+                continue
+            cherga, pidcherga = parts[0], parts[1]
+
+            slots_today = records_to_slots_for_date(records, today)
+            slots_tomorrow = records_to_slots_for_date(records, tomorrow)
+
+            # У документі тримаємо сьогоднішні слоти (бот показує «Сьогодні»)
+            text_parts = [f"{s['from']}–{s['to']}" for s in slots_today]
+            text = ", ".join(text_parts) if text_parts else "немає відключень"
+
+            extra = {
+                "slots_tomorrow": slots_tomorrow,
+                "queue_key": queue_key,
+                "source": "monitor.py",
+            }
+            # Основний ключ бота: queue=4, subqueue=2 → _id "4|2"
+            upsert_queue_schedule(
+                cherga,
+                pidcherga,
+                slots=slots_today,
+                events=slots_today,
+                text=text,
+                date=today,
+                known=True,
+                extra=extra,
+            )
+            # Alias: якщо в адресі queue="4.2" і subqueue="" → _id "4.2"
+            upsert_queue_schedule(
+                queue_key,
+                "",
+                slots=slots_today,
+                events=slots_today,
+                text=text,
+                date=today,
+                known=True,
+                extra=extra,
+            )
+            saved += 1
+
+            if render_ok:
+                try:
+                    qlabel = queue_key
+                    data = build_data(
+                        queue=qlabel,
+                        status_title="Статус Житомирської області",
+                        status_sub="Застосовані графіки погодинних відключень",
+                        period=today,
+                        days=[
+                            {
+                                "label": "Сьогодні",
+                                "offset": 0,
+                                "known": True,
+                                "events": events_from_slots(slots_today),
+                            },
+                            {
+                                "label": "Завтра",
+                                "offset": 1,
+                                "known": bool(slots_tomorrow),
+                                "events": events_from_slots(slots_tomorrow),
+                            },
+                        ],
+                    )
+                    png = render_to_png(data)
+                    if png:
+                        # PNG для обох ключів (4|2 і 4.2)
+                        save_schedule_png(cherga, pidcherga, png)
+                        save_schedule_png(queue_key, "", png)
+                        images += 1
+                except Exception as e:
+                    log_to_buffer(f"⚠️ PNG для {queue_key}: {e}")
+                    errors += 1
+        except Exception as e:
+            log_to_buffer(f"❌ Mongo sync {queue_key}: {e}")
+            errors += 1
+
+    log_to_buffer(
+        f"🗄 Mongo queue_schedules: збережено {saved} черг, PNG={images}, помилок={errors}"
+    )
+
+
 def main():
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_to_buffer("=" * 60)
@@ -551,6 +695,12 @@ def main():
         
         save_json(norm_by_queue, CURRENT_FILE)
         log_to_buffer("💾 Нормалізовані дані збережено в data/current.json")
+
+        # 3b. Завжди синхронізуємо графіки в Mongo для бота (навіть без змін)
+        try:
+            sync_schedules_to_mongo(norm_by_queue)
+        except Exception as e:
+            log_to_buffer(f"❌ sync_schedules_to_mongo: {e}")
 
         # 4. Завантажити попередній стан
         last_state = load_last_state()
