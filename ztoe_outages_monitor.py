@@ -164,7 +164,7 @@ def main() -> int:
     if not users:
         log.info("Немає кого перевіряти")
         bot = Bot(token=bot_token)
-        send_log(f"✅ <b>ZTOE outages</b>\ndb: <code>{mongo_db}</code>\nusers: 0\n(немає підписників)")
+        send_log("✅ <b>Перевірка відключень</b>\n\nНемає підписників з увімкненими сповіщеннями.")
         return 0
 
     # groups[(otg_id, city_id)] = [(user, addr), ...]
@@ -248,11 +248,10 @@ def main() -> int:
             log.error("Send fail %s: %s", tid, e)
 
     summary = (
-        f"✅ <b>ZTOE outages</b>\n"
-        f"db: <code>{mongo_db}</code>\n"
-        f"users: {len(users)}\n"
-        f"groups: {groups_checked}\n"
-        f"notifications: {sent}"
+        f"✅ <b>Перевірка відключень</b>\n\n"
+        f"Підписників з адресами: <b>{len(users)}</b>\n"
+        f"Перевірено груп адрес: <b>{groups_checked}</b>\n"
+        f"Надіслано сповіщень: <b>{sent}</b>"
     )
     log.info(
         "Готово: users=%s groups=%s notifications=%s",

@@ -314,7 +314,7 @@ def main() -> int:
     if not docs:
         log.info("Немає адрес для перевірки — вихід")
         bot = Bot(token=bot_token)
-        send_log(f"✅ <b>ZTOE queues</b>\ndb: <code>{mongo_db}</code>\nchecked: 0\n(немає адрес у queue_directory)")
+        send_log("✅ <b>Перевірка черг</b>\n\nУ базі ще немає збережених адрес з чергами.")
         return 0
 
     bot = Bot(token=bot_token)
@@ -455,13 +455,12 @@ def main() -> int:
             log.info("Перша фіксація черги (без notify): %s", label)
 
     summary = (
-        f"✅ <b>ZTOE queues</b>\n"
-        f"db: <code>{mongo_db}</code>\n"
-        f"checked: {checked}\n"
-        f"changed: {changed}\n"
-        f"notified: {notified_users}\n"
-        f"temporary_skip: {skipped_temp}\n"
-        f"errors: {errors}"
+        f"✅ <b>Перевірка черг</b>\n\n"
+        f"Перевірено адрес: <b>{checked}</b>\n"
+        f"Черга змінилась: <b>{changed}</b>\n"
+        f"Сповіщено людей: <b>{notified_users}</b>\n"
+        f"Сайт тимчасово недоступний: <b>{skipped_temp}</b>\n"
+        f"Помилок: <b>{errors}</b>"
     )
     log.info(
         "Готово: checked=%s changed=%s notified=%s temp=%s errors=%s",
