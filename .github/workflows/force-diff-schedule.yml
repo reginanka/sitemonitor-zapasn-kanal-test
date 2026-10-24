@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       force_queues:
-        description: "Черги через кому (напр. 1.1,2.1). За замовч. 1.1"
+        description: "Черги через кому (1.1,2.1) або all — усі. За замовч. all"
         required: false
-        default: "1.1"
+        default: "all"
         type: string
       force_max_flip:
-        description: "Скільки інтервалів максимум перевернути (white↔red)"
+        description: "Скільки інтервалів перевернути НА КОЖНУ чергу (white↔red)"
         required: false
         default: "8"
         type: string
