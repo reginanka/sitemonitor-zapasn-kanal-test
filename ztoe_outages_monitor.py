@@ -255,8 +255,8 @@ def main() -> int:
     summary = (
         f"✅ <b>Перевірка відключень</b>\n\n"
         f"Підписників з адресами: <b>{len(users)}</b>\n"
-        f"Перевірено груп адрес: <b>{groups_checked}</b>\n"
-        f"Надіслано сповіщень: <b>{sent}</b>"
+        f"Перевірено локацій: <b>{groups_checked}</b>\n"
+        f"Сповіщень: <b>{sent}</b>"
     )
     log.info(
         "Готово: users=%s groups=%s notifications=%s",
