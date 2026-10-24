@@ -21,6 +21,7 @@ jobs:
       ZTOE_MONGO_DB: ${{ secrets.ZTOE_MONGO_DB }}
       ZTOE_BOT_TOKEN: ${{ secrets.ZTOE_BOT_TOKEN }}
       TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
     steps:
       - name: Checkout repository
