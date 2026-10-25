@@ -131,6 +131,47 @@ def save_schedule_png(
     return file_id
 
 
+def get_schedule_png(
+    queue: str,
+    subqueue: str = "",
+) -> Optional[bytes]:
+    """Читає PNG черги з GridFS. None якщо немає."""
+    db = get_db()
+    q = (queue or "").strip()
+    sq = (subqueue or "").strip()
+    _id = f"{q}|{sq}" if sq else q
+    doc = db["queue_schedules"].find_one({"_id": _id}) or {}
+    file_id = doc.get("image_file_id")
+    if not file_id:
+        # fallback: спроба 4.2 як queue без subqueue
+        if sq:
+            alt = db["queue_schedules"].find_one({"_id": f"{q}.{sq}"}) or {}
+            file_id = alt.get("image_file_id")
+        if not file_id and "." in q and not sq:
+            parts = q.split(".", 1)
+            alt = db["queue_schedules"].find_one({"_id": f"{parts[0]}|{parts[1]}"}) or {}
+            file_id = alt.get("image_file_id")
+    if not file_id:
+        return None
+    fs = GridFS(db, collection="schedule_images")
+    try:
+        return fs.get(file_id).read()
+    except Exception:
+        return None
+
+
+def list_queue_schedule_ids() -> list[tuple[str, str]]:
+    """Усі (queue, subqueue) з queue_schedules."""
+    db = get_db()
+    out = []
+    for doc in db["queue_schedules"].find({}, {"queue": 1, "subqueue": 1}):
+        q = str(doc.get("queue") or "").strip()
+        sq = str(doc.get("subqueue") or "").strip()
+        if q:
+            out.append((q, sq))
+    return out
+
+
 # ---------- outages (повні документи для /check) ----------
 
 def upsert_outage(doc: dict) -> str:

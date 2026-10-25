@@ -549,6 +549,31 @@ def main() -> None:
             return
         save_state(current)
         log_to_buffer("✅ Сповіщення надіслано, стан збережено в Mongo")
+
+        # Перегенерація PNG черг (новий статус у шапці) + DM підписникам бота
+        # Картинки + підпис одним повідомленням (media group)
+        try:
+            from bot_notify import (
+                collect_notify_targets,
+                notify_bot_users_with_images,
+                regenerate_queues_for_labels,
+            )
+
+            targets = collect_notify_targets(None)  # усі черги підписників
+            labels = sorted({q for qs in targets.values() for q in qs})
+            if labels:
+                log_to_buffer(f"🖼 Перегенерація PNG для {len(labels)} черг підписників…")
+                n = regenerate_queues_for_labels(labels)
+                log_to_buffer(f"✓ Перегенеровано PNG: {n}/{len(labels)}")
+            else:
+                log_to_buffer("ℹ️ Немає черг підписників — PNG не перегенеровую")
+
+            notify_bot_users_with_images(
+                message,
+                all_user_queues=True,
+            )
+        except Exception as e:
+            log_to_buffer(f"⚠️ Перегенерація/DM після статусу: {e}")
     except Exception as e:
         log_to_buffer(f"❌ Критична помилка Укренерго 2: {e}")
     finally:

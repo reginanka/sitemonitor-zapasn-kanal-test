@@ -699,97 +699,21 @@ def notify_bot_users(
     """
     Сповіщення підписникам бота ztoe (users.notify=true),
     у яких адреса з чергою з changed_queues.
-    Текст — той самий, що в канал (без посилань-дублів якщо дуже довгий).
+
+    Картинки графіків + підпис одним повідомленням (media group).
+    Якщо PNG ще немає — лише текст.
     """
-    mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
-    bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-    if not mongo_uri:
-        log_to_buffer("⚠️ Mongo URI немає — пропуск сповіщень користувачам бота")
-        return
-    if not bot_token:
-        log_to_buffer("⚠️ ZTOE_BOT_TOKEN / TELEGRAM_BOT_TOKEN немає — пропуск DM")
-        return
-    if not changed_queues:
-        return
-
     try:
-        import asyncio
-        import time
-        from pymongo import MongoClient
-        from telegram import Bot
-    except Exception as e:
-        log_to_buffer(f"⚠️ Імпорт для DM: {e}")
-        return
+        from bot_notify import notify_bot_users_with_images
 
-    db_name = (
-        os.getenv("ZTOE_MONGO_DB")
-        or os.getenv("MONGO_DB")
-        or os.getenv("MAYACHOK_MONGO_DB")
-        or "vidkluchennya"
-    )
-    try:
-        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=15000)
-        db = client[db_name]
-        users = list(db["users"].find({"notify": True}))
-    except Exception as e:
-        log_to_buffer(f"❌ Mongo users: {e}")
-        return
-
-    def user_addresses(u: dict) -> list:
-        if u.get("addresses"):
-            return u["addresses"]
-        if u.get("address"):
-            return [u["address"]]
-        return []
-
-    targets: Dict[int, List[str]] = {}  # telegram_id -> matched queue keys
-    for u in users:
-        tid = u.get("telegram_id")
-        if tid is None:
-            continue
-        matched = []
-        for addr in user_addresses(u):
-            for qk in changed_queues:
-                if addr_matches_queue(addr, qk) and qk not in matched:
-                    matched.append(qk)
-        if matched:
-            targets[int(tid)] = matched
-
-    if not targets:
-        log_to_buffer("ℹ️ Немає підписників бота з чергами зі змінами — DM не шлемо")
-        return
-
-    # Обрізати під ліміт Telegram
-    body = channel_message or "🔔 Оновлення графіка відключень"
-    if len(body) > 4000:
-        body = body[:3900] + "\n\n…(скорочено)"
-
-    bot = Bot(token=bot_token)
-    sent = 0
-    failed = 0
-
-    async def _send_one(chat_id: int, text: str):
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+        notify_bot_users_with_images(
+            channel_message or "🔔 Оновлення графіка відключень",
+            queue_keys=changed_queues or [],
+            all_user_queues=False,
         )
+    except Exception as e:
+        log_to_buffer(f"❌ notify_bot_users: {e}")
 
-    for tid, qs in targets.items():
-        q_note = ", ".join(qs)
-        text = f"{body}\n\n📌 Твої черги: <b>{q_note}</b>"
-        if len(text) > 4096:
-            text = text[:4000] + "\n…"
-        try:
-            asyncio.run(_send_one(tid, text))
-            sent += 1
-            time.sleep(0.35)
-        except Exception as e:
-            failed += 1
-            log_to_buffer(f"⚠️ DM {tid}: {e}")
-
-    log_to_buffer(f"📬 DM бота: надіслано {sent}, помилок {failed}, цілей {len(targets)}")
 
 
 def main():
