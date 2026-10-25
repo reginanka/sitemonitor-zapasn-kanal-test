@@ -227,3 +227,66 @@ def outage_from_api_item(o: dict) -> dict:
             "id": o.get("id"),
         },
     }
+
+
+# ---------- site screenshot (один скрін ЖОЕ для /check і каналу) ----------
+
+SITE_SCREENSHOT_ID = "site_screenshot_latest"
+SITE_SCREENSHOT_FILENAME = "site_screenshot_latest.png"
+
+
+def save_site_screenshot(png_bytes: bytes, *, source_hash: str = "") -> Any:
+    """
+    Зберігає офіційний скрін сайту ЖОЕ в GridFS (bucket schedule_images)
+    і метадані в колекції site_meta.
+    """
+    if not png_bytes:
+        return None
+    db = get_db()
+    fs = GridFS(db, collection="schedule_images")
+
+    # прибрати старий файл з тим самим ім'ям
+    for old in fs.find({"filename": SITE_SCREENSHOT_FILENAME}):
+        try:
+            fs.delete(old._id)
+        except Exception:
+            pass
+
+    file_id = fs.put(
+        png_bytes,
+        filename=SITE_SCREENSHOT_FILENAME,
+        content_type="image/png",
+        metadata={"kind": "site_screenshot", "hash": source_hash or ""},
+    )
+    db["site_meta"].update_one(
+        {"_id": SITE_SCREENSHOT_ID},
+        {
+            "$set": {
+                "image_file_id": file_id,
+                "filename": SITE_SCREENSHOT_FILENAME,
+                "hash": source_hash or "",
+                "size": len(png_bytes),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+    return file_id
+
+
+def get_site_screenshot() -> Optional[bytes]:
+    """Читає останній скрін ЖОЕ з GridFS."""
+    db = get_db()
+    meta = db["site_meta"].find_one({"_id": SITE_SCREENSHOT_ID}) or {}
+    file_id = meta.get("image_file_id")
+    fs = GridFS(db, collection="schedule_images")
+    if file_id:
+        try:
+            return fs.get(file_id).read()
+        except Exception:
+            pass
+    try:
+        grid_out = fs.get_last_version(SITE_SCREENSHOT_FILENAME)
+        return grid_out.read()
+    except Exception:
+        return None

@@ -808,6 +808,16 @@ def main():
         from pathlib import Path as _Path
         img_path = _Path(screenshot_path) if screenshot_path else None
 
+        # 7b. Зберегти скрін у Mongo (для /check у боті)
+        if img_path and img_path.exists():
+            try:
+                from mongo_store import save_site_screenshot
+                png_bytes = img_path.read_bytes()
+                fid = save_site_screenshot(png_bytes, source_hash=screenshot_hash or "")
+                log_to_buffer(f"🗄 Скрін ЖОЕ збережено в Mongo ({len(png_bytes)} bytes, id={fid})")
+            except Exception as e:
+                log_to_buffer(f"⚠️ Не вдалося зберегти скрін у Mongo: {e}")
+
         # 8. Визначаємо типи змін
         has_new_dates = bool(diff.get("new_dates"))
         has_changes = any(
