@@ -58,7 +58,7 @@ STATUS_FALLBACK = {
         "Енергосистема працює з дефіцитом.",
     ),
     9: (
-        "Застосовані графіки погодинних відключень",
+        "За розпорядженням НЕК Укренерго застосовано графіки погодинних відключень",
         "Діють графіки обмеження споживання.",
     ),
     10: ("Застосовані аварійні відключення", "Аварійні обмеження споживання."),
@@ -66,27 +66,36 @@ STATUS_FALLBACK = {
 }
 
 
-def _fmt_period(period: Any) -> str:
-    """Короткий рядок періоду для шапки картинки."""
+def _parse_iso_kyiv(iso: str) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        try:
+            import pytz
+
+            return dt.astimezone(pytz.timezone("Europe/Kyiv"))
+        except Exception:
+            return dt.astimezone(timezone(timedelta(hours=3)))
+    except Exception:
+        return None
+
+
+def _fmt_period_str(period: Any) -> str:
+    """Короткий рядок періоду (для логів / legacy)."""
     if not isinstance(period, dict):
-        return ""
-    start = period.get("start")
-    end = period.get("end")
+        return str(period or "")
+    start = period.get("start") or period.get("from")
+    end = period.get("end") or period.get("to")
     if not start and not end:
         return ""
 
     def _hm(iso: str) -> str:
-        try:
-            dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-            try:
-                import pytz
-
-                dt = dt.astimezone(pytz.timezone("Europe/Kyiv"))
-            except Exception:
-                dt = dt.astimezone(timezone(timedelta(hours=3)))
+        dt = _parse_iso_kyiv(iso)
+        if dt:
             return dt.strftime("%H:%M")
-        except Exception:
-            return str(iso)[:16]
+        s = str(iso)
+        if ":" in s and len(s) <= 5:
+            return s[:5]
+        return s[:16]
 
     if start and end:
         return f"{_hm(start)}–{_hm(end)}"
@@ -95,10 +104,56 @@ def _fmt_period(period: Any) -> str:
     return f"до {_hm(end)}"
 
 
+def _period_for_template(period: Any) -> dict:
+    """
+    Об'єкт period для нового outage-schedule.html:
+      { from: 'HH:MM', to: 'HH:MM' }
+      або з fromDate/toDate якщо інтервал через північ / кілька днів.
+    """
+    if isinstance(period, dict):
+        # вже у форматі шаблону
+        if period.get("from") and period.get("to") and "start" not in period:
+            return {
+                "from": str(period["from"])[:5],
+                "to": str(period["to"])[:5],
+                **(
+                    {"fromDate": period["fromDate"], "toDate": period["toDate"]}
+                    if period.get("fromDate") and period.get("toDate")
+                    else {}
+                ),
+            }
+
+        start = period.get("start")
+        end = period.get("end")
+        if start or end:
+            ds = _parse_iso_kyiv(start) if start else None
+            de = _parse_iso_kyiv(end) if end else None
+            out: dict[str, str] = {
+                "from": ds.strftime("%H:%M") if ds else "06:00",
+                "to": de.strftime("%H:%M") if de else "23:59",
+            }
+            if ds and de and ds.date() != de.date():
+                out["fromDate"] = ds.strftime("%d.%m")
+                out["toDate"] = de.strftime("%d.%m")
+            return out
+
+    if isinstance(period, str) and period.strip():
+        # "06:00–23:59" або подібне
+        s = period.strip()
+        for sep in ("–", "—", " - ", "-"):
+            if sep in s:
+                a, b = s.split(sep, 1)
+                a, b = a.strip()[:5], b.strip()[:5]
+                if ":" in a and ":" in b:
+                    return {"from": a, "to": b}
+    return {"from": "06:00", "to": "23:59"}
+
+
 def load_ukrenergo_status(db) -> dict:
     """
     Повертає dict:
-      status_title, status_sub, period, status_code, emoji, name_uk
+      status_title, status_sub, period (dict для шаблону), period_str,
+      status_code, emoji, name_uk, raw_title, raw_sub
     """
     doc = db["ukrenergo2_states"].find_one({"slug": REGION_SLUG}) or {}
     code = doc.get("status_code")
@@ -117,23 +172,30 @@ def load_ukrenergo_status(db) -> dict:
     if not title:
         title = "Статус енергосистеми"
 
-    # підзаголовок: body з fallback або status
     sub = ""
     if code_i in STATUS_FALLBACK:
         sub = STATUS_FALLBACK[code_i][1]
     elif doc.get("status"):
         sub = str(doc.get("status"))
 
-    period_str = _fmt_period(doc.get("period"))
-    if period_str:
-        sub = f"{sub} · {period_str}".strip(" ·")
+    raw_period = doc.get("period")
+    period_str = _fmt_period_str(raw_period)
+    period_obj = _period_for_template(raw_period)
 
-    status_title = f"{emoji} {name_uk}".strip() if emoji else name_uk
+    # Для нового шаблону: statusTitle = "Статус Житомирської області"
+    # statusSub = довгий текст від Укренерго
+    status_title = f"Статус {name_uk}" if name_uk else "Статус області"
+    if emoji:
+        status_title = f"{emoji} {status_title}".strip()
+
+    # statusSub — основний текст (title з API / fallback)
+    status_sub = title
 
     return {
         "status_title": status_title,
-        "status_sub": title if not sub else f"{title}",
-        "period": period_str,
+        "status_sub": status_sub,
+        "period": period_obj,
+        "period_str": period_str,
         "status_code": code_i,
         "emoji": emoji,
         "name_uk": name_uk,
@@ -160,6 +222,28 @@ def iter_queue_docs(
         yield doc
 
 
+def _normalize_events(events: list) -> list:
+    """text → note, гарантує type/from/to."""
+    out = []
+    for e in events or []:
+        if not isinstance(e, dict):
+            continue
+        fr = e.get("from") or e.get("start")
+        to = e.get("to") or e.get("end")
+        if not fr or not to:
+            continue
+        note = e.get("note") or e.get("text") or ""
+        out.append(
+            {
+                "type": e.get("type") or "schedule",
+                "from": str(fr)[:5],
+                "to": str(to)[:5],
+                "note": note,
+            }
+        )
+    return out
+
+
 def build_days_from_doc(doc: dict) -> list:
     """Збирає days[] для шаблону з slots / events документа."""
     slots = doc.get("slots") or []
@@ -168,25 +252,64 @@ def build_days_from_doc(doc: dict) -> list:
 
     if not events and slots:
         events = events_from_slots(slots)
+    events = _normalize_events(events)
 
-    # якщо в документі вже є структуровані days — беремо їх
+    # якщо в документі вже є структуровані days — беремо їх (з нормалізацією)
     if isinstance(doc.get("days"), list) and doc["days"]:
-        return doc["days"]
+        days = []
+        for d in doc["days"]:
+            if not isinstance(d, dict):
+                continue
+            days.append(
+                {
+                    **d,
+                    "events": _normalize_events(d.get("events") or []),
+                }
+            )
+        if days:
+            return days
 
-    return [
-        {
-            "label": "Сьогодні",
-            "offset": 0,
-            "known": known,
-            "events": events,
-        },
-        {
-            "label": "Завтра",
-            "offset": 1,
-            "known": False,
-            "events": doc.get("events_tomorrow") or [],
-        },
-    ]
+    tomorrow_events = _normalize_events(
+        doc.get("events_tomorrow")
+        or doc.get("extra", {}).get("slots_tomorrow")
+        or []
+    )
+    # slots_tomorrow може бути списком слотів без type
+    if not tomorrow_events:
+        raw_tm = (doc.get("extra") or {}).get("slots_tomorrow") or []
+        if raw_tm:
+            tomorrow_events = events_from_slots(raw_tm)
+
+    tomorrow_known = bool(tomorrow_events) or bool(doc.get("known_tomorrow"))
+
+    day_today = {
+        "label": "Сьогодні",
+        "offset": 0,
+        "known": known,
+        "events": events,
+    }
+    # дата з документа, якщо є
+    if doc.get("date"):
+        try:
+            # YYYY-MM-DD → DD.MM
+            ds = str(doc["date"])
+            if len(ds) >= 10 and ds[4] == "-":
+                day_today["date"] = f"{ds[8:10]}.{ds[5:7]}"
+        except Exception:
+            pass
+
+    day_tomorrow = {
+        "label": "Завтра",
+        "offset": 1,
+        "known": tomorrow_known,
+        "events": tomorrow_events,
+    }
+    if not tomorrow_known:
+        day_tomorrow["waitNote"] = (
+            "Розпорядження НЕК Укренерго очікується після 18:00"
+        )
+
+    return [day_today, day_tomorrow]
 
 
 def regenerate_one(
@@ -206,7 +329,6 @@ def regenerate_one(
         return "skip"
 
     qlabel = f"{queue}.{subqueue}" if subqueue else queue
-    _id = doc.get("_id") or (f"{queue}|{subqueue}" if subqueue else queue)
 
     if only_missing and doc.get("image_file_id"):
         log.info("skip (є image_file_id): %s", qlabel)
@@ -216,17 +338,18 @@ def regenerate_one(
     data = build_data(
         queue=qlabel,
         status_title=ukr["status_title"],
-        status_sub=ukr.get("raw_title") or ukr["status_sub"],
-        period=ukr.get("period") or "",
+        status_sub=ukr.get("status_sub") or ukr.get("raw_title") or "",
+        period=ukr.get("period") or {"from": "06:00", "to": "23:59"},
         operator=OPERATOR,
         days=days,
     )
 
     log.info(
-        "рендер %s | status=%s | events_today=%s",
+        "рендер %s | status=%s | events_today=%s | period=%s",
         qlabel,
         ukr.get("status_code"),
         len(days[0].get("events") or []) if days else 0,
+        ukr.get("period_str") or ukr.get("period"),
     )
 
     if dry_run:
@@ -288,7 +411,7 @@ def main() -> int:
         "Укренерго: code=%s title=%r period=%r",
         ukr.get("status_code"),
         ukr.get("raw_title"),
-        ukr.get("period"),
+        ukr.get("period_str") or ukr.get("period"),
     )
 
     stats = {"ok": 0, "skip": 0, "dry": 0, "error": 0, "total": 0}

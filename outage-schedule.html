@@ -7,220 +7,327 @@
 <style>
 :root{
   color-scheme:dark;
-  --bg:#0b1630;--card:#13234a;--border:rgba(255,255,255,.14);--border-strong:rgba(255,255,255,.28);--border-stronger:rgba(255,255,255,.55);
-  --text:#eef2fb;--text2:#aab6d3;--text3:#7886a8;
-  --ok:#3fbf6f;--bad:#f2564f;--wait:#34456f;
-  --planned:#f5a524;--emerg:#b86bf2;
-  --bad-bg:#3a1b2b;--bad-border:#a8343a;--bad-text:#ffc5c2;
-  --warn-bg:#3d3320;--warn-text:#ffd58a;
-  --ok-bg:#16382f;--ok-text:#a6e8c0;
-  --pl-bg:#3d3320;--pl-text:#ffd58a;
-  --em-bg:#33214f;--em-text:#e2c4ff;
+  --bg:#090e1a;
+  --card:#131b2e;
+  --inner:#19243c;
+  --border:rgba(255,255,255,.12);
+  --text:#fff;
+  --muted:#94a3b8;
+  --dim:#64748b;
+  --ok:#10b981;
+  --bad:#ef4444;
+  --planned:#f59e0b;
+  --emerg:#a855f7;
+  --wait:#334155;
 }
-*{box-sizing:border-box}
-body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.5}
-.wrap{max-width:420px;margin:0 auto}
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin:0 0 12px}
-.status{background:var(--bad-bg);border-color:var(--bad-border)}
-.status .t{display:flex;align-items:center;gap:8px;font-weight:500;font-size:15px;color:var(--bad-text)}
-.dot{width:12px;height:12px;border-radius:50%;background:var(--bad);display:inline-block}
-.status .s{font-size:14px;margin-top:6px}
-.status .p{font-size:13px;margin-top:4px;color:var(--text2)}
-.head{display:flex;justify-content:space-between;align-items:center}
-.head b{font-weight:500;font-size:15px}
-.head span{font-size:12px;color:var(--text2)}
-.day{margin-top:18px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:8px}
-.day:first-of-type{margin-top:16px}
-.day .d{font-size:13px;color:var(--text2)}
-.pill{font-size:12px;padding:3px 10px;border-radius:8px;white-space:nowrap}
-.pill.bad{background:var(--bad-bg);color:var(--bad-text)}
-.pill.warn{background:var(--warn-bg);color:var(--warn-text)}
-.pill.ok{background:var(--ok-bg);color:var(--ok-text)}
-.rowb{display:flex;align-items:center}
-.body{flex:1;display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:2px;padding:3px;border:1.5px solid var(--border-stronger);border-radius:8px}
-.cap{width:5px;height:16px;background:var(--border-stronger);border-radius:0 3px 3px 0;margin-left:2px}
-.capx{width:5px;margin-left:2px}
-.hr{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:2px;padding:0 3px;margin:3px 7px 10px 1.5px;font-size:11px;color:var(--text);font-weight:500;text-align:center}
-.c{display:flex;height:34px;border-radius:3px;overflow:hidden;gap:1px}
-.c i{flex:1;background:var(--ok);opacity:.88}
-.c i.off{background:var(--bad);opacity:1}
-.c i.planned{background:var(--planned);opacity:1}
-.c i.emerg{background:var(--emerg);opacity:1}
-.c i.wait{background:var(--wait);opacity:1}
-.c.now{outline:2px solid var(--text);outline-offset:1px}
-.ev{display:flex;gap:10px;align-items:flex-start;padding:8px 10px;border-radius:8px;margin-top:8px;font-size:13px}
-.ev.schedule{background:var(--bad-bg)}
-.ev.planned{background:var(--pl-bg)}
-.ev.emerg{background:var(--em-bg)}
-.ev .k{width:10px;height:10px;border-radius:2px;margin-top:6px;flex:none}
-.ev.schedule .k{background:var(--bad)}
-.ev.planned .k{background:var(--planned)}
-.ev.emerg .k{background:var(--emerg)}
-.ev b{font-weight:500}
-.ev .tm{color:var(--text2);white-space:nowrap}
-.ev .tx{color:var(--text2);font-size:12px;margin-top:1px}
-.ev .top{display:flex;justify-content:space-between;gap:8px}
-.lg{display:flex;gap:6px 14px;font-size:12px;color:var(--text2);flex-wrap:wrap}
-.lg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}
-.note{font-size:12px;color:var(--text3);margin-top:6px}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{
+  background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  line-height:1.35;padding:14px 10px;
+  overflow-x:hidden;
+}
+.wrap{width:100%;max-width:480px;margin:0 auto}
+
+/* 1. Статус Укренерго */
+.status-card{
+  background:#2a1523;border:1px solid #a8343a;border-left:5px solid var(--bad);
+  border-radius:12px;padding:12px 14px;margin-bottom:10px;
+}
+.status-top{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:700;color:#fecaca}
+.status-dot{flex:none;width:9px;height:9px;border-radius:50%;background:var(--bad);box-shadow:0 0 6px var(--bad)}
+.status-sub{font-size:12.5px;margin-top:4px;color:#ffeded}
+.status-period{font-size:12px;font-weight:600;color:#fca5a5;margin-top:4px;white-space:pre-line}
+
+/* 2. Шапка черги */
+.header-card{
+  background:var(--card);border:1px solid var(--border);border-radius:12px;
+  padding:12px 14px;margin-bottom:10px;
+  display:flex;justify-content:space-between;align-items:center;gap:10px;
+}
+.queue-pill{
+  flex:none;background:#fbbf24;color:#000;font-size:15px;font-weight:800;
+  padding:5px 12px;border-radius:7px;letter-spacing:.5px;
+}
+.operator-box{text-align:right;min-width:0}
+.operator-name{font-size:13px;font-weight:700;overflow-wrap:anywhere}
+.updated-at{font-size:11px;color:var(--muted)}
+
+/* 3. Легенда */
+.legend{
+  display:flex;flex-wrap:wrap;gap:6px 12px;
+  background:var(--card);border:1px solid var(--border);border-radius:10px;
+  padding:8px 10px;margin-bottom:10px;
+}
+.lg-item{display:flex;align-items:center;gap:5px;font-size:11px;font-weight:600;color:var(--muted);white-space:nowrap}
+.lg-dot{width:8px;height:8px;border-radius:2px;flex:none}
+
+/* 4. Картка дня */
+.day-card{
+  background:var(--card);border:1px solid var(--border);border-radius:14px;
+  padding:12px;margin-bottom:10px;
+}
+.day-header{
+  display:flex;justify-content:space-between;align-items:center;
+  flex-wrap:wrap;gap:6px 8px;margin-bottom:10px;
+}
+.day-title{font-size:14.5px;font-weight:700}
+.day-date{color:var(--muted);font-weight:500}
+.total-pill{font-size:11.5px;font-weight:700;padding:3px 8px;border-radius:6px}
+.total-pill.bad{background:rgba(239,68,68,.2);color:#fca5a5}
+.total-pill.wait{background:rgba(245,158,11,.2);color:#fde68a}
+.total-pill.ok{background:rgba(16,185,129,.2);color:#a7f3d0}
+.day-note{font-size:12px;color:var(--muted);margin-bottom:8px}
+
+/* Інтервали */
+.intervals-title{
+  font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;
+  color:var(--muted);font-weight:700;margin-bottom:6px;
+}
+.intervals-grid{display:flex;flex-direction:column;gap:5px;margin-bottom:10px}
+.interval-badge{
+  display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px 8px;
+  padding:7px 10px;border-radius:7px;border-left:4px solid;background:var(--inner);
+}
+.interval-badge.schedule{border-color:var(--bad)}
+.interval-badge.planned{border-color:var(--planned)}
+.interval-badge.emerg{border-color:var(--emerg)}
+.ib-left{display:flex;align-items:center;gap:7px}
+.ib-time{font-size:14px;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap}
+.ib-tag{font-size:10.5px;font-weight:700;padding:2px 6px;border-radius:4px;color:#fff;white-space:nowrap}
+.schedule .ib-tag{background:#dc2626}
+.planned .ib-tag{background:#d97706}
+.emerg .ib-tag{background:#9333ea}
+.ib-right{font-size:11.5px;font-weight:500;color:var(--muted)}
+
+/* Шкала */
+.timeline-wrapper{
+  background:var(--inner);border:1px solid rgba(255,255,255,.08);
+  border-radius:9px;padding:7px 6px 5px;
+}
+.timeline-row{margin-bottom:7px}
+.timeline-row:last-child{margin-bottom:0}
+.timeline-section-title{
+  display:flex;justify-content:space-between;font-size:9.5px;font-weight:700;
+  color:var(--dim);text-transform:uppercase;margin-bottom:3px;
+}
+.hours-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:2px}
+.hour-box{display:flex;flex-direction:column;align-items:center;min-width:0}
+.slots-pair{
+  display:flex;width:100%;height:22px;border-radius:3px;overflow:hidden;
+  background:rgba(0,0,0,.3);gap:1px;
+}
+.s-half{flex:1;min-width:0;height:100%}
+.s-half.ok{background:var(--ok)}
+.s-half.off{background:var(--bad)}
+.s-half.planned{background:var(--planned)}
+.s-half.emerg{background:var(--emerg)}
+.s-half.wait{background:var(--wait)}
+.hour-label{font-size:9.5px;font-weight:700;margin-top:2px;color:var(--muted)}
+.hour-label.accent{color:#fff}
+
+@media (max-width:340px){
+  .hour-label{font-size:8.5px}
+  .ib-time{font-size:13px}
+}
 </style>
 </head>
 <body>
-<div class="wrap">
+<div class="wrap" id="app"></div>
 
-  <div class="card status">
-    <div class="t"><span class="dot"></span><span id="st-title"></span></div>
-    <div class="s" id="st-sub"></div>
-    <div class="p" id="st-period"></div>
-  </div>
-
-  <div class="card" id="queue"></div>
-
-  <div class="lg">
-    <span><i style="background:var(--ok)"></i>Світло є</span>
-    <span><i style="background:var(--bad)"></i>За графіком</span>
-    <span><i style="background:var(--planned)"></i>Планове</span>
-    <span><i style="background:var(--emerg)"></i>Аварійне</span>
-    <span><i style="background:var(--wait)"></i>Невідомо</span>
-  </div>
-  <div class="note">Клітинка — година, кожна половинка — 30 хвилин. Рамка — поточна година.</div>
-
-</div>
+<noscript>
+  <p style="padding:16px;color:#fca5a5">Для відображення графіка потрібен JavaScript.</p>
+</noscript>
 
 <script>
-/* ================= ДАНІ (міняти тут) =================
+/* ===================== ДАНІ (міняти тільки тут) =====================
    type: 'schedule' — за графіком (червоний)
-         'planned'  — планове відключення (жовтий)
-         'emerg'    — аварійне відключення (фіолетовий)
-   from/to — "ГГ:ХХ" (можна не вказувати, тоді це просто повідомлення)
-   text    — пояснення (необов'язково)
-   known   — чи вже опублікований графік на цей день
-   Події нижче — ПРИКЛАД, заміни своїми. */
+         'planned'  — планове (жовтий)
+         'emerg'    — аварійне (фіолетовий)
+   from/to — "ГГ:ХХ"; note — коротка примітка (необов'язково)
+   date    — дата для підпису "ДД.ММ"; якщо не вказати, підставиться сама
+   known   — false = графік ще не опубліковано (сіра шкала)
+   period: один день  { from:'06:00', to:'23:59' }
+           кілька днів { from:'22:00', fromDate:'16.10', to:'01:00', toDate:'17.10' } */
 var DATA = {
   statusTitle: 'Статус Житомирської області',
-  statusSub:   'Застосовані графіки погодинних відключень',
-  period:      'Період: 21.10, 06:00 — 21.10, 23:59',
+  statusSub:   'За розпорядженням НЕК Укренерго застосовано графіки погодинних відключень',
+  period:      { from:'06:00', to:'23:59' },
   queue:       '4.2',
   operator:    'Житомиробленерго',
+  updated:     '16.10 о 08:30',            // '' — щоб прибрати рядок
   days: [
-    { label:'Сьогодні', offset:0, known:true, events:[
-      { type:'planned',  from:'10:00', to:'14:00', text:'Планові ремонтні роботи на мережах' },
-      { type:'emerg',    from:'16:20', to:'17:45', text:'Пошкодження лінії, бригада працює на місці' },
+    { label:'Сьогодні', date:'16.10', offset:0, known:true, events:[
+      { type:'planned',  from:'10:00', to:'14:00', note:'Ремонт' },
+      { type:'emerg',    from:'16:20', to:'17:45' },
       { type:'schedule', from:'19:30', to:'22:00' }
     ]},
-    { label:'Завтра', offset:1, known:false, events:[] }
+    { label:'Завтра', date:'17.10', offset:1, known:false, waitNote:'Розпорядження НЕК Укренерго очікується після 18:00', events:[] }
   ]
 };
+/* ==================================================================== */
 
-var TYPE_NAME = { schedule:'Відключення за графіком', planned:'Планове відключення', emerg:'Аварійне відключення' };
-var PRIORITY  = { schedule:1, planned:2, emerg:3 };
-var CLASS     = { schedule:'off', planned:'planned', emerg:'emerg' };
+var TAG   = { schedule:'Графік', planned:'Планове', emerg:'Аварійне' };
+var CLS   = { schedule:'off',    planned:'planned', emerg:'emerg' };
+var PRIO  = { schedule:1, planned:2, emerg:3 };
 
-function toMin(s){ var p=s.split(':'); return (+p[0])*60+(+p[1]); }
 function pad(n){ return (n<10?'0':'')+n; }
-function fmtDate(d){ return pad(d.getDate())+'.'+pad(d.getMonth()+1); }
-function fmtDur(m){ var h=Math.floor(m/60), r=m%60; return (h?h+' год':'')+(h&&r?' ':'')+(r?r+' хв':''); }
+function toMin(s){ var p=String(s).split(':'); return (+p[0])*60+(+p[1]||0); }
+function fmtDur(m){
+  var h=Math.floor(m/60), r=m%60, a=[];
+  if(h) a.push(h+' год');
+  if(r) a.push(r+' хв');
+  return a.join(' ')||'0 хв';
+}
+function autoDate(offset){
+  var d=new Date(); d.setDate(d.getDate()+(offset||0));
+  return pad(d.getDate())+'.'+pad(d.getMonth()+1);
+}
+function el(tag, cls, text){
+  var e=document.createElement(tag);
+  if(cls) e.className=cls;
+  if(text!==undefined) e.textContent=text;
+  return e;
+}
+function evRange(e){
+  var f=toMin(e.from), t=toMin(e.to);
+  if(t<=f) t=24*60; // інтервал через північ — обрізаємо до кінця доби
+  return [f,t];
+}
 
-function slotState(day, slot){
+/* стан півгодинного слота (0..47) */
+function slotClass(day, slot){
   var a=slot*30, b=a+30, best=null;
   day.events.forEach(function(e){
-    if(!e.from||!e.to) return;
-    var f=toMin(e.from), t=toMin(e.to);
-    var overlap=Math.min(b,t)-Math.max(a,f);
-    if(overlap>=15 && (!best || PRIORITY[e.type]>PRIORITY[best])) best=e.type;
+    var r=evRange(e);
+    var overlap=Math.min(b,r[1])-Math.max(a,r[0]);
+    if(overlap>=15 && (!best || PRIO[e.type]>PRIO[best])) best=e.type;
   });
-  if(best) return CLASS[best];
-  return day.known ? '' : 'wait';
+  if(best) return CLS[best];
+  return day.known ? 'ok' : 'wait';
 }
 
-function outageMinutes(day){
-  var n=0;
-  for(var s=0;s<48;s++){
-    var a=s*30, b=a+30, hit=false;
-    day.events.forEach(function(e){
-      if(!e.from||!e.to) return;
-      var o=Math.min(b,toMin(e.to))-Math.max(a,toMin(e.from));
-      if(o>=15) hit=true;
-    });
-    if(hit) n+=30;
-  }
-  return n;
+/* сумарний час без світла з точних інтервалів (з об'єднанням перетинів) */
+function totalMinutes(day){
+  var rs=day.events.map(evRange).sort(function(x,y){return x[0]-y[0];});
+  var sum=0, curS=null, curE=null;
+  rs.forEach(function(r){
+    if(curE===null || r[0]>curE){
+      if(curE!==null) sum+=curE-curS;
+      curS=r[0]; curE=r[1];
+    } else if(r[1]>curE){ curE=r[1]; }
+  });
+  if(curE!==null) sum+=curE-curS;
+  return sum;
 }
 
-function renderBar(root, day, markNow){
-  var nowH=new Date().getHours();
-  for(var r=0;r<2;r++){
-    var wrap=document.createElement('div'); wrap.className='rowb';
-    var body=document.createElement('div'); body.className='body';
-    var lab=document.createElement('div'); lab.className='hr';
+function buildTimeline(day){
+  var wrap=el('div','timeline-wrapper');
+  var rows=[
+    {title:'Ніч / Ранок',  range:'00:00 – 12:00', from:0},
+    {title:'День / Вечір', range:'12:00 – 24:00', from:12}
+  ];
+  rows.forEach(function(r){
+    var row=el('div','timeline-row');
+    var t=el('div','timeline-section-title');
+    t.appendChild(el('span','',r.title));
+    t.appendChild(el('span','',r.range));
+    row.appendChild(t);
+    var grid=el('div','hours-grid');
     for(var k=0;k<12;k++){
-      var h=r*12+k;
-      var c=document.createElement('div');
-      c.className='c'+(markNow&&h===nowH?' now':'');
-      for(var s=0;s<2;s++){
-        var i=document.createElement('i'); i.className=slotState(day,h*2+s); c.appendChild(i);
-      }
-      body.appendChild(c);
-      var sp=document.createElement('span'); sp.textContent=h; lab.appendChild(sp);
+      var h=r.from+k;
+      var box=el('div','hour-box');
+      var pair=el('div','slots-pair');
+      for(var s=0;s<2;s++) pair.appendChild(el('div','s-half '+slotClass(day,h*2+s)));
+      box.appendChild(pair);
+      box.appendChild(el('div','hour-label'+(h%3===0?' accent':''),pad(h)));
+      grid.appendChild(box);
     }
-    wrap.appendChild(body);
-    var cap=document.createElement('div'); cap.className=(r===1?'cap':'capx'); wrap.appendChild(cap);
-    root.appendChild(wrap); root.appendChild(lab);
-  }
+    row.appendChild(grid);
+    wrap.appendChild(row);
+  });
+  return wrap;
 }
 
-function renderEvents(root, day){
-  var list=day.events.slice().sort(function(x,y){
-    return (x.from?toMin(x.from):0)-(y.from?toMin(y.from):0);
-  });
-  list.forEach(function(e){
-    var el=document.createElement('div'); el.className='ev '+e.type;
-    var k=document.createElement('span'); k.className='k';
-    var box=document.createElement('div'); box.style.flex='1';
-    var top=document.createElement('div'); top.className='top';
-    var b=document.createElement('b'); b.textContent=TYPE_NAME[e.type];
-    top.appendChild(b);
-    if(e.from&&e.to){
-      var tm=document.createElement('span'); tm.className='tm'; tm.textContent=e.from+'–'+e.to;
-      top.appendChild(tm);
-    }
-    box.appendChild(top);
-    if(e.text){
-      var tx=document.createElement('div'); tx.className='tx'; tx.textContent=e.text;
-      box.appendChild(tx);
-    }
-    el.appendChild(k); el.appendChild(box); root.appendChild(el);
-  });
+function buildDay(day){
+  var card=el('div','day-card');
+
+  var head=el('div','day-header');
+  var title=el('div','day-title',day.label+' ');
+  title.appendChild(el('span','day-date','· '+(day.date||autoDate(day.offset))));
+  head.appendChild(title);
+
+  var mins=totalMinutes(day), pill;
+  if(!day.known){ pill=el('div','total-pill wait','Очікується графік'); }
+  else if(mins>0){ pill=el('div','total-pill bad','Всього: '+fmtDur(mins)+' без світла'); }
+  else { pill=el('div','total-pill ok','Відключень немає'); }
+  head.appendChild(pill);
+  card.appendChild(head);
+
+  if(!day.known && day.waitNote) card.appendChild(el('div','day-note',day.waitNote));
+
+  if(day.events.length){
+    card.appendChild(el('div','intervals-title','Години без світла:'));
+    var grid=el('div','intervals-grid');
+    day.events.slice().sort(function(a,b){return toMin(a.from)-toMin(b.from);}).forEach(function(e){
+      var r=evRange(e);
+      var b=el('div','interval-badge '+e.type);
+      var left=el('div','ib-left');
+      left.appendChild(el('span','ib-time',e.from+' – '+e.to));
+      left.appendChild(el('span','ib-tag',TAG[e.type]));
+      b.appendChild(left);
+      b.appendChild(el('div','ib-right',fmtDur(r[1]-r[0])+(e.note?' · '+e.note:'')));
+      grid.appendChild(b);
+    });
+    card.appendChild(grid);
+  }
+
+  card.appendChild(buildTimeline(day));
+  return card;
 }
 
 function build(){
-  document.getElementById('st-title').textContent=DATA.statusTitle;
-  document.getElementById('st-sub').textContent=DATA.statusSub;
-  document.getElementById('st-period').textContent=DATA.period;
+  var app=document.getElementById('app');
 
-  var q=document.getElementById('queue');
-  var head=document.createElement('div'); head.className='head';
-  head.innerHTML='<b>⚡ Черга '+DATA.queue+'</b><span>'+DATA.operator+'</span>';
-  q.appendChild(head);
+  /* статус */
+  var st=el('div','status-card');
+  var top=el('div','status-top');
+  top.appendChild(el('span','status-dot'));
+  top.appendChild(el('span','',DATA.statusTitle));
+  st.appendChild(top);
+  st.appendChild(el('div','status-sub',DATA.statusSub));
+  var P=DATA.period, ptxt;
+  if(P.fromDate && P.toDate && P.fromDate!==P.toDate){
+    ptxt='Прогнозований період:\nз '+P.from+' ('+P.fromDate+')\nдо '+P.to+' ('+P.toDate+')';
+  } else {
+    ptxt='Прогнозований період: '+P.from+'-'+P.to;
+  }
+  st.appendChild(el('div','status-period',ptxt));
+  app.appendChild(st);
 
-  DATA.days.forEach(function(day, idx){
-    var d=new Date(); d.setDate(d.getDate()+day.offset);
-    var row=document.createElement('div'); row.className='day';
-    row.innerHTML='<span class="d">'+day.label+' · '+fmtDate(d)+'</span>';
-    var pill=document.createElement('span'); pill.className='pill';
-    var mins=outageMinutes(day);
-    if(!day.known){ pill.className+=' warn'; pill.textContent='Чекаємо на графік'; }
-    else if(mins>0){ pill.className+=' bad'; pill.textContent=fmtDur(mins)+' без світла'; }
-    else { pill.className+=' ok'; pill.textContent='Відключень немає'; }
-    row.appendChild(pill);
-    q.appendChild(row);
+  /* шапка черги */
+  var hd=el('div','header-card');
+  hd.appendChild(el('div','queue-pill','ЧЕРГА '+DATA.queue));
+  var ob=el('div','operator-box');
+  ob.appendChild(el('div','operator-name',DATA.operator));
+  if(DATA.updated) ob.appendChild(el('div','updated-at','Оновлено: '+DATA.updated));
+  hd.appendChild(ob);
+  app.appendChild(hd);
 
-    var bar=document.createElement('div'); q.appendChild(bar);
-    renderBar(bar, day, day.offset===0);
-
-    var evs=document.createElement('div'); q.appendChild(evs);
-    renderEvents(evs, day);
+  /* легенда */
+  var lg=el('div','legend');
+  [['var(--ok)','Світло є'],['var(--bad)','За графіком'],['var(--planned)','Планове'],
+   ['var(--emerg)','Аварійне'],['var(--wait)','Невідомо']].forEach(function(x){
+    var it=el('div','lg-item');
+    var d=el('span','lg-dot'); d.style.background=x[0];
+    it.appendChild(d); it.appendChild(document.createTextNode(x[1]));
+    lg.appendChild(it);
   });
+  app.appendChild(lg);
+
+  /* дні */
+  DATA.days.forEach(function(day){ app.appendChild(buildDay(day)); });
 }
 build();
 </script>
