@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """
-Перевірка аварійних / планових відключень Житомиробленерго для підписників бота.
+Аварійні / планові відключення ЖОЕ → підписники бота.
 
-Читає users з Mongo (notify=true, є addresses),
-тягне /pw_accidents + /pw_accident_planeds (усі сторінки),
-порівнює з outages_cache за content-fingerprint (не лише id),
-пише full docs у outages (для /check у боті),
-шле Telegram лише на реально нові події по вулиці.
-
-Secrets / env:
-  MAYACHOK_MONGO_URI або MONGO_URI
-  ZTOE_MONGO_DB або MONGO_DB
-  ZTOE_BOT_TOKEN або TELEGRAM_BOT_TOKEN
-  ZTOE_API_BASE (напр. https://api-ztoe-poweron.inneti.net/api)
+- Усі сторінки API
+- Дедуп по fingerprint (не спам на новий id)
+- План після відомої аварії не дублює
+- Full docs у Mongo outages (+ queue_key) → /check і PNG (planned/emerg)
+- При новій події: перегенерація PNG черги + повідомлення з картинкою
 """
 
 from __future__ import annotations
@@ -23,11 +17,12 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Tuple
 
 import httpx
 from pymongo import MongoClient
-from telegram import Bot
+from telegram import Bot, InputMediaPhoto
+from telegram import InputFile
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +34,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 API_BASE = (os.getenv("ZTOE_API_BASE") or os.getenv("API_BASE") or "").rstrip("/")
 if not API_BASE:
-    raise SystemExit("Немає ZTOE_API_BASE (базовий URL API відключень)")
+    raise SystemExit("Немає ZTOE_API_BASE")
 
 TYPE_LABELS = {
     0: ("Планове", "заплановані роботи (ремонт, обслуговування)"),
@@ -48,13 +43,13 @@ TYPE_LABELS = {
     3: ("Планове", "заплановані роботи (ремонт, обслуговування)"),
 }
 
-# typeOff → «сімейство» для дедупу (аварія vs план)
+
 def type_family(type_off) -> str:
     try:
         t = int(type_off)
     except (TypeError, ValueError):
         return "x"
-    if t in (1,):
+    if t == 1:
         return "emerg"
     if t in (0, 3):
         return "planned"
@@ -72,18 +67,16 @@ def get_user_addresses(user: dict) -> list:
 
 
 def _fetch_all_pages(path: str, otg_id: int, city_id: int = None) -> List[dict]:
-    """Усі сторінки hydra-колекції (не лише page=1)."""
     items: List[dict] = []
     page = 1
-    max_pages = 40
     with httpx.Client(
         timeout=30,
         headers={
             "Accept": "application/ld+json",
-            "User-Agent": "ztoe-outages-monitor/1.1",
+            "User-Agent": "ztoe-outages-monitor/1.2",
         },
     ) as client:
-        while page <= max_pages:
+        while page <= 40:
             params = {"page": page, "itemsPerPage": 100, "otg.id": otg_id}
             if city_id:
                 params["city.id"] = city_id
@@ -95,8 +88,7 @@ def _fetch_all_pages(path: str, otg_id: int, city_id: int = None) -> List[dict]:
                 break
             batch = data.get("hydra:member") or []
             items.extend(batch)
-            view = data.get("hydra:view") or {}
-            if not view.get("hydra:next") or not batch:
+            if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
                 break
             page += 1
     return items
@@ -121,32 +113,24 @@ def make_outage_key(outage: dict) -> str:
 
 
 def content_fingerprint(outage: dict) -> str:
-    """
-    Стабільний ключ події: вулиця + будинки + година старту + сімейство типу.
-    API часто видає НОВИЙ id на ту саму ГПВ/аварію → без цього йдуть дублікати.
-    """
     street = outage.get("street") or {}
     sid = street.get("id") or (street.get("name") or "").strip().lower()
     buildings = (outage.get("buildingNames") or "").strip().lower()
-    # нормалізуємо список будинків
     parts = sorted({p.strip() for p in buildings.replace(";", ",").split(",") if p.strip()})
-    bnorm = ",".join(parts)
-    start = (outage.get("dateEvent") or "")[:13]  # YYYY-MM-DDTHH
+    start = (outage.get("dateEvent") or "")[:13]
     fam = type_family(outage.get("typeOff"))
     city = (outage.get("city") or {}).get("id") or ""
-    return f"{city}|{sid}|{bnorm}|{start}|{fam}"
+    return f"{city}|{sid}|{','.join(parts)}|{start}|{fam}"
 
 
 def soft_fingerprint(outage: dict) -> str:
-    """Без типу: та сама вулиця/час/будинки (щоб план після аварії не дублював)."""
     street = outage.get("street") or {}
     sid = street.get("id") or (street.get("name") or "").strip().lower()
     buildings = (outage.get("buildingNames") or "").strip().lower()
     parts = sorted({p.strip() for p in buildings.replace(";", ",").split(",") if p.strip()})
-    bnorm = ",".join(parts)
     start = (outage.get("dateEvent") or "")[:13]
     city = (outage.get("city") or {}).get("id") or ""
-    return f"{city}|{sid}|{bnorm}|{start}"
+    return f"{city}|{sid}|{','.join(parts)}|{start}"
 
 
 def format_outage(outage: dict) -> str:
@@ -158,9 +142,7 @@ def format_outage(outage: dict) -> str:
     type_off = outage.get("typeOff")
     type_name, type_desc = TYPE_LABELS.get(type_off, (f"Тип {type_off}", ""))
     icon = {0: "🟠", 1: "🔴", 2: "🟡", 3: "🟠"}.get(type_off, "⚪")
-
-    text = f"{icon} <b>{city}, {street}</b>"
-    text += f"\n📌 {type_name}"
+    text = f"{icon} <b>{city}, {street}</b>\n📌 {type_name}"
     if type_desc:
         text += f" — {type_desc}"
     if buildings:
@@ -189,28 +171,32 @@ def matches_street(outage: dict, street_id, street_name: str) -> bool:
 
 
 def matches_building(outage: dict, house: str) -> bool:
-    """Якщо в адресі є номер будинку — перевіряємо, що він у buildingNames."""
     house = (house or "").strip()
     if not house:
         return True
     buildings = (outage.get("buildingNames") or "").strip()
     if not buildings:
-        return True  # API без будинків — не відсікаємо
+        return True
     tokens = {p.strip().lower() for p in buildings.replace(";", ",").split(",") if p.strip()}
     h = house.lower()
     if h in tokens:
         return True
-    # 066 vs 66
     h2 = h.lstrip("0") or "0"
-    if h2 in tokens or any(t.lstrip("0") == h2 for t in tokens):
-        return True
-    return False
+    return h2 in tokens or any(t.lstrip("0") == h2 for t in tokens)
 
 
-def outage_to_mongo_doc(outage: dict) -> dict:
+def outage_to_mongo_doc(outage: dict, queue_key: str = "") -> dict:
+    from outage_events import parse_queue_from_koment
+
     city = outage.get("city") or {}
     street = outage.get("street") or {}
     otg = outage.get("otg") or {}
+    qk = queue_key or parse_queue_from_koment(outage.get("koment") or "") or ""
+    ch, pid = "", ""
+    if qk:
+        parts = qk.replace("|", ".").split(".")
+        ch = parts[0]
+        pid = parts[1] if len(parts) > 1 else ""
     return {
         "source_id": outage.get("id"),
         "source": outage.get("_source"),
@@ -225,10 +211,55 @@ def outage_to_mongo_doc(outage: dict) -> dict:
         "dateEvent": outage.get("dateEvent"),
         "datePlanIn": outage.get("datePlanIn"),
         "koment": outage.get("koment"),
+        "queue_key": qk,
+        "queue": ch,
+        "subqueue": pid,
         "fingerprint": content_fingerprint(outage),
         "soft_fp": soft_fingerprint(outage),
         "updated_at": datetime.now(timezone.utc),
     }
+
+
+def user_queue_key(addr: dict) -> str:
+    q = (addr.get("queue") or "").strip()
+    sq = (addr.get("subqueue") or "").strip()
+    if not q:
+        return ""
+    if "." in q or "|" in q:
+        return q.replace("|", ".")
+    return f"{q}.{sq}" if sq else q
+
+
+def regenerate_queue_png(queue_key: str) -> bytes | None:
+    """Перемалювати PNG черги з ГПВ + planned/emerg з outages."""
+    try:
+        from mongo_store import get_db, get_schedule_png, save_schedule_png
+        from regenerate_images import load_ukrenergo_status, regenerate_one
+    except Exception as e:
+        log.warning("regenerate import: %s", e)
+        return None
+
+    db = get_db()
+    ch, _, *rest = (queue_key.replace("|", ".") + ".").split(".")
+    pid = rest[0] if rest and rest[0] else ""
+    # parts properly
+    parts = queue_key.replace("|", ".").split(".")
+    ch = parts[0]
+    pid = parts[1] if len(parts) > 1 else ""
+
+    doc = None
+    for _id in (f"{ch}|{pid}" if pid else ch, f"{ch}.{pid}" if pid else ch, ch):
+        doc = db["queue_schedules"].find_one({"_id": _id})
+        if doc:
+            break
+    if not doc:
+        doc = {"queue": ch, "subqueue": pid, "slots": [], "events": [], "known": True}
+
+    ukr = load_ukrenergo_status(db)
+    status = regenerate_one(doc, ukr, dry_run=False, only_missing=False)
+    if status != "ok":
+        log.warning("regenerate %s → %s", queue_key, status)
+    return get_schedule_png(ch, pid) or get_schedule_png(queue_key, "")
 
 
 def main() -> int:
@@ -249,8 +280,6 @@ def main() -> int:
     outages_full = db["outages"]
 
     users = list(users_col.find({"notify": True}))
-    # збираємо (user, addr) з валідним otg
-    pairs: List[Tuple[dict, dict]] = []
     groups: Dict[Tuple[int, int], List[Tuple[dict, dict]]] = {}
     for u in users:
         for addr in get_user_addresses(u):
@@ -265,20 +294,19 @@ def main() -> int:
                 city_id = int(city_id) if city_id else 0
             except (TypeError, ValueError):
                 continue
-            pairs.append((u, addr))
             groups.setdefault((otg_id, city_id), []).append((u, addr))
 
-    log.info("Підписників: %s, пар адрес: %s, груп: %s", len(users), len(pairs), len(groups))
-
+    log.info("users=%s groups=%s", len(users), len(groups))
     bot = Bot(token=bot_token)
     notified: Dict[int, list] = {}
+    queues_to_regen: set = set()
     groups_checked = 0
 
     for (otg_id, city_id), group_pairs in groups.items():
         try:
             outages = fetch_all_outages(otg_id, city_id if city_id else None)
         except Exception as e:
-            log.error("Fetch error otg=%s city=%s: %s", otg_id, city_id, e)
+            log.error("Fetch otg=%s city=%s: %s", otg_id, city_id, e)
             continue
 
         groups_checked += 1
@@ -288,24 +316,17 @@ def main() -> int:
 
         cache_key = f"{otg_id}_{city_id or 0}"
         cache = outages_col.find_one({"_id": cache_key}) or {}
-        prev_ids = set(cache.get("ids") or [])
         prev_fps = set(cache.get("fps") or [])
         prev_soft = set(cache.get("soft_fps") or [])
 
-        # Нові за fingerprint (не за id)
         new_fps = current_fps - prev_fps
         new_outages = [o for o in outages if content_fingerprint(o) in new_fps]
 
-        # План після вже відомої аварії на той самий soft_fp — не спамимо
-        filtered: List[dict] = []
+        filtered = []
         for o in new_outages:
             soft = soft_fingerprint(o)
-            fam = type_family(o.get("typeOff"))
-            if fam == "planned" and soft in prev_soft:
-                log.info(
-                    "skip planned after known event soft=%s id=%s",
-                    soft, o.get("id"),
-                )
+            if type_family(o.get("typeOff")) == "planned" and soft in prev_soft:
+                log.info("skip planned after known soft=%s", soft)
                 continue
             filtered.append(o)
         new_outages = filtered
@@ -316,7 +337,7 @@ def main() -> int:
                 "$set": {
                     "ids": list(current_ids),
                     "fps": list(current_fps),
-                    "soft_fps": list(current_soft | prev_soft),  # накопичуємо soft
+                    "soft_fps": list(current_soft | prev_soft),
                     "updated_at": datetime.now(timezone.utc),
                     "count": len(current_ids),
                 }
@@ -324,73 +345,105 @@ def main() -> int:
             upsert=True,
         )
 
-        # full docs у outages — для /check у боті
         for o in outages:
             doc = outage_to_mongo_doc(o)
             outages_full.update_one(
-                {
-                    "source": doc["source"],
-                    "source_id": doc["source_id"],
-                },
+                {"source": doc["source"], "source_id": doc["source_id"]},
                 {"$set": doc},
                 upsert=True,
             )
 
         if not new_outages:
-            log.info("otg=%s city=%s: без нових (fp)", otg_id, city_id)
             continue
 
-        log.info(
-            "otg=%s city=%s: %s нових (fp), ids_new=%s",
-            otg_id, city_id, len(new_outages), len(current_ids - prev_ids),
-        )
+        log.info("otg=%s city=%s new=%s", otg_id, city_id, len(new_outages))
 
         for user, addr in group_pairs:
             street_id = addr.get("street_id")
             street_name = (addr.get("street_name") or "").lower()
-            house = (
-                addr.get("house")
-                or addr.get("building")
-                or addr.get("bud")
-                or ""
-            )
+            house = addr.get("house") or addr.get("building") or addr.get("bud") or ""
+            uqk = user_queue_key(addr)
             tid = user["telegram_id"]
             for outage in new_outages:
                 if not matches_street(outage, street_id, street_name):
                     continue
                 if not matches_building(outage, str(house)):
                     continue
+                if uqk:
+                    doc = outage_to_mongo_doc(outage, queue_key=uqk)
+                    outages_full.update_one(
+                        {"source": doc["source"], "source_id": doc["source_id"]},
+                        {"$set": doc},
+                        upsert=True,
+                    )
+                    outage["_user_queue"] = uqk
+                    queues_to_regen.add(uqk)
                 notified.setdefault(tid, [])
                 fp = content_fingerprint(outage)
                 if any(content_fingerprint(x) == fp for x in notified[tid]):
                     continue
                 notified[tid].append(outage)
 
+    # перемалювати PNG для черг, де з'явились outages
+    png_by_queue: Dict[str, bytes] = {}
+    for qk in queues_to_regen:
+        try:
+            png = regenerate_queue_png(qk)
+            if png:
+                png_by_queue[qk] = png
+                log.info("PNG оновлено для %s (%s bytes)", qk, len(png))
+        except Exception as e:
+            log.warning("PNG %s: %s", qk, e)
+
     sent = 0
     for tid, outage_list in notified.items():
         text = "⚠️ <b>Нові відключення по твоїх адресах:</b>\n\n"
         text += "\n\n".join(format_outage(o) for o in outage_list[:10])
+        caption = text if len(text) <= 1024 else text[:1000] + "\n…"
 
-        async def _send(chat_id=tid, body=text):
-            await bot.send_message(
-                chat_id=chat_id,
-                text=body,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+        # унікальні черги з цієї пачки
+        qkeys = []
+        for o in outage_list:
+            qk = o.get("_user_queue") or ""
+            if qk and qk not in qkeys:
+                qkeys.append(qk)
+        images = [png_by_queue[q] for q in qkeys if q in png_by_queue]
+
+        async def _send(chat_id=tid, body=text, cap=caption, imgs=images):
+            if imgs:
+                from io import BytesIO
+                media = []
+                for i, png in enumerate(imgs[:10]):
+                    bio = BytesIO(png)
+                    bio.name = f"schedule_{i}.png"
+                    media.append(
+                        InputMediaPhoto(
+                            media=bio,
+                            caption=cap if i == 0 else None,
+                            parse_mode="HTML" if i == 0 else None,
+                        )
+                    )
+                await bot.send_media_group(chat_id=chat_id, media=media)
+                if len(body) > 1024:
+                    await bot.send_message(
+                        chat_id=chat_id, text=body[:4096], parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+            else:
+                await bot.send_message(
+                    chat_id=chat_id, text=body[:4096], parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
 
         try:
             asyncio.run(_send())
             sent += 1
-            log.info("Надіслано %s (%s відключень)", tid, len(outage_list))
-            time.sleep(0.35)
+            log.info("Надіслано %s (outages=%s images=%s)", tid, len(outage_list), len(images))
+            time.sleep(0.4)
         except Exception as e:
             log.error("Send fail %s: %s", tid, e)
 
-    log.info(
-        "Готово: users=%s groups=%s sent=%s",
-        len(users), groups_checked, sent,
-    )
+    log.info("Готово groups=%s sent=%s regen=%s", groups_checked, sent, len(png_by_queue))
     return 0
 
 

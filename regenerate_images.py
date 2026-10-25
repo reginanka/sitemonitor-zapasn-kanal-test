@@ -335,6 +335,17 @@ def regenerate_one(
         return "skip"
 
     days = build_days_from_doc(doc)
+    # планові/аварійні з outages (ГПВ у koment) на шкалу
+    try:
+        from outage_events import load_outage_events_for_queue, merge_events
+        extra = load_outage_events_for_queue(qlabel)
+        for i, day in enumerate(days):
+            if i in extra and extra[i]:
+                day["events"] = merge_events(day.get("events") or [], extra[i])
+                day["known"] = True
+    except Exception as e:
+        log.warning("outage events %s: %s", qlabel, e)
+
     data = build_data(
         queue=qlabel,
         status_title=ukr["status_title"],

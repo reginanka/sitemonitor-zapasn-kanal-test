@@ -679,6 +679,13 @@ def sync_schedules_to_mongo(
 
             if render_ok:
                 try:
+                    try:
+                        from outage_events import load_outage_events_for_queue, merge_events
+                        _extra = load_outage_events_for_queue(queue_key)
+                    except Exception:
+                        _extra = {0: [], 1: []}
+                    _ev_today = merge_events(events_from_slots(slots_today), _extra.get(0) or [])
+                    _ev_tm = merge_events(events_from_slots(slots_tomorrow), _extra.get(1) or [])
                     data = build_data(
                         queue=queue_key,
                         status_title="Статус Житомирської області",
@@ -689,13 +696,13 @@ def sync_schedules_to_mongo(
                                 "label": "Сьогодні",
                                 "offset": 0,
                                 "known": True,
-                                "events": events_from_slots(slots_today),
+                                "events": _ev_today,
                             },
                             {
                                 "label": "Завтра",
                                 "offset": 1,
-                                "known": bool(slots_tomorrow),
-                                "events": events_from_slots(slots_tomorrow),
+                                "known": bool(slots_tomorrow) or bool(_extra.get(1)),
+                                "events": _ev_tm,
                             },
                         ],
                     )
