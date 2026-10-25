@@ -358,13 +358,15 @@ def main() -> int:
 
         log.info("otg=%s city=%s new=%s", otg_id, city_id, len(new_outages))
 
+        # Прив'язка queue_key + PNG для ВСІХ поточних outages по адресах
+        # (навіть якщо сповіщення не шлемо — щоб /check і картинки були актуальні)
         for user, addr in group_pairs:
             street_id = addr.get("street_id")
             street_name = (addr.get("street_name") or "").lower()
             house = addr.get("house") or addr.get("building") or addr.get("bud") or ""
             uqk = user_queue_key(addr)
             tid = user["telegram_id"]
-            for outage in new_outages:
+            for outage in outages:
                 if not matches_street(outage, street_id, street_name):
                     continue
                 if not matches_building(outage, str(house)):
@@ -378,6 +380,14 @@ def main() -> int:
                     )
                     outage["_user_queue"] = uqk
                     queues_to_regen.add(uqk)
+            # сповіщення лише по new_outages
+            for outage in new_outages:
+                if not matches_street(outage, street_id, street_name):
+                    continue
+                if not matches_building(outage, str(house)):
+                    continue
+                if uqk:
+                    outage["_user_queue"] = uqk
                 notified.setdefault(tid, [])
                 fp = content_fingerprint(outage)
                 if any(content_fingerprint(x) == fp for x in notified[tid]):
@@ -442,6 +452,24 @@ def main() -> int:
             time.sleep(0.4)
         except Exception as e:
             log.error("Send fail %s: %s", tid, e)
+
+    # короткий звіт у лог (і опційно в ADMIN_CHAT_ID)
+    summary = (
+        f"✅ Перевірка відключень\n"
+        f"Підписників: {len(users)}\n"
+        f"Локацій: {groups_checked}\n"
+        f"Сповіщень: {sent}\n"
+        f"PNG оновлено: {len(png_by_queue)}"
+    )
+    log.info("%s", summary.replace("\n", " | "))
+    admin = os.getenv("ADMIN_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+    if admin and (sent or png_by_queue):
+        try:
+            async def _adm():
+                await bot.send_message(chat_id=int(admin), text=summary)
+            asyncio.run(_adm())
+        except Exception as e:
+            log.warning("admin summary: %s", e)
 
     log.info("Готово groups=%s sent=%s regen=%s", groups_checked, sent, len(png_by_queue))
     return 0
