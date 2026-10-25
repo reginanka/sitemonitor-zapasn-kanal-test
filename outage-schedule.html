@@ -36,7 +36,6 @@ body{
   border-radius:12px;padding:12px 14px;margin-bottom:10px;
 }
 .status-top{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:700;color:#fecaca}
-.status-dot{flex:none;width:9px;height:9px;border-radius:50%;background:var(--bad);box-shadow:0 0 6px var(--bad)}
 .status-sub{font-size:12.5px;margin-top:4px;color:#ffeded}
 .status-period{font-size:12px;font-weight:600;color:#fca5a5;margin-top:4px;white-space:pre-line}
 
@@ -293,7 +292,6 @@ function build(){
   /* статус */
   var st=el('div','status-card');
   var top=el('div','status-top');
-  top.appendChild(el('span','status-dot'));
   top.appendChild(el('span','',DATA.statusTitle));
   st.appendChild(top);
   st.appendChild(el('div','status-sub',DATA.statusSub));
