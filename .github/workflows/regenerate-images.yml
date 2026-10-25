@@ -11,9 +11,6 @@ on:
         description: "Dry-run (без запису в Mongo)"
         type: boolean
         default: false
-  schedule:
-    # Щодня о 05:15 UTC (~08:15 Київ взимку / 08:15–09:15 влітку)
-    - cron: "15 5 * * *"
 
 jobs:
   regenerate-images:

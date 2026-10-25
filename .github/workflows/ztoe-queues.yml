@@ -2,9 +2,6 @@ name: ZTOE queues weekly
 
 on:
   workflow_dispatch:
-  schedule:
-    # Щонеділі о 04:00 UTC
-    - cron: "0 4 * * 0"
 
 jobs:
   ztoe-queues:
