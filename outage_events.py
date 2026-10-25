@@ -105,7 +105,10 @@ def load_outage_events_for_queue(queue_label: str, *, db=None) -> dict:
     except Exception:
         return result
 
-    seen = set()
+    # Групуємо по (день, from, to) без типу; лишаємо найважливіший тип
+    # emerg > planned
+    prio = {"emerg": 3, "planned": 1, "schedule": 2}
+    best = {}  # (off, fr, to) -> event dict
     for doc in cursor:
         fr = _hhmm(doc.get("dateEvent") or "")
         to = _hhmm(doc.get("datePlanIn") or "") or fr
@@ -115,21 +118,31 @@ def load_outage_events_for_queue(queue_label: str, *, db=None) -> dict:
         if off is None:
             continue
         et = type_to_event_type(doc.get("typeOff"))
-        key = (off, fr, to, et)
-        if key in seen:
-            continue
-        seen.add(key)
+        key = (off, fr, to)
         note = (doc.get("koment") or "").strip()[:40]
-        result[off].append({"type": et, "from": fr, "to": to, "note": note})
+        cand = {"type": et, "from": fr, "to": to, "note": note}
+        prev = best.get(key)
+        if prev is None or prio.get(et, 0) > prio.get(prev.get("type"), 0):
+            best[key] = cand
+    for (off, _fr, _to), ev in best.items():
+        result[off].append(ev)
     return result
 
 
 def merge_events(base: list, extra: list) -> list:
-    out = list(base or [])
-    have = {(e.get("from"), e.get("to"), e.get("type")) for e in out}
-    for e in extra or []:
-        k = (e.get("from"), e.get("to"), e.get("type"))
-        if k not in have and e.get("from") and e.get("to"):
-            out.append(e)
-            have.add(k)
-    return out
+    """
+    Зливає інтервали. Одна й та сама година (from–to):
+    emerg > schedule > planned — лишається один слот.
+    """
+    prio = {"emerg": 3, "schedule": 2, "planned": 1}
+    best = {}
+    for e in list(base or []) + list(extra or []):
+        fr, to = e.get("from"), e.get("to")
+        if not fr or not to:
+            continue
+        key = (fr, to)
+        typ = e.get("type") or "schedule"
+        prev = best.get(key)
+        if prev is None or prio.get(typ, 0) > prio.get(prev.get("type"), 0):
+            best[key] = {**e, "type": typ}
+    return sorted(best.values(), key=lambda x: x.get("from") or "")
