@@ -13,14 +13,18 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
       TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
+      ZTOE_BOT_TOKEN: ${{ secrets.ZTOE_BOT_TOKEN }}
       SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
       UKRENERGO2_REGIONS_URL: ${{ secrets.UKRENERGO2_REGIONS_URL }}
       UKRENERGO2_REGION_SLUG: ${{ secrets.UKRENERGO2_REGION_SLUG }}
       UKRENERGO2_REGION_NAME: ${{ secrets.UKRENERGO2_REGION_NAME }}
       MAYACHOK_MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
       MAYACHOK_MONGO_DB: ${{ secrets.MAYACHOK_MONGO_DB }}
+      ZTOE_MONGO_DB: ${{ secrets.ZTOE_MONGO_DB }}
       UKRENERGO_SITE_URL: ${{ secrets.UKRENERGO_SITE_URL }}
       UKRENERGO2_SYNC_REGIONSTATUS: "1"
+      REGENERATE_OPERATOR: "Житомиробленерго"
+      RENDER_SCHEDULE_IMAGES: "1"
 
     steps:
       - name: Checkout repository
@@ -34,7 +38,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-telegram-bot==20.8 pytz "pymongo>=4.6"
+          pip install requests python-telegram-bot==20.8 pytz "pymongo>=4.6" playwright
+          python -m playwright install chromium --with-deps
 
       - name: Run Ukrenergo 2 monitor
         run: python ukrenergo2_monitor.py
