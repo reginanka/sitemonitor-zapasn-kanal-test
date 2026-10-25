@@ -529,11 +529,35 @@ def send_notification_safe(message: str, img_path=None) -> bool:
     return send_notification(message, img_path)
 
 
+
+def normalize_date_key(date_str: str) -> str:
+    """YYYY-MM-DD / DD.MM.YYYY / DD.MM.YY → YYYY-MM-DD для порівняння."""
+    s = (date_str or "").strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return s
+
+
+def dates_equal(a: str, b: str) -> bool:
+    na, nb = normalize_date_key(a), normalize_date_key(b)
+    return bool(na) and na == nb
+
+
 def records_to_slots_for_date(records: List[Dict], date: str) -> List[Dict]:
-    """Червоні інтервали за дату → [{from, to, type}] (сусідні злиті через group_spans)."""
+    """Червоні інтервали за дату → [{from, to, type}] (сусідні злиті через group_spans).
+
+    date у current.json часто як DD.MM.YYYY, а today у sync — YYYY-MM-DD.
+    Порівнюємо через normalize_date_key.
+    """
     outages = [
         r for r in (records or [])
-        if r.get("date") == date and (r.get("color") or "").strip().lower() == "red"
+        if dates_equal(r.get("date") or "", date)
+        and (r.get("color") or "").strip().lower() == "red"
     ]
     if not outages:
         return []
