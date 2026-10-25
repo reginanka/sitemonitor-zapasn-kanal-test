@@ -700,16 +700,24 @@ def notify_bot_users(
     Сповіщення підписникам бота ztoe (users.notify=true),
     у яких адреса з чергою з changed_queues.
 
-    Картинки графіків + підпис одним повідомленням (media group).
-    Якщо PNG ще немає — лише текст.
+    Текст — ЛИШЕ черги цього користувача (не весь список каналу).
+    Картинки + підпис одним media group.
     """
     try:
         from bot_notify import notify_bot_users_with_images
+        from datetime import datetime as _dt
 
+        header = "🔔 Оновлення графіка відключень"
+        msg = (channel_message or "").strip()
+        if msg.startswith("🔔"):
+            header = msg.split("\n")[0].strip()
         notify_bot_users_with_images(
-            channel_message or "🔔 Оновлення графіка відключень",
+            msg,
             queue_keys=changed_queues or [],
             all_user_queues=False,
+            header=header,
+            date_str=_dt.now().strftime("%d.%m.%Y"),
+            personalize=True,
         )
     except Exception as e:
         log_to_buffer(f"❌ notify_bot_users: {e}")
