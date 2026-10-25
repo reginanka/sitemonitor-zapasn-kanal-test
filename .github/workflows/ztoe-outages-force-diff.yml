@@ -1,0 +1,42 @@
+name: Force Diff ZTOE Outages (очистити cache)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ztoe-outages-force
+  cancel-in-progress: false
+
+jobs:
+  force-diff:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      MAYACHOK_MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
+      ZTOE_MONGO_DB: ${{ secrets.ZTOE_MONGO_DB }}
+      MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
+      MONGO_DB: ${{ secrets.ZTOE_MONGO_DB }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pymongo>=4.6"
+
+      - name: Clear outages_cache (force new events)
+        run: python ztoe_outages_force_diff.py
+
+      - name: Hint
+        run: |
+          echo "Cache очищено. Тепер можна вручну запустити workflow «ZTOE outages»,"
+          echo "щоб monitor побачив усі поточні outages як нові і перемалював PNG."
