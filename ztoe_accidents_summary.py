@@ -2,9 +2,11 @@
 """
 Погодинний звіт про аварійні відключення в Житомирській області (ЖОЕ).
 
-Тягне всі записи з /pw_accidents?pagination=false,
-рахує унікальні вулиці/населені пункти по РЕМ та ключових містах,
-формує повідомлення і шле в Telegram-канал.
+- Тягне всі записи з /pw_accidents
+- Рахує унікальні вулиці / нас. пункти по РЕМ і ключових містах
+- Сортує від найгіршої ситуації
+- Зберігає знімок у Mongo (колекція accidents_summary, БД vidkluchennya)
+- Шле в Telegram-канал
 """
 
 from __future__ import annotations
@@ -13,10 +15,11 @@ import logging
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime
-from typing import Any, Dict, List, Set, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Set
 
 import httpx
+
 try:
     from zoneinfo import ZoneInfo
     KYIV = ZoneInfo("Europe/Kyiv")
@@ -35,9 +38,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 API_BASE = (os.getenv("ZTOE_API_BASE") or os.getenv("API_BASE") or "").rstrip("/")
+URL = (os.getenv("URL") or "").strip()
+SUBSCRIBE = (os.getenv("SUBSCRIBE") or "").strip()
 
-# Ключові міста для окремого блоку (порядок пріоритету)
-KEY_CITIES = [
+# Ключові міста (завжди в блоці, якщо є дані)
+KEY_CITIES = {
     "Житомир",
     "Звягель",
     "Бердичів",
@@ -50,10 +55,15 @@ KEY_CITIES = [
     "Андрушівка",
     "Чуднів",
     "Баранівка",
-]
+}
 
-# Емодзі за кількістю вулиць (для РЕМ і міст)
+CITY_PREFIX = {
+    "Житомир", "Звягель", "Бердичів", "Овруч", "Коростень", "Малин",
+}
+
+
 def severity_emoji(streets: int) -> str:
+    """Колір за кількістю вулиць (чим більше — тим гірше)."""
     if streets >= 400:
         return "🔴"
     if streets >= 150:
@@ -66,18 +76,17 @@ def severity_emoji(streets: int) -> str:
 
 
 def fetch_all_accidents() -> List[dict]:
-    """Тягне всі аварії. Спочатку пробує pagination=false, інакше по сторінках."""
+    """Тягне всі аварії. Спочатку pagination=false, інакше по сторінках."""
     if not API_BASE:
         raise SystemExit("Немає ZTOE_API_BASE / API_BASE")
 
     headers = {
         "Accept": "application/ld+json",
-        "User-Agent": "ztoe-accidents-summary/1.0",
+        "User-Agent": "ztoe-accidents-summary/1.1",
     }
     items: List[dict] = []
 
     with httpx.Client(timeout=60, headers=headers) as client:
-        # 1) Спроба одним запитом
         try:
             r = client.get(
                 f"{API_BASE}/pw_accidents",
@@ -92,9 +101,8 @@ def fetch_all_accidents() -> List[dict]:
                 log.info("pagination=false → %s записів", len(batch))
                 return batch
         except Exception as e:
-            log.warning("pagination=false failed: %s — переходимо на сторінки", e)
+            log.warning("pagination=false failed: %s — сторінки", e)
 
-        # 2) Посторінково
         page = 1
         while page <= 100:
             r = client.get(
@@ -117,22 +125,13 @@ def fetch_all_accidents() -> List[dict]:
 
 
 def aggregate(accidents: List[dict]) -> Dict[str, Any]:
-    """
-    Рахує:
-    - unique streets overall
-    - unique cities overall (і окремо без Житомира)
-    - per REM: records, unique streets, unique cities
-    - per city: unique streets
-    """
     all_streets: Set[Any] = set()
     all_cities: Set[Any] = set()
     zhytomyr_streets: Set[Any] = set()
 
-    # REM name → stats
     rem: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {"records": 0, "streets": set(), "cities": set()}
     )
-    # city name → unique street ids
     city_streets: Dict[str, Set[Any]] = defaultdict(set)
 
     for a in accidents:
@@ -145,36 +144,27 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
         sid = street.get("id")
         oname = (otg.get("name") or "").strip() or "?"
 
-        # нормалізуємо назву РЕМ (іноді приходить "АТ ...")
         if "Житомиробленерго" in oname and "РЕМ" not in oname:
             oname = "Інше (обленерго)"
 
-        all_streets.add(sid if sid is not None else (cname, street.get("name")))
-        all_cities.add(cid if cid is not None else cname)
+        street_key = sid if sid is not None else (cname, street.get("name"))
+        city_key = cid if cid is not None else cname
+
+        all_streets.add(street_key)
+        all_cities.add(city_key)
 
         if cname == "Житомир":
-            zhytomyr_streets.add(sid if sid is not None else street.get("name"))
+            zhytomyr_streets.add(street_key)
 
         rem[oname]["records"] += 1
-        rem[oname]["streets"].add(sid if sid is not None else street.get("name"))
-        rem[oname]["cities"].add(cid if cid is not None else cname)
-        city_streets[cname].add(sid if sid is not None else street.get("name"))
-
-    # унікальні нас. пункти без Житомира
-    cities_no_zh = len(all_cities) - (1 if any(
-        (c.get("name") if isinstance(c, dict) else None) == "Житомир"
-        or c == "Житомир"
-        for c in []  # placeholder
-    ) else 0)
-    # простіше: якщо є Житомир у city_streets
-    total_cities = len(all_cities)
-    cities_except_zhytomyr = total_cities - (1 if "Житомир" in city_streets else 0)
+        rem[oname]["streets"].add(street_key)
+        rem[oname]["cities"].add(city_key)
+        city_streets[cname].add(street_key)
 
     return {
         "total_records": len(accidents),
         "total_streets": len(all_streets),
-        "total_cities": total_cities,
-        "cities_except_zhytomyr": cities_except_zhytomyr,
+        "total_cities": len(all_cities),
         "zhytomyr_streets": len(zhytomyr_streets),
         "rem": {
             name: {
@@ -189,66 +179,142 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
 
 
 def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
-    time_str = as_of.strftime("%d.%m.%Y %H:%M")
+    time_full = as_of.strftime("%d.%m.%Y %H:%M")
+    time_short = as_of.strftime("%H:%M %d.%m")
 
     total_cities = stats["total_cities"]
     total_streets = stats["total_streets"]
 
-    lines = [
-        f"⚡️ <b>Стан електромереж у Житомирській області</b>",
-        f"(станом на {time_str})",
+    lines: List[str] = [
+        "⚡️ <b>Стан електромереж у Житомирській області</b>",
+        f"(станом на {time_full})",
         "",
-        f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
-        f"(загалом <b>{total_streets:,}</b> вулиць).".replace(",", " "),
+        (
+            f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
+            f"(загалом <b>{total_streets:,}</b> вулиць)."
+        ).replace(",", " "),
         "",
-        "⚠️ <b>Ситуація по РЕМ</b> (від найбільш проблемних):",
     ]
 
-    # РЕМ за кількістю нас. пунктів, потім за вулицями
+    # --- РЕМ: сортуємо від найгіршої (спочатку вулиці, потім нас. пункти) ---
     rem_sorted = sorted(
         stats["rem"].items(),
-        key=lambda x: (-x[1]["cities"], -x[1]["streets"]),
+        key=lambda x: (-x[1]["streets"], -x[1]["cities"], -x[1]["records"]),
     )
-
-    shown = 0
+    rem_lines: List[str] = []
     for name, st in rem_sorted:
         if st["streets"] == 0:
             continue
-        # прибираємо суфікс « РЕМ» для короткості, якщо є
         short = name.replace(" РЕМ", "").strip()
         emoji = severity_emoji(st["streets"])
-        lines.append(
-            f"{emoji} <b>{short}</b> — {st['cities']} нас.пунктів / {st['streets']:,} вулиць".replace(",", " ")
+        rem_lines.append(
+            f"{emoji} <b>{short}</b> — {st['cities']} нас.пунктів / "
+            f"{st['streets']:,} вулиць".replace(",", " ")
         )
-        shown += 1
-        if shown >= 12:  # щоб не роздувати повідомлення
-            rest = len(rem_sorted) - shown
-            if rest > 0:
-                lines.append(f"<i>(…ще {rest} РЕМ)</i>")
-            break
+
+    lines.append("⚠️ <b>Ситуація по РЕМ</b> (від найбільш проблемних):")
+    if rem_lines:
+        # expandable blockquote — у Telegram клієнтах згортається стрілкою
+        lines.append("<blockquote expandable>")
+        lines.extend(rem_lines)
+        lines.append("</blockquote>")
+    else:
+        lines.append("<i>немає даних</i>")
 
     lines.append("")
-    lines.append("🏙 <b>По ключових містах</b> (від найбільш проблемних):")
 
-    # ключові + всі міста з ≥ 20 вулицями
-    city_items = []
-    for name, cnt in stats["city_streets"].items():
-        if name in KEY_CITIES or cnt >= 20:
-            city_items.append((name, cnt))
-
+    # --- Ключові міста (тільки KEY_CITIES, від найгіршої) ---
+    city_items = [
+        (name, cnt)
+        for name, cnt in stats["city_streets"].items()
+        if name in KEY_CITIES and cnt > 0
+    ]
     city_items.sort(key=lambda x: -x[1])
 
-    for name, cnt in city_items[:15]:
+    city_lines: List[str] = []
+    for name, cnt in city_items:
         emoji = severity_emoji(cnt)
-        prefix = "м. " if name in KEY_CITIES or name in (
-            "Житомир", "Звягель", "Бердичів", "Овруч", "Коростень", "Малин"
-        ) else ""
-        lines.append(f"{emoji} {prefix}{name} — {cnt} вулиць")
+        prefix = "м. " if name in CITY_PREFIX or name in KEY_CITIES else ""
+        city_lines.append(f"{emoji} {prefix}{name} — {cnt} вулиць")
+
+    lines.append("🏙 <b>По ключових містах</b> (від найбільш проблемних):")
+    if city_lines:
+        lines.append("<blockquote expandable>")
+        lines.extend(city_lines)
+        lines.append("</blockquote>")
+    else:
+        lines.append("<i>немає даних</i>")
 
     lines.append("")
-    lines.append("<i>Дані: API Житомиробленерго · оновлення раз на годину</i>")
+
+    # --- Футер як у інших моніторах ---
+    footer_parts: List[str] = []
+    if URL:
+        footer_parts.append(f'<a href="{URL}">🔗 Сайт "ЖОЕ"</a>')
+    if SUBSCRIBE:
+        footer_parts.append(f'<a href="{SUBSCRIBE}">⚡️ ПІДПИСАТИСЯ</a>')
+    if footer_parts:
+        lines.append(" | ".join(footer_parts))
+    lines.append(f"🕐 {time_short}")
 
     return "\n".join(lines)
+
+
+def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
+    """
+    Зберігає знімок у нову колекцію accidents_summary.
+    БД: vidkluchennya (або ZTOE_MONGO_DB / MONGO_DB).
+    Не чіпає users, outages, queue_schedules тощо.
+    """
+    uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
+    if not uri:
+        log.warning("Немає MONGO_URI — пропускаємо запис у Mongo")
+        return
+
+    db_name = (
+        os.getenv("ZTOE_MONGO_DB")
+        or os.getenv("MONGO_DB")
+        or os.getenv("MAYACHOK_MONGO_DB")
+        or "vidkluchennya"
+    )
+
+    try:
+        from pymongo import MongoClient
+
+        client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+        db = client[db_name]
+        col = db["accidents_summary"]
+
+        doc = {
+            "_id": "latest",  # завжди один актуальний документ
+            "as_of": as_of.isoformat(),
+            "as_of_utc": datetime.now(timezone.utc),
+            "total_records": stats["total_records"],
+            "total_streets": stats["total_streets"],
+            "total_cities": stats["total_cities"],
+            "zhytomyr_streets": stats["zhytomyr_streets"],
+            "rem": stats["rem"],
+            "city_streets": stats["city_streets"],
+            "message": message,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        col.update_one({"_id": "latest"}, {"$set": doc}, upsert=True)
+
+        # також історія (опційно, по годинах)
+        history_id = as_of.strftime("%Y-%m-%dT%H")
+        col.update_one(
+            {"_id": history_id},
+            {
+                "$set": {
+                    **{k: v for k, v in doc.items() if k != "_id"},
+                    "_id": history_id,
+                }
+            },
+            upsert=True,
+        )
+        log.info("Mongo: збережено в %s.accidents_summary (latest + %s)", db_name, history_id)
+    except Exception as e:
+        log.error("Mongo write failed: %s", e)
 
 
 def main() -> int:
@@ -259,18 +325,27 @@ def main() -> int:
         log.error("Не вдалося отримати дані: %s", e)
         return 1
 
+    as_of = datetime.now(KYIV)
+
     if not accidents:
         log.warning("Порожня відповідь API")
         msg = (
             "⚡️ <b>Стан електромереж у Житомирській області</b>\n"
-            f"(станом на {datetime.now(KYIV).strftime('%d.%m.%Y %H:%M')})\n\n"
+            f"(станом на {as_of.strftime('%d.%m.%Y %H:%M')})\n\n"
             "Зараз аварійних відключень за даними API немає."
         )
+        if URL or SUBSCRIBE:
+            parts = []
+            if URL:
+                parts.append(f'<a href="{URL}">🔗 Сайт "ЖОЕ"</a>')
+            if SUBSCRIBE:
+                parts.append(f'<a href="{SUBSCRIBE}">⚡️ ПІДПИСАТИСЯ</a>')
+            msg += "\n\n" + " | ".join(parts)
+            msg += f"\n🕐 {as_of.strftime('%H:%M %d.%m')}"
         send_notification(msg)
         return 0
 
     stats = aggregate(accidents)
-    as_of = datetime.now(KYIV)
     msg = format_message(stats, as_of)
 
     log.info(
@@ -280,14 +355,16 @@ def main() -> int:
         stats["total_cities"],
         stats["zhytomyr_streets"],
     )
-    log.info("Повідомлення (%s символів):\n%s", len(msg), msg[:500])
+
+    # Mongo (нова колекція, існуючі не чіпаємо)
+    save_to_mongo(stats, as_of, msg)
 
     ok = send_notification(msg)
     if not ok:
         log.error("Не вдалося відправити в Telegram")
         return 1
 
-    log.info("✓ Звіт відправлено")
+    log.info("✓ Звіт відправлено (%s символів)", len(msg))
     return 0
 
 
