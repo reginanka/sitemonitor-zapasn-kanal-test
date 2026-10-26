@@ -217,7 +217,7 @@ def _merge_intervals(intervals: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     return [(_minutes_to_str(a), _minutes_to_str(b)) for a, b in merged]
 
 
-def _total_hours(intervals: List[Tuple[str, str]]) -> float:
+def _total_minutes(intervals: List[Tuple[str, str]]) -> int:
     merged = _merge_intervals(intervals)
     total_min = 0
     for fr, to in merged:
@@ -228,14 +228,19 @@ def _total_hours(intervals: List[Tuple[str, str]]) -> float:
         if b <= a:
             b += 24 * 60
         total_min += b - a
-    h = total_min / 60.0
-    return float(int(h)) if h == int(h) else round(h, 1)
+    return total_min
 
 
-def _fmt_hours(h: float) -> str:
-    if h == int(h):
-        return str(int(h))
-    return f"{h:.1f}".rstrip("0").rstrip(".")
+def _fmt_duration(total_min: int) -> str:
+    """2 год, 30хв або 2 год 30хв. Півгодини не округлюються."""
+    if total_min < 0:
+        total_min = 0
+    h, m = divmod(int(total_min), 60)
+    if h and m:
+        return f"{h} год {m}хв"
+    if h:
+        return f"{h} год"
+    return f"{m}хв"
 
 
 def _interval_key(fr: str, to: str) -> Tuple[int, int]:
@@ -497,8 +502,8 @@ def _format_slots_line(prefix: str, slots: List[Tuple[str, str]]) -> str:
     if not slots:
         return f"{prefix}: немає"
     parts = [f"<b><u>{a}–{b}</u></b>" for a, b in slots]
-    h = _total_hours(slots)
-    return f"{prefix}: {', '.join(parts)} ({_fmt_hours(h)} год)"
+    h = _total_minutes(slots)
+    return f"{prefix}: {', '.join(parts)} ({_fmt_duration(h)})"
 
 
 def _short_time(t: str) -> str:
@@ -524,15 +529,14 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     )
 
     all_merged = _merge_intervals(scheduled + emerg + repair + other)
-    total_h = _total_hours(all_merged)
     addr_str = _html_esc(format_address(addr))
     lab_esc = _html_esc(lab)
 
     if all_merged:
-        t0, t1 = all_merged[0][0], all_merged[-1][1]
+        ranges = ", ".join(f"<b><u>{a}–{b}</u></b>" for a, b in all_merged)
         summary = (
-            f"Світла не буде ({_fmt_hours(total_h)} год): "
-            f"<b><u>{t0}–{t1}</u></b>"
+            f"Світла не буде ({_fmt_duration(_total_minutes(all_merged))}): "
+            f"{ranges}"
         )
     else:
         summary = "Світла не буде: немає відключень"
