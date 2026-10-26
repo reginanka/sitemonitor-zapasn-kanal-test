@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from mongo_store import get_db, get_schedule_png
+from mongo_store import get_db, get_site_screenshot
 from telegram_handler import send_photos_sync
 
 try:
@@ -132,18 +132,10 @@ def collect_notify_targets(
 
 
 def pngs_for_queues(queue_labels: Sequence[str]) -> List[bytes]:
-    """PNG з GridFS у тому ж порядку, що queue_labels (пропуск якщо немає)."""
-    images: List[bytes] = []
-    for lab in queue_labels:
-        ch, pid = _queue_parts(lab)
-        png = get_schedule_png(ch, pid)
-        if not png and pid:
-            png = get_schedule_png(f"{ch}.{pid}", "")
-        if not png and pid:
-            png = get_schedule_png(f"{ch}|{pid}", "")
-        if png:
-            images.append(png)
-    return images
+    """Залишено для сумісності. PNG черг більше немає — лише скрін ЖОЕ (1 шт)."""
+    site = get_site_screenshot()
+    return [site] if site else []
+
 
 
 def _slots_line_from_doc(doc: dict | None) -> str:
@@ -216,7 +208,7 @@ def notify_bot_users_with_images(
     personalize: bool = True,
 ) -> None:
     """
-    DM підписникам: картинки їхніх черг + caption одним повідомленням.
+    DM підписникам: текст + опційно один скрін ЖОЕ (без PNG черг).
 
     personalize=True: текст збирається ЛИШЕ по чергах юзера з Mongo,
     а не весь текст каналу (де всі 1.1–6.2).
@@ -278,42 +270,7 @@ def notify_bot_users_with_images(
 
 
 def regenerate_queues_for_labels(labels: Sequence[str]) -> int:
-    """Перегенерувати PNG для списку черг (4.2). Повертає кількість успішних."""
-    try:
-        from regenerate_images import load_ukrenergo_status, regenerate_one
-        from mongo_store import get_db
-    except Exception as e:
-        log_to_buffer(f"⚠️ regenerate недоступний: {e}")
-        return 0
+    """Вимкнено: PNG по чергах більше не генеруємо."""
+    log_to_buffer("ℹ️ regenerate_queues_for_labels: пропуск (PNG disabled)")
+    return 0
 
-    try:
-        db = get_db()
-        ukr = load_ukrenergo_status(db)
-    except Exception as e:
-        log_to_buffer(f"❌ Mongo/ukr status: {e}")
-        return 0
-
-    ok_n = 0
-    for lab in labels:
-        ch, pid = _queue_parts(lab)
-        doc = None
-        for _id in (
-            f"{ch}|{pid}" if pid else ch,
-            f"{ch}.{pid}" if pid else ch,
-            ch,
-        ):
-            doc = db["queue_schedules"].find_one({"_id": _id})
-            if doc:
-                break
-        if not doc:
-            doc = {
-                "queue": ch,
-                "subqueue": pid,
-                "slots": [],
-                "events": [],
-                "known": True,
-            }
-        status = regenerate_one(doc, ukr, dry_run=False, only_missing=False)
-        if status == "ok":
-            ok_n += 1
-    return ok_n

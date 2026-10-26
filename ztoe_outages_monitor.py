@@ -21,8 +21,7 @@ from typing import Dict, List, Tuple
 
 import httpx
 from pymongo import MongoClient
-from telegram import Bot, InputMediaPhoto
-from telegram import InputFile
+from telegram import Bot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -231,35 +230,8 @@ def user_queue_key(addr: dict) -> str:
 
 
 def regenerate_queue_png(queue_key: str) -> bytes | None:
-    """Перемалювати PNG черги з ГПВ + planned/emerg з outages."""
-    try:
-        from mongo_store import get_db, get_schedule_png, save_schedule_png
-        from regenerate_images import load_ukrenergo_status, regenerate_one
-    except Exception as e:
-        log.warning("regenerate import: %s", e)
-        return None
-
-    db = get_db()
-    ch, _, *rest = (queue_key.replace("|", ".") + ".").split(".")
-    pid = rest[0] if rest and rest[0] else ""
-    # parts properly
-    parts = queue_key.replace("|", ".").split(".")
-    ch = parts[0]
-    pid = parts[1] if len(parts) > 1 else ""
-
-    doc = None
-    for _id in (f"{ch}|{pid}" if pid else ch, f"{ch}.{pid}" if pid else ch, ch):
-        doc = db["queue_schedules"].find_one({"_id": _id})
-        if doc:
-            break
-    if not doc:
-        doc = {"queue": ch, "subqueue": pid, "slots": [], "events": [], "known": True}
-
-    ukr = load_ukrenergo_status(db)
-    status = regenerate_one(doc, ukr, dry_run=False, only_missing=False)
-    if status != "ok":
-        log.warning("regenerate %s → %s", queue_key, status)
-    return get_schedule_png(ch, pid) or get_schedule_png(queue_key, "")
+    """Вимкнено."""
+    return None
 
 
 def main() -> int:
@@ -299,7 +271,6 @@ def main() -> int:
     log.info("users=%s groups=%s", len(users), len(groups))
     bot = Bot(token=bot_token)
     notified: Dict[int, list] = {}
-    queues_to_regen: set = set()
     groups_checked = 0
 
     for (otg_id, city_id), group_pairs in groups.items():
@@ -379,7 +350,6 @@ def main() -> int:
                         upsert=True,
                     )
                     outage["_user_queue"] = uqk
-                    queues_to_regen.add(uqk)
             # сповіщення лише по new_outages
             for outage in new_outages:
                 if not matches_street(outage, street_id, street_name):
@@ -394,61 +364,25 @@ def main() -> int:
                     continue
                 notified[tid].append(outage)
 
-    # перемалювати PNG для черг, де з'явились outages
-    png_by_queue: Dict[str, bytes] = {}
-    for qk in queues_to_regen:
-        try:
-            png = regenerate_queue_png(qk)
-            if png:
-                png_by_queue[qk] = png
-                log.info("PNG оновлено для %s (%s bytes)", qk, len(png))
-        except Exception as e:
-            log.warning("PNG %s: %s", qk, e)
-
     sent = 0
     for tid, outage_list in notified.items():
         text = "⚠️ <b>Нові відключення по твоїх адресах:</b>\n\n"
         text += "\n\n".join(format_outage(o) for o in outage_list[:10])
         caption = text if len(text) <= 1024 else text[:1000] + "\n…"
 
-        # унікальні черги з цієї пачки
-        qkeys = []
-        for o in outage_list:
-            qk = o.get("_user_queue") or ""
-            if qk and qk not in qkeys:
-                qkeys.append(qk)
-        images = [png_by_queue[q] for q in qkeys if q in png_by_queue]
-
-        async def _send(chat_id=tid, body=text, cap=caption, imgs=images):
-            if imgs:
-                from io import BytesIO
-                media = []
-                for i, png in enumerate(imgs[:10]):
-                    bio = BytesIO(png)
-                    bio.name = f"schedule_{i}.png"
-                    media.append(
-                        InputMediaPhoto(
-                            media=bio,
-                            caption=cap if i == 0 else None,
-                            parse_mode="HTML" if i == 0 else None,
-                        )
-                    )
-                await bot.send_media_group(chat_id=chat_id, media=media)
-                if len(body) > 1024:
-                    await bot.send_message(
-                        chat_id=chat_id, text=body[:4096], parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-            else:
-                await bot.send_message(
-                    chat_id=chat_id, text=body[:4096], parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
+        # Тільки текст — без картинок
+        async def _send(chat_id=tid, body=text):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=body[:4096],
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
 
         try:
             asyncio.run(_send())
             sent += 1
-            log.info("Надіслано %s (outages=%s images=%s)", tid, len(outage_list), len(images))
+            log.info("Надіслано %s (outages=%s)", tid, len(outage_list))
             time.sleep(0.4)
         except Exception as e:
             log.error("Send fail %s: %s", tid, e)
@@ -459,11 +393,11 @@ def main() -> int:
         f"Підписників: {len(users)}\n"
         f"Локацій: {groups_checked}\n"
         f"Сповіщень: {sent}\n"
-        f"PNG оновлено: {len(png_by_queue)}"
+        f"PNG: вимкнено"
     )
     log.info("%s", summary.replace("\n", " | "))
     admin = os.getenv("ADMIN_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
-    if admin and (sent or png_by_queue):
+    if admin and sent:
         try:
             async def _adm():
                 await bot.send_message(chat_id=int(admin), text=summary)
@@ -471,7 +405,7 @@ def main() -> int:
         except Exception as e:
             log.warning("admin summary: %s", e)
 
-    log.info("Готово groups=%s sent=%s regen=%s", groups_checked, sent, len(png_by_queue))
+    log.info("Готово groups=%s sent=%s", groups_checked, sent)
     return 0
 
 

@@ -14,10 +14,9 @@ from telegram_handler import send_notification
 API_BASE_URL = os.getenv("API_BASE_URL")
 URL = os.environ.get('URL')
 SUBSCRIBE = os.environ.get('SUBSCRIBE')
-# Якщо 1/true — рендерити PNG графіків у GridFS (потрібен playwright)
-RENDER_SCHEDULE_IMAGES = os.getenv("RENDER_SCHEDULE_IMAGES", "1").strip().lower() in (
-    "1", "true", "yes", "on",
-)
+# PNG черг вимкнено назавжди (файли render_schedule видалені)
+RENDER_SCHEDULE_IMAGES = False
+
 
 QUEUES = [(i, j) for i in range(1, 7) for j in range(1, 2 + 1)]
 
@@ -609,7 +608,7 @@ def sync_schedules_to_mongo(
     queue_keys: Optional[List[str]] = None,
 ) -> None:
     """
-    Пише слоти + PNG у Mongo (queue_schedules + GridFS) лише для вказаних черг.
+    Пише слоти у Mongo (queue_schedules) лише для вказаних черг (без PNG).
     Викликати ТІЛЬКИ коли є зміни в графіку.
     """
     mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
@@ -618,7 +617,7 @@ def sync_schedules_to_mongo(
         return
 
     try:
-        from mongo_store import upsert_queue_schedule, save_schedule_png
+        from mongo_store import upsert_queue_schedule
     except Exception as e:
         log_to_buffer(f"⚠️ Не вдалося імпортувати mongo_store: {e}")
         return
@@ -631,20 +630,8 @@ def sync_schedules_to_mongo(
     today = datetime.now().strftime("%Y-%m-%d")
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    render_ok = False
-    if RENDER_SCHEDULE_IMAGES:
-        try:
-            from render_schedule import (
-                build_data,
-                events_from_slots,
-                render_to_png,
-            )
-            render_ok = True
-        except Exception as e:
-            log_to_buffer(f"⚠️ render_schedule недоступний (PNG не буде): {e}")
 
     saved = 0
-    images = 0
     errors = 0
 
     for queue_key in sorted(keys):
@@ -676,50 +663,12 @@ def sync_schedules_to_mongo(
                 text=text, date=today, known=True, extra=extra,
             )
             saved += 1
-
-            if render_ok:
-                try:
-                    try:
-                        from outage_events import load_outage_events_for_queue, merge_events
-                        _extra = load_outage_events_for_queue(queue_key)
-                    except Exception:
-                        _extra = {0: [], 1: []}
-                    _ev_today = merge_events(events_from_slots(slots_today), _extra.get(0) or [])
-                    _ev_tm = merge_events(events_from_slots(slots_tomorrow), _extra.get(1) or [])
-                    data = build_data(
-                        queue=queue_key,
-                        status_title="Статус Житомирської області",
-                        status_sub="Застосовані графіки погодинних відключень",
-                        period=today,
-                        days=[
-                            {
-                                "label": "Сьогодні",
-                                "offset": 0,
-                                "known": True,
-                                "events": _ev_today,
-                            },
-                            {
-                                "label": "Завтра",
-                                "offset": 1,
-                                "known": bool(slots_tomorrow) or bool(_extra.get(1)),
-                                "events": _ev_tm,
-                            },
-                        ],
-                    )
-                    png = render_to_png(data)
-                    if png:
-                        save_schedule_png(cherga, pidcherga, png)
-                        save_schedule_png(queue_key, "", png)
-                        images += 1
-                except Exception as e:
-                    log_to_buffer(f"⚠️ PNG для {queue_key}: {e}")
-                    errors += 1
         except Exception as e:
-            log_to_buffer(f"❌ Mongo sync {queue_key}: {e}")
             errors += 1
+            log_to_buffer(f"⚠️ Mongo queue {queue_key}: {e}")
 
     log_to_buffer(
-        f"🗄 Mongo: збережено {saved} черг (зі змінами), PNG={images}, помилок={errors}"
+        f"🗄 Mongo: збережено {saved} черг (зі змінами), помилок={errors}"
     )
 
 
@@ -732,7 +681,7 @@ def notify_bot_users(
     у яких адреса з чергою з changed_queues.
 
     Текст — ЛИШЕ черги цього користувача (не весь список каналу).
-    Картинки + підпис одним media group.
+    Текст + опційно один скрін ЖОЕ (без PNG черг).
     """
     try:
         from bot_notify import notify_bot_users_with_images

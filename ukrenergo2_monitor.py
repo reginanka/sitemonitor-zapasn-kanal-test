@@ -550,30 +550,27 @@ def main() -> None:
         save_state(current)
         log_to_buffer("✅ Сповіщення надіслано, стан збережено в Mongo")
 
-        # Перегенерація PNG черг (новий статус у шапці) + DM підписникам бота
-        # Картинки + підпис одним повідомленням (media group)
+        # DM підписникам: той самий текст статусу (без картинок черг)
         try:
-            from bot_notify import (
-                collect_notify_targets,
-                notify_bot_users_with_images,
-                regenerate_queues_for_labels,
-            )
+            from bot_notify import collect_notify_targets
+            from telegram_handler import send_photos_sync
+            import os
 
-            targets = collect_notify_targets(None)  # усі черги підписників
-            labels = sorted({q for qs in targets.values() for q in qs})
-            if labels:
-                log_to_buffer(f"🖼 Перегенерація PNG для {len(labels)} черг підписників…")
-                n = regenerate_queues_for_labels(labels)
-                log_to_buffer(f"✓ Перегенеровано PNG: {n}/{len(labels)}")
+            targets = collect_notify_targets(None)
+            bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+            if not targets:
+                log_to_buffer("ℹ️ Немає підписників бота для DM статусу")
+            elif not bot_token:
+                log_to_buffer("⚠️ Немає ZTOE_BOT_TOKEN — DM статусу не шлю")
             else:
-                log_to_buffer("ℹ️ Немає черг підписників — PNG не перегенеровую")
-
-            notify_bot_users_with_images(
-                message,
-                all_user_queues=True,
-            )
+                sent = 0
+                for tid in targets.keys():
+                    ok = send_photos_sync(tid, [], message, bot_token=bot_token)
+                    if ok:
+                        sent += 1
+                log_to_buffer(f"📬 DM статусу Укренерго: sent={sent}/{len(targets)}")
         except Exception as e:
-            log_to_buffer(f"⚠️ Перегенерація/DM після статусу: {e}")
+            log_to_buffer(f"⚠️ DM статусу після зміни: {e}")
     except Exception as e:
         log_to_buffer(f"❌ Критична помилка Укренерго 2: {e}")
     finally:
