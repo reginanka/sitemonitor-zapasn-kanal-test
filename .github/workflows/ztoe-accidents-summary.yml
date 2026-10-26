@@ -22,7 +22,7 @@ jobs:
       TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
       MAYACHOK_MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
       ZTOE_MONGO_DB: ${{ secrets.ZTOE_MONGO_DB }}
-      URL: ${{ secrets.URL }}
+      AVARII_ZHOE: ${{ secrets.AVARII_ZHOE }}
       SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
 
     steps:
