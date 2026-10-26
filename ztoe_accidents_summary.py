@@ -3,9 +3,10 @@
 Погодинний звіт про аварійні відключення в Житомирській області (ЖОЕ).
 
 - Тягне всі записи з /pw_accidents
-- Рахує унікальні вулиці / нас. пункти по РЕМ і ключових містах
+- Рахує унікальні вулиці / нас. пункти по РЕМ
+- Під кожним РЕМ — топ населених пунктів (географія)
 - Сортує від найгіршої ситуації
-- Зберігає знімок у Mongo (колекція accidents_summary, БД vidkluchennya)
+- Зберігає знімок у Mongo (колекція accidents_summary)
 - Шле в Telegram-канал + лог у TELEGRAM_LOG_CHANNEL_ID
 """
 
@@ -16,7 +17,7 @@ import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 import httpx
 
@@ -50,20 +51,8 @@ API_BASE = (os.getenv("ZTOE_API_BASE") or os.getenv("API_BASE") or "").rstrip("/
 URL = (os.getenv("URL") or "").strip()
 SUBSCRIBE = (os.getenv("SUBSCRIBE") or "").strip()
 
-KEY_CITIES = {
-    "Житомир",
-    "Звягель",
-    "Бердичів",
-    "Овруч",
-    "Коростень",
-    "Малин",
-    "Коростишів",
-    "Радомишль",
-    "Олевськ",
-    "Андрушівка",
-    "Чуднів",
-    "Баранівка",
-}
+# скільки топ-населених пунктів показувати під кожним РЕМ
+TOP_CITIES_PER_REM = 5
 
 CITY_PREFIX = {
     "Житомир", "Звягель", "Бердичів", "Овруч", "Коростень", "Малин",
@@ -82,13 +71,19 @@ def severity_emoji(streets: int) -> str:
     return "⚪"
 
 
+def city_label(name: str) -> str:
+    if name in CITY_PREFIX:
+        return f"м. {name}"
+    return name
+
+
 def fetch_all_accidents() -> List[dict]:
     if not API_BASE:
         raise SystemExit("Немає ZTOE_API_BASE / API_BASE")
 
     headers = {
         "Accept": "application/ld+json",
-        "User-Agent": "ztoe-accidents-summary/1.2",
+        "User-Agent": "ztoe-accidents-summary/1.3",
     }
     items: List[dict] = []
 
@@ -132,14 +127,24 @@ def fetch_all_accidents() -> List[dict]:
 
 
 def aggregate(accidents: List[dict]) -> Dict[str, Any]:
+    """
+    rem[name] = {
+      records, streets(set), cities(set),
+      city_streets: {city_name: set(street_keys)}
+    }
+    """
     all_streets: Set[Any] = set()
     all_cities: Set[Any] = set()
     zhytomyr_streets: Set[Any] = set()
 
     rem: Dict[str, Dict[str, Any]] = defaultdict(
-        lambda: {"records": 0, "streets": set(), "cities": set()}
+        lambda: {
+            "records": 0,
+            "streets": set(),
+            "cities": set(),
+            "city_streets": defaultdict(set),
+        }
     )
-    city_streets: Dict[str, Set[Any]] = defaultdict(set)
 
     for a in accidents:
         city = a.get("city") or {}
@@ -166,22 +171,27 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
         rem[oname]["records"] += 1
         rem[oname]["streets"].add(street_key)
         rem[oname]["cities"].add(city_key)
-        city_streets[cname].add(street_key)
+        rem[oname]["city_streets"][cname].add(street_key)
+
+    # серіалізація для Mongo / форматування
+    rem_out: Dict[str, Any] = {}
+    for name, st in rem.items():
+        city_counts = {
+            c: len(sids) for c, sids in st["city_streets"].items()
+        }
+        rem_out[name] = {
+            "records": st["records"],
+            "streets": len(st["streets"]),
+            "cities": len(st["cities"]),
+            "city_streets": city_counts,
+        }
 
     return {
         "total_records": len(accidents),
         "total_streets": len(all_streets),
         "total_cities": len(all_cities),
         "zhytomyr_streets": len(zhytomyr_streets),
-        "rem": {
-            name: {
-                "records": st["records"],
-                "streets": len(st["streets"]),
-                "cities": len(st["cities"]),
-            }
-            for name, st in rem.items()
-        },
-        "city_streets": {name: len(sids) for name, sids in city_streets.items()},
+        "rem": rem_out,
     }
 
 
@@ -201,56 +211,44 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
             f"(загалом <b>{total_streets:,}</b> вулиць)."
         ).replace(",", " "),
         "",
+        "⚠️ <b>Ситуація по РЕМ</b> (від найбільш проблемних):",
     ]
 
+    # сортування РЕМ: вулиці → нас. пункти → records
     rem_sorted = sorted(
         stats["rem"].items(),
         key=lambda x: (-x[1]["streets"], -x[1]["cities"], -x[1]["records"]),
     )
-    rem_lines: List[str] = []
+
+    block: List[str] = []
     for name, st in rem_sorted:
         if st["streets"] == 0:
             continue
         short = name.replace(" РЕМ", "").strip()
         emoji = severity_emoji(st["streets"])
-        rem_lines.append(
-            f"{emoji} <b>{short}</b> — {st['cities']} нас.пунктів / "
-            f"{st['streets']:,} вулиць".replace(",", " ")
+        block.append(
+            f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
+            f"{st['streets']:,} вул.".replace(",", " ")
         )
 
-    lines.append("⚠️ <b>Ситуація по РЕМ</b> (від найбільш проблемних):")
-    if rem_lines:
+        # топ населених пунктів у цьому РЕМ (географія)
+        cities_sorted = sorted(
+            st.get("city_streets", {}).items(),
+            key=lambda x: -x[1],
+        )[:TOP_CITIES_PER_REM]
+        for cname, cnt in cities_sorted:
+            block.append(f"    · {city_label(cname)} — {cnt}")
+
+    if block:
         lines.append("<blockquote expandable>")
-        lines.extend(rem_lines)
+        lines.extend(block)
         lines.append("</blockquote>")
     else:
         lines.append("<i>немає даних</i>")
 
     lines.append("")
 
-    city_items = [
-        (name, cnt)
-        for name, cnt in stats["city_streets"].items()
-        if name in KEY_CITIES and cnt > 0
-    ]
-    city_items.sort(key=lambda x: -x[1])
-
-    city_lines: List[str] = []
-    for name, cnt in city_items:
-        emoji = severity_emoji(cnt)
-        prefix = "м. " if name in CITY_PREFIX or name in KEY_CITIES else ""
-        city_lines.append(f"{emoji} {prefix}{name} — {cnt} вулиць")
-
-    lines.append("🏙 <b>По ключових містах</b> (від найбільш проблемних):")
-    if city_lines:
-        lines.append("<blockquote expandable>")
-        lines.extend(city_lines)
-        lines.append("</blockquote>")
-    else:
-        lines.append("<i>немає даних</i>")
-
-    lines.append("")
-
+    # футер
     footer_parts: List[str] = []
     if URL:
         footer_parts.append(f'<a href="{URL}">🔗 Сайт "ЖОЕ"</a>')
@@ -264,11 +262,6 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
 
 
 def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
-    """
-    Зберігає знімок у нову колекцію accidents_summary.
-    БД: vidkluchennya (або ZTOE_MONGO_DB / MONGO_DB).
-    Не чіпає users, outages, queue_schedules тощо.
-    """
     uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
     if not uri:
         log_to_buffer("⚠️ Немає MONGO_URI — пропускаємо запис у Mongo")
@@ -288,6 +281,7 @@ def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
         db = client[db_name]
         col = db["accidents_summary"]
 
+        # city_streets вкладені — ок для Mongo
         doc = {
             "_id": "latest",
             "as_of": as_of.isoformat(),
@@ -297,7 +291,6 @@ def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
             "total_cities": stats["total_cities"],
             "zhytomyr_streets": stats["zhytomyr_streets"],
             "rem": stats["rem"],
-            "city_streets": stats["city_streets"],
             "message": message,
             "updated_at": datetime.now(timezone.utc),
         }
@@ -306,12 +299,7 @@ def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
         history_id = as_of.strftime("%Y-%m-%dT%H")
         col.update_one(
             {"_id": history_id},
-            {
-                "$set": {
-                    **{k: v for k, v in doc.items() if k != "_id"},
-                    "_id": history_id,
-                }
-            },
+            {"$set": {**{k: v for k, v in doc.items() if k != "_id"}, "_id": history_id}},
             upsert=True,
         )
         log_to_buffer(f"🗄 Mongo: {db_name}.accidents_summary (latest + {history_id})")
@@ -368,7 +356,11 @@ def main() -> int:
         key=lambda x: (-x[1]["streets"], -x[1]["cities"]),
     )[:5]
     for name, st in top_rem:
-        log_to_buffer(f"  REM {name}: streets={st['streets']} cities={st['cities']}")
+        top_cities = sorted(st.get("city_streets", {}).items(), key=lambda x: -x[1])[:3]
+        cities_s = ", ".join(f"{c}:{n}" for c, n in top_cities)
+        log_to_buffer(
+            f"  REM {name}: streets={st['streets']} cities={st['cities']} [{cities_s}]"
+        )
 
     save_to_mongo(stats, as_of, msg)
 
