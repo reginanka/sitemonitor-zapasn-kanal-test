@@ -107,8 +107,8 @@ log = logging.getLogger("ztoe_accidents_summary")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-API_BASE = (os.getenv("ZTOE_API_BASE") or os.getenv("API_BASE") or "").rstrip("/")
-URL = (os.getenv("URL") or "").strip()
+API_BASE = (os.getenv("ZTOE_API_BASE") or "").rstrip("/")
+AVARII_ZHOE = (os.getenv("AVARII_ZHOE") or "").strip()
 SUBSCRIBE = (os.getenv("SUBSCRIBE") or "").strip()
 
 # скільки топ-населених пунктів показувати під кожним РЕМ
@@ -139,7 +139,7 @@ def city_label(name: str) -> str:
 
 def fetch_all_accidents() -> List[dict]:
     if not API_BASE:
-        raise SystemExit("Немає ZTOE_API_BASE / API_BASE")
+        raise SystemExit("Немає ZTOE_API_BASE")
 
     headers = {
         "Accept": "application/ld+json",
@@ -310,12 +310,12 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
 
     # футер
     footer_parts: List[str] = []
-    if URL:
-        footer_parts.append(f'<a href="{URL}">🔗 Сайт "ЖОЕ"</a>')
+    if AVARII_ZHOE:
+        footer_parts.append(f'<a href="{AVARII_ZHOE}">Чому немає світла?|ЖОЕ</a>')
     if SUBSCRIBE:
         footer_parts.append(f'<a href="{SUBSCRIBE}">⚡️ ПІДПИСАТИСЯ</a>')
     if footer_parts:
-        lines.append(" | ".join(footer_parts))
+        lines.append("  ".join(footer_parts))
     lines.append(f"🕐 {time_short}")
 
     return "\n".join(lines)
@@ -370,8 +370,8 @@ def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
 def main() -> int:
     log_to_buffer("=" * 40)
     log_to_buffer("🚀 СТАРТ · Зведення аварій ЖОЕ (погодинний)")
-    log_to_buffer(f"API_BASE={API_BASE or '—'}")
-    log_to_buffer(f"URL={'є' if URL else 'немає'} · SUBSCRIBE={'є' if SUBSCRIBE else 'немає'}")
+    log_to_buffer(f"ZTOE_API_BASE={'задано' if API_BASE else 'НЕМАЄ'}")
+    log_to_buffer(f"AVARII_ZHOE={'є' if AVARII_ZHOE else 'немає'} · SUBSCRIBE={'є' if SUBSCRIBE else 'немає'}")
 
     try:
         accidents = fetch_all_accidents()
@@ -389,13 +389,13 @@ def main() -> int:
             f"(станом на {as_of.strftime('%d.%m.%Y %H:%M')})\n\n"
             "Зараз аварійних відключень за даними API немає."
         )
-        if URL or SUBSCRIBE:
+        if AVARII_ZHOE or SUBSCRIBE:
             parts = []
-            if URL:
-                parts.append(f'<a href="{URL}">🔗 Сайт "ЖОЕ"</a>')
+            if AVARII_ZHOE:
+                parts.append(f'<a href="{AVARII_ZHOE}">Чому немає світла?|ЖОЕ</a>')
             if SUBSCRIBE:
                 parts.append(f'<a href="{SUBSCRIBE}">⚡️ ПІДПИСАТИСЯ</a>')
-            msg += "\n\n" + " | ".join(parts)
+            msg += "\n\n" + "  ".join(parts)
             msg += f"\n🕐 {as_of.strftime('%H:%M %d.%m')}"
         ok = send_notification(msg)
         log_to_buffer(f"Telegram (empty): {'✓' if ok else '✗'}")
