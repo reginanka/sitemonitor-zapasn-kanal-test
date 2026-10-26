@@ -2,11 +2,13 @@
 """
 Аварійні / планові відключення ЖОЕ → підписники бота.
 
-- Усі сторінки API
-- Дедуп по fingerprint (не спам на новий id)
-- План після відомої аварії не дублює
-- Full docs у Mongo outages (+ queue_key) → /check
-- При новій події: текстове сповіщення підписникам (без PNG)
+Оптимізації:
+- один fetch на otg_id (без city), фільтр міста в пам'яті
+- спільний httpx.Client
+- bulk_write у Mongo замість поштучних update_one
+- без подвійного retry empty+city
+
+Логіка сповіщень / дедупу / soft_fingerprint без змін.
 """
 
 from __future__ import annotations
@@ -17,10 +19,10 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from telegram import Bot
 
 logging.basicConfig(
@@ -65,38 +67,40 @@ def get_user_addresses(user: dict) -> list:
     return []
 
 
-def _fetch_all_pages(path: str, otg_id: int, city_id: int = None) -> List[dict]:
+def _fetch_all_pages(
+    client: httpx.Client,
+    path: str,
+    otg_id: int,
+    city_id: Optional[int] = None,
+) -> List[dict]:
     items: List[dict] = []
     page = 1
-    with httpx.Client(
-        timeout=30,
-        headers={
-            "Accept": "application/ld+json",
-            "User-Agent": "ztoe-outages-monitor/1.2",
-        },
-    ) as client:
-        while page <= 40:
-            params = {"page": page, "itemsPerPage": 100, "otg.id": otg_id}
-            if city_id:
-                params["city.id"] = city_id
-            r = client.get(f"{API_BASE}{path}", params=params)
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, list):
-                items.extend(data)
-                break
-            batch = data.get("hydra:member") or []
-            items.extend(batch)
-            if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
-                break
-            page += 1
+    while page <= 40:
+        params: dict = {"page": page, "itemsPerPage": 100, "otg.id": otg_id}
+        if city_id:
+            params["city.id"] = city_id
+        r = client.get(f"{API_BASE}{path}", params=params)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            items.extend(data)
+            break
+        batch = data.get("hydra:member") or []
+        items.extend(batch)
+        if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
+            break
+        page += 1
     return items
 
 
-def fetch_all_outages(otg_id: int, city_id: int = None) -> List[dict]:
-    accidents = _fetch_all_pages("/pw_accidents", otg_id, city_id)
+def fetch_all_outages(
+    client: httpx.Client,
+    otg_id: int,
+    city_id: Optional[int] = None,
+) -> List[dict]:
+    accidents = _fetch_all_pages(client, "/pw_accidents", otg_id, city_id)
     try:
-        planned = _fetch_all_pages("/pw_accident_planeds", otg_id, city_id)
+        planned = _fetch_all_pages(client, "/pw_accident_planeds", otg_id, city_id)
     except Exception as e:
         log.warning("planeds error otg=%s city=%s: %s", otg_id, city_id, e)
         planned = []
@@ -105,6 +109,18 @@ def fetch_all_outages(otg_id: int, city_id: int = None) -> List[dict]:
     for p in planned:
         p["_source"] = "planeds"
     return accidents + planned
+
+
+def filter_by_city(outages: List[dict], city_id: int) -> List[dict]:
+    """Якщо city_id=0 — повертаємо все. Інакше лишаємо збіг або без city (плани часто без міста)."""
+    if not city_id:
+        return outages
+    result = []
+    for o in outages:
+        cid = (o.get("city") or {}).get("id")
+        if cid is None or int(cid) == int(city_id):
+            result.append(o)
+    return result
 
 
 def make_outage_key(outage: dict) -> str:
@@ -160,7 +176,7 @@ def _norm_street(name: str) -> str:
     s = (name or "").strip().lower()
     for pfx in ("вул.", "вул ", "пров.", "провулок ", "проспект ", "пр.", "бульвар ", "пл.", "площа "):
         if s.startswith(pfx):
-            s = s[len(pfx):].strip()
+            s = s[len(pfx) :].strip()
     return s
 
 
@@ -241,8 +257,6 @@ def user_queue_key(addr: dict) -> str:
     return f"{q}.{sq}" if sq else q
 
 
-
-
 def main() -> int:
     mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
     if not mongo_uri:
@@ -277,157 +291,183 @@ def main() -> int:
                 continue
             groups.setdefault((otg_id, city_id), []).append((u, addr))
 
-    log.info("users=%s groups=%s", len(users), len(groups))
+    unique_otgs = sorted({otg for otg, _ in groups})
+    log.info("users=%s groups=%s unique_otgs=%s", len(users), len(groups), len(unique_otgs))
+
     bot = Bot(token=bot_token)
     notified: Dict[int, list] = {}
     groups_checked = 0
 
-    for (otg_id, city_id), group_pairs in groups.items():
-        try:
-            outages = fetch_all_outages(otg_id, city_id if city_id else None)
-        except Exception as e:
-            log.error("Fetch otg=%s city=%s: %s", otg_id, city_id, e)
-            continue
+    # Один HTTP-клієнт на весь прогін
+    http = httpx.Client(
+        timeout=30,
+        headers={
+            "Accept": "application/ld+json",
+            "User-Agent": "ztoe-outages-monitor/1.3",
+        },
+    )
 
-        # Якщо з city_id порожньо — пробуємо без фільтра міста (часто плани висять на ОТГ)
-        if not outages and city_id:
+    # Кеш fetch по otg (без city) — головна економія при кількох city в одній ОТГ
+    otg_outages_cache: Dict[int, List[dict]] = {}
+
+    try:
+        for otg_id in unique_otgs:
             try:
-                outages = fetch_all_outages(otg_id, None)
-                log.info("otg=%s city=%s: empty with city filter → retry without city → %s",
-                         otg_id, city_id, len(outages))
+                otg_outages_cache[otg_id] = fetch_all_outages(http, otg_id, None)
+                log.info("otg=%s fetched_total=%s", otg_id, len(otg_outages_cache[otg_id]))
             except Exception as e:
-                log.error("Fetch otg=%s (no city): %s", otg_id, e)
-                continue
+                log.error("Fetch otg=%s: %s", otg_id, e)
+                otg_outages_cache[otg_id] = []
 
-        groups_checked += 1
-        current_ids = {make_outage_key(o) for o in outages}
-        current_fps = {content_fingerprint(o) for o in outages}
-        current_soft = {soft_fingerprint(o) for o in outages}
+        for (otg_id, city_id), group_pairs in groups.items():
+            raw = otg_outages_cache.get(otg_id) or []
+            outages = filter_by_city(raw, city_id)
 
-        cache_key = f"{otg_id}_{city_id or 0}"
-        cache = outages_col.find_one({"_id": cache_key}) or {}
-        prev_fps = set(cache.get("fps") or [])
-        prev_soft = set(cache.get("soft_fps") or [])
+            groups_checked += 1
+            current_ids = {make_outage_key(o) for o in outages}
+            current_fps = {content_fingerprint(o) for o in outages}
+            current_soft = {soft_fingerprint(o) for o in outages}
 
-        new_fps = current_fps - prev_fps
-        new_outages = [o for o in outages if content_fingerprint(o) in new_fps]
+            cache_key = f"{otg_id}_{city_id or 0}"
+            cache = outages_col.find_one({"_id": cache_key}) or {}
+            prev_fps = set(cache.get("fps") or [])
+            prev_soft = set(cache.get("soft_fps") or [])
 
-        filtered = []
-        for o in new_outages:
-            soft = soft_fingerprint(o)
-            if type_family(o.get("typeOff")) == "planned" and soft in prev_soft:
-                log.info("skip planned after known soft=%s", soft)
-                continue
-            filtered.append(o)
-        new_outages = filtered
+            new_fps = current_fps - prev_fps
+            new_outages = [o for o in outages if content_fingerprint(o) in new_fps]
 
-        log.info(
-            "otg=%s city=%s fetched=%s cache_fps=%s new=%s",
-            otg_id, city_id, len(outages), len(prev_fps), len(new_outages),
-        )
+            filtered = []
+            for o in new_outages:
+                soft = soft_fingerprint(o)
+                if type_family(o.get("typeOff")) == "planned" and soft in prev_soft:
+                    log.info("skip planned after known soft=%s", soft)
+                    continue
+                filtered.append(o)
+            new_outages = filtered
 
-        # Повні docs у Mongo (для /check) — завжди
-        for o in outages:
-            doc = outage_to_mongo_doc(o)
-            outages_full.update_one(
-                {"source": doc["source"], "source_id": doc["source_id"]},
-                {"$set": doc},
-                upsert=True,
+            log.info(
+                "otg=%s city=%s fetched=%s cache_fps=%s new=%s",
+                otg_id,
+                city_id,
+                len(outages),
+                len(prev_fps),
+                len(new_outages),
             )
 
-        matched_fps: set = set()
-        match_attempts = 0
-
-        if new_outages:
-            for user, addr in group_pairs:
-                tid = user.get("telegram_id")
-                if not tid:
-                    continue
-                street_id = addr.get("street_id") or addr.get("streetId")
-                street_name = (addr.get("street_name") or addr.get("street") or "").strip().lower()
-                house = addr.get("house") or addr.get("building") or ""
-                uqk = user_queue_key(addr)
-
-                for outage in outages:
-                    if not matches_street(outage, street_id, street_name):
-                        continue
-                    if not matches_building(outage, str(house)):
-                        continue
-                    if uqk:
-                        doc = outage_to_mongo_doc(outage, queue_key=uqk)
-                        outages_full.update_one(
+            # Bulk upsert full docs (для /check)
+            if outages:
+                ops = []
+                for o in outages:
+                    doc = outage_to_mongo_doc(o)
+                    ops.append(
+                        UpdateOne(
                             {"source": doc["source"], "source_id": doc["source_id"]},
                             {"$set": doc},
                             upsert=True,
                         )
-                        outage["_user_queue"] = uqk
-
-                for outage in new_outages:
-                    match_attempts += 1
-                    if not matches_street(outage, street_id, street_name):
-                        continue
-                    if not matches_building(outage, str(house)):
-                        continue
-                    if uqk:
-                        outage["_user_queue"] = uqk
-                    notified.setdefault(tid, [])
-                    fp = content_fingerprint(outage)
-                    if any(content_fingerprint(x) == fp for x in notified[tid]):
-                        continue
-                    notified[tid].append(outage)
-                    matched_fps.add(fp)
-
-            log.info(
-                "otg=%s city=%s matched_new=%s (addrs=%s)",
-                otg_id, city_id, len(matched_fps), len(group_pairs),
-            )
-            if new_outages and not matched_fps:
-                # Підказка в лог: що прийшло з API, але не збіглося з адресами
-                sample = []
-                for o in new_outages[:5]:
-                    st = (o.get("street") or {}).get("name") or "?"
-                    bld = (o.get("buildingNames") or "")[:30]
-                    sample.append(f"{st}|{bld}|type={o.get('typeOff')}")
-                log.info("no street match; API sample: %s", " || ".join(sample))
-                for user, addr in group_pairs:
-                    log.info(
-                        "  user street=%r id=%s house=%r",
-                        addr.get("street_name") or addr.get("street"),
-                        addr.get("street_id") or addr.get("streetId"),
-                        addr.get("house"),
                     )
+                if ops:
+                    # chunk на випадок дуже великих списків
+                    for i in range(0, len(ops), 500):
+                        outages_full.bulk_write(ops[i : i + 500], ordered=False)
 
-        # Кеш: усі поточні fps (щоб не спамити нерелевантним),
-        # але якщо був force (prev порожній) і нічого не зматчилось —
-        # НЕ записуємо fps, щоб наступний прогін міг ще раз спробувати після фіксу адрес.
-        if prev_fps or matched_fps or not new_outages:
-            outages_col.update_one(
-                {"_id": cache_key},
-                {
-                    "$set": {
-                        "ids": list(current_ids),
-                        "fps": list(current_fps),
-                        "soft_fps": list(current_soft | prev_soft),
-                        "updated_at": datetime.now(timezone.utc),
-                        "count": len(current_ids),
-                    }
-                },
-                upsert=True,
-            )
-        else:
-            log.warning(
-                "otg=%s city=%s: new=%s but 0 matched — cache NOT updated (можна виправити адреси і повторити)",
-                otg_id, city_id, len(new_outages),
-            )
+            matched_fps: set = set()
 
+            if new_outages:
+                for user, addr in group_pairs:
+                    tid = user.get("telegram_id")
+                    if not tid:
+                        continue
+                    street_id = addr.get("street_id") or addr.get("streetId")
+                    street_name = (addr.get("street_name") or addr.get("street") or "").strip().lower()
+                    house = addr.get("house") or addr.get("building") or ""
+                    uqk = user_queue_key(addr)
+
+                    # queue_key на full docs тільки для зматчених адрес
+                    if uqk:
+                        queue_ops = []
+                        for outage in outages:
+                            if not matches_street(outage, street_id, street_name):
+                                continue
+                            if not matches_building(outage, str(house)):
+                                continue
+                            doc = outage_to_mongo_doc(outage, queue_key=uqk)
+                            queue_ops.append(
+                                UpdateOne(
+                                    {"source": doc["source"], "source_id": doc["source_id"]},
+                                    {"$set": doc},
+                                    upsert=True,
+                                )
+                            )
+                        if queue_ops:
+                            outages_full.bulk_write(queue_ops, ordered=False)
+
+                    for outage in new_outages:
+                        if not matches_street(outage, street_id, street_name):
+                            continue
+                        if not matches_building(outage, str(house)):
+                            continue
+                        if uqk:
+                            outage["_user_queue"] = uqk
+                        notified.setdefault(tid, [])
+                        fp = content_fingerprint(outage)
+                        if any(content_fingerprint(x) == fp for x in notified[tid]):
+                            continue
+                        notified[tid].append(outage)
+                        matched_fps.add(fp)
+
+                log.info(
+                    "otg=%s city=%s matched_new=%s (addrs=%s)",
+                    otg_id,
+                    city_id,
+                    len(matched_fps),
+                    len(group_pairs),
+                )
+                if new_outages and not matched_fps:
+                    sample = []
+                    for o in new_outages[:5]:
+                        st = (o.get("street") or {}).get("name") or "?"
+                        bld = (o.get("buildingNames") or "")[:30]
+                        sample.append(f"{st}|{bld}|type={o.get('typeOff')}")
+                    log.info("no street match; API sample: %s", " || ".join(sample))
+                    for user, addr in group_pairs:
+                        log.info(
+                            "  user street=%r id=%s house=%r",
+                            addr.get("street_name") or addr.get("street"),
+                            addr.get("street_id") or addr.get("streetId"),
+                            addr.get("house"),
+                        )
+
+            # Кеш fps
+            if prev_fps or matched_fps or not new_outages:
+                outages_col.update_one(
+                    {"_id": cache_key},
+                    {
+                        "$set": {
+                            "ids": list(current_ids),
+                            "fps": list(current_fps),
+                            "soft_fps": list(current_soft | prev_soft),
+                            "updated_at": datetime.now(timezone.utc),
+                            "count": len(current_ids),
+                        }
+                    },
+                    upsert=True,
+                )
+            else:
+                log.warning(
+                    "otg=%s city=%s: new=%s but 0 matched — cache NOT updated (можна виправити адреси і повторити)",
+                    otg_id,
+                    city_id,
+                    len(new_outages),
+                )
+    finally:
+        http.close()
 
     sent = 0
     for tid, outage_list in notified.items():
         text = "⚠️ <b>Нові відключення по твоїх адресах:</b>\n\n"
         text += "\n\n".join(format_outage(o) for o in outage_list[:10])
-        caption = text if len(text) <= 1024 else text[:1000] + "\n…"
 
-        # Тільки текст — без картинок
         async def _send(chat_id=tid, body=text):
             await bot.send_message(
                 chat_id=chat_id,
@@ -444,7 +484,6 @@ def main() -> int:
         except Exception as e:
             log.error("Send fail %s: %s", tid, e)
 
-    # короткий звіт
     n_events = sum(len(v) for v in notified.values())
     summary = (
         f"✅ Перевірка відключень\n"
@@ -455,7 +494,6 @@ def main() -> int:
     )
     log.info("%s", summary.replace("\n", " | "))
 
-    # Лог-канал (якщо задано)
     log_chat = (
         os.getenv("TELEGRAM_LOG_CHANNEL_ID")
         or os.getenv("ADMIN_CHAT_ID")
@@ -463,8 +501,10 @@ def main() -> int:
     )
     if log_chat:
         try:
+
             async def _log():
                 await bot.send_message(chat_id=int(log_chat), text=summary)
+
             asyncio.run(_log())
         except Exception as e:
             log.warning("log channel: %s", e)
