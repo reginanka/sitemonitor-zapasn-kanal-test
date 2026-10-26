@@ -3,4 +3,5 @@ python-telegram-bot==20.8
 beautifulsoup4
 playwright
 pytz
+Pillow
 pymongo>=4.6
