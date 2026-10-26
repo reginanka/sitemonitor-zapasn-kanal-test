@@ -6,7 +6,7 @@
 - Рахує унікальні вулиці / нас. пункти по РЕМ і ключових містах
 - Сортує від найгіршої ситуації
 - Зберігає знімок у Mongo (колекція accidents_summary, БД vidkluchennya)
-- Шле в Telegram-канал
+- Шле в Telegram-канал + лог у TELEGRAM_LOG_CHANNEL_ID
 """
 
 from __future__ import annotations
@@ -29,6 +29,15 @@ except Exception:
 
 from telegram_handler import send_notification
 
+try:
+    from log_utils import log_to_buffer, send_log_to_channel
+except Exception:  # pragma: no cover
+    def log_to_buffer(msg: str) -> None:
+        print(msg)
+
+    def send_log_to_channel(title: str = "📊 ЛОГ · АВАРІЇ ЖОЕ") -> None:
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -41,7 +50,6 @@ API_BASE = (os.getenv("ZTOE_API_BASE") or os.getenv("API_BASE") or "").rstrip("/
 URL = (os.getenv("URL") or "").strip()
 SUBSCRIBE = (os.getenv("SUBSCRIBE") or "").strip()
 
-# Ключові міста (завжди в блоці, якщо є дані)
 KEY_CITIES = {
     "Житомир",
     "Звягель",
@@ -63,7 +71,6 @@ CITY_PREFIX = {
 
 
 def severity_emoji(streets: int) -> str:
-    """Колір за кількістю вулиць (чим більше — тим гірше)."""
     if streets >= 400:
         return "🔴"
     if streets >= 150:
@@ -76,13 +83,12 @@ def severity_emoji(streets: int) -> str:
 
 
 def fetch_all_accidents() -> List[dict]:
-    """Тягне всі аварії. Спочатку pagination=false, інакше по сторінках."""
     if not API_BASE:
         raise SystemExit("Немає ZTOE_API_BASE / API_BASE")
 
     headers = {
         "Accept": "application/ld+json",
-        "User-Agent": "ztoe-accidents-summary/1.1",
+        "User-Agent": "ztoe-accidents-summary/1.2",
     }
     items: List[dict] = []
 
@@ -95,13 +101,14 @@ def fetch_all_accidents() -> List[dict]:
             r.raise_for_status()
             data = r.json()
             if isinstance(data, list):
+                log_to_buffer(f"API: list → {len(data)} записів")
                 return data
             batch = data.get("hydra:member") or []
             if batch:
-                log.info("pagination=false → %s записів", len(batch))
+                log_to_buffer(f"API: pagination=false → {len(batch)} записів")
                 return batch
         except Exception as e:
-            log.warning("pagination=false failed: %s — сторінки", e)
+            log_to_buffer(f"⚠️ pagination=false failed: {e} — сторінки")
 
         page = 1
         while page <= 100:
@@ -119,7 +126,7 @@ def fetch_all_accidents() -> List[dict]:
             if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
                 break
             page += 1
-        log.info("по сторінках → %s записів (сторінок: %s)", len(items), page)
+        log_to_buffer(f"API: по сторінках → {len(items)} записів (сторінок: {page})")
 
     return items
 
@@ -196,7 +203,6 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
         "",
     ]
 
-    # --- РЕМ: сортуємо від найгіршої (спочатку вулиці, потім нас. пункти) ---
     rem_sorted = sorted(
         stats["rem"].items(),
         key=lambda x: (-x[1]["streets"], -x[1]["cities"], -x[1]["records"]),
@@ -214,7 +220,6 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
 
     lines.append("⚠️ <b>Ситуація по РЕМ</b> (від найбільш проблемних):")
     if rem_lines:
-        # expandable blockquote — у Telegram клієнтах згортається стрілкою
         lines.append("<blockquote expandable>")
         lines.extend(rem_lines)
         lines.append("</blockquote>")
@@ -223,7 +228,6 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
 
     lines.append("")
 
-    # --- Ключові міста (тільки KEY_CITIES, від найгіршої) ---
     city_items = [
         (name, cnt)
         for name, cnt in stats["city_streets"].items()
@@ -247,7 +251,6 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
 
     lines.append("")
 
-    # --- Футер як у інших моніторах ---
     footer_parts: List[str] = []
     if URL:
         footer_parts.append(f'<a href="{URL}">🔗 Сайт "ЖОЕ"</a>')
@@ -268,7 +271,7 @@ def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
     """
     uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
     if not uri:
-        log.warning("Немає MONGO_URI — пропускаємо запис у Mongo")
+        log_to_buffer("⚠️ Немає MONGO_URI — пропускаємо запис у Mongo")
         return
 
     db_name = (
@@ -286,7 +289,7 @@ def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
         col = db["accidents_summary"]
 
         doc = {
-            "_id": "latest",  # завжди один актуальний документ
+            "_id": "latest",
             "as_of": as_of.isoformat(),
             "as_of_utc": datetime.now(timezone.utc),
             "total_records": stats["total_records"],
@@ -300,7 +303,6 @@ def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
         }
         col.update_one({"_id": "latest"}, {"$set": doc}, upsert=True)
 
-        # також історія (опційно, по годинах)
         history_id = as_of.strftime("%Y-%m-%dT%H")
         col.update_one(
             {"_id": history_id},
@@ -312,23 +314,28 @@ def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
             },
             upsert=True,
         )
-        log.info("Mongo: збережено в %s.accidents_summary (latest + %s)", db_name, history_id)
+        log_to_buffer(f"🗄 Mongo: {db_name}.accidents_summary (latest + {history_id})")
     except Exception as e:
-        log.error("Mongo write failed: %s", e)
+        log_to_buffer(f"❌ Mongo write failed: {e}")
 
 
 def main() -> int:
-    log.info("Старт зведення аварій")
+    log_to_buffer("=" * 40)
+    log_to_buffer("🚀 СТАРТ · Зведення аварій ЖОЕ (погодинний)")
+    log_to_buffer(f"API_BASE={API_BASE or '—'}")
+    log_to_buffer(f"URL={'є' if URL else 'немає'} · SUBSCRIBE={'є' if SUBSCRIBE else 'немає'}")
+
     try:
         accidents = fetch_all_accidents()
     except Exception as e:
-        log.error("Не вдалося отримати дані: %s", e)
+        log_to_buffer(f"❌ Fetch failed: {e}")
+        send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ (помилка)")
         return 1
 
     as_of = datetime.now(KYIV)
 
     if not accidents:
-        log.warning("Порожня відповідь API")
+        log_to_buffer("⚠️ Порожня відповідь API")
         msg = (
             "⚡️ <b>Стан електромереж у Житомирській області</b>\n"
             f"(станом на {as_of.strftime('%d.%m.%Y %H:%M')})\n\n"
@@ -342,30 +349,37 @@ def main() -> int:
                 parts.append(f'<a href="{SUBSCRIBE}">⚡️ ПІДПИСАТИСЯ</a>')
             msg += "\n\n" + " | ".join(parts)
             msg += f"\n🕐 {as_of.strftime('%H:%M %d.%m')}"
-        send_notification(msg)
+        ok = send_notification(msg)
+        log_to_buffer(f"Telegram (empty): {'✓' if ok else '✗'}")
+        send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ")
         return 0
 
     stats = aggregate(accidents)
     msg = format_message(stats, as_of)
 
-    log.info(
-        "records=%s streets=%s cities=%s zhytomyr_streets=%s",
-        stats["total_records"],
-        stats["total_streets"],
-        stats["total_cities"],
-        stats["zhytomyr_streets"],
+    log_to_buffer(
+        f"📊 records={stats['total_records']} "
+        f"streets={stats['total_streets']} "
+        f"cities={stats['total_cities']} "
+        f"zhytomyr={stats['zhytomyr_streets']}"
     )
+    top_rem = sorted(
+        stats["rem"].items(),
+        key=lambda x: (-x[1]["streets"], -x[1]["cities"]),
+    )[:5]
+    for name, st in top_rem:
+        log_to_buffer(f"  REM {name}: streets={st['streets']} cities={st['cities']}")
 
-    # Mongo (нова колекція, існуючі не чіпаємо)
     save_to_mongo(stats, as_of, msg)
 
     ok = send_notification(msg)
-    if not ok:
-        log.error("Не вдалося відправити в Telegram")
-        return 1
+    if ok:
+        log_to_buffer(f"✓ Telegram: звіт відправлено ({len(msg)} символів)")
+    else:
+        log_to_buffer("❌ Telegram: не вдалося відправити")
 
-    log.info("✓ Звіт відправлено (%s символів)", len(msg))
-    return 0
+    send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
