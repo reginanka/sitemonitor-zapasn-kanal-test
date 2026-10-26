@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from mongo_store import get_db, get_site_screenshot
@@ -310,10 +310,14 @@ def load_queue_doc(label: str) -> dict | None:
     return None
 
 
-def _slots_from_doc(doc: dict | None) -> List[Tuple[str, str]]:
+def _slots_from_doc(doc: dict | None, *, day: int = 0) -> List[Tuple[str, str]]:
+    """day=0 → slots (сьогодні), day=1 → slots_tomorrow."""
     if not doc:
         return []
-    slots = doc.get("slots") or doc.get("events") or []
+    if day == 1:
+        slots = doc.get("slots_tomorrow") or []
+    else:
+        slots = doc.get("slots") or doc.get("events") or []
     out = []
     for s in slots:
         if not isinstance(s, dict):
@@ -323,6 +327,62 @@ def _slots_from_doc(doc: dict | None) -> List[Tuple[str, str]]:
         if fr and to:
             out.append((fr, to))
     return _merge_intervals(out)
+
+
+def _fmt_date_display(date_str: str) -> str:
+    """YYYY-MM-DD / DD.MM.YYYY → DD.MM.YYYY."""
+    s = (date_str or "").strip()
+    if not s:
+        return datetime.now().strftime("%d.%m.%Y")
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return s
+
+
+def _ymd(date_str: str) -> str:
+    s = (date_str or "").strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return s
+
+
+def _day_offset(date_str: str) -> int:
+    """0 = сьогодні, 1 = завтра, інакше 0 (fallback на сьогоднішні слоти)."""
+    ymd = _ymd(date_str)
+    if not ymd:
+        return 0
+    try:
+        d = datetime.strptime(ymd, "%Y-%m-%d").date()
+    except ValueError:
+        return 0
+    today = datetime.now().date()
+    if d == today:
+        return 0
+    if d == today + timedelta(days=1):
+        return 1
+    return 0
+
+
+def _dates_from_changes(
+    changes: Optional[Dict[str, List[dict]]],
+    fallback: str,
+) -> List[str]:
+    """Унікальні дати з diff (порядок збереження), у форматі YYYY-MM-DD."""
+    seen = []
+    for items in (changes or {}).values():
+        for c in items or []:
+            d = _ymd(c.get("date") or "")
+            if d and d not in seen:
+                seen.append(d)
+    if not seen:
+        seen.append(_ymd(fallback) or datetime.now().strftime("%Y-%m-%d"))
+    return seen
 
 
 def _norm_street(name: str) -> str:
@@ -535,9 +595,12 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     """
     Зовні: адреса + <b>Черга</b>.
     Згорнутий блок: Світла не буде + час <b><u>…</u></b> + Деталі.
+    date_str — день, для якого брати слоти (сьогодні/завтра з Mongo).
     """
-    scheduled = _slots_from_doc(load_queue_doc(lab))
-    buckets = _outages_bucketed(addr, date_str)
+    day = _day_offset(date_str)
+    scheduled = _slots_from_doc(load_queue_doc(lab), day=day)
+    # outages у Mongo фільтруємо по цій даті
+    buckets = _outages_bucketed(addr, _fmt_date_display(date_str))
     scheduled, emerg, repair, other = _dedupe_by_priority(
         scheduled,
         buckets.get("emergency") or [],
@@ -569,7 +632,6 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     if other:
         detail_lines.append(_format_slots_line("⚪ Інші", other))
 
-    # HTML усередині blockquote (теги залишаємо, текст адрес вже escaped зовні)
     body = "\n".join(detail_lines)
     return (
         f"{addr_str} (<b>Черга {lab_esc}</b>)\n"
@@ -577,62 +639,90 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     )
 
 
-def _changes_header(
+def _change_line(c: dict) -> str:
+    s = _html_esc(_short_time(c.get("start") or ""))
+    e = _html_esc(_short_time(c.get("end") or ""))
+    span = f"{s}-{e}" if s or e else ""
+    ch = (c.get("change") or "").strip()
+    if ch in ("added", "new"):
+        return f"{span} 🪫 додали відключення" if span else "🪫 додали відключення / новий графік"
+    if span:
+        return f"<s>{span}</s> 🔋 скасували відключення"
+    return "🔋 скасували відключення"
+
+
+def build_changes_text(
     queue_labels_with_addr: Sequence[Tuple[str, dict]],
-    changes: Dict[str, List[dict]],
-    date_str: str,
+    changes: Optional[Dict[str, List[dict]]] = None,
+    date_str: str = "",
 ) -> str:
-    labs_order = []
+    """
+    Блок «що змінилось» — під скрін.
+    Групує по датах з diff (не лише «сьогодні»).
+    """
+    changes = changes or {}
+    labs_order: List[str] = []
     for lab, _ in queue_labels_with_addr:
         if lab not in labs_order:
             labs_order.append(lab)
 
-    def _change_line(c: dict) -> str:
-        s = _html_esc(_short_time(c.get("start") or ""))
-        e = _html_esc(_short_time(c.get("end") or ""))
-        span = f"{s}-{e}" if s or e else ""
-        if c.get("change") == "added":
-            # додані — звичайний час
-            return f"{span} 🪫 додали відключення" if span else "🪫 додали відключення"
-        # скасовані — закреслений час
-        if span:
-            return f"<s>{span}</s> 🔋 скасували відключення"
-        return "🔋 скасували відключення"
+    dates = _dates_from_changes(changes, date_str)
+    lines = [
+        f"Для черг {', '.join(_html_esc(x) for x in labs_order)} "
+        f"🔔 ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!",
+        "",
+    ]
 
-    if len(labs_order) > 1:
-        lines = [
-            f"Для черг {', '.join(_html_esc(x) for x in labs_order)} 🔔 ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!",
-            "",
-            f"📅 {_html_esc(date_str)}",
-            "",
-        ]
+    for d in dates:
+        lines.append(f"📅 {_html_esc(_fmt_date_display(d))}")
+        lines.append("")
         for lab in labs_order:
+            items = [
+                c
+                for c in (changes.get(lab) or [])
+                if not c.get("date") or _ymd(c.get("date") or "") == d
+            ]
+            # якщо в diff дата порожня — показуємо всі items лише на першій даті
+            if not items and d == dates[0]:
+                items = [
+                    c
+                    for c in (changes.get(lab) or [])
+                    if not c.get("date")
+                ]
             lines.append(f"▶️ Черга <b>{_html_esc(lab)}</b>:")
-            items = changes.get(lab) or []
             if not items:
                 lines.append("оновлення графіка")
-                continue
-            for c in items:
-                lines.append(_change_line(c))
-        return "\n".join(lines)
+            else:
+                for c in items:
+                    lines.append(_change_line(c))
+            lines.append("")
+    return "\n".join(lines).strip()
 
-    lab = labs_order[0] if labs_order else ""
-    bits = []
-    for c in changes.get(lab, []):
-        s = _html_esc(_short_time(c.get("start") or ""))
-        e = _html_esc(_short_time(c.get("end") or ""))
-        span = f"{s}-{e}" if s or e else ""
-        if c.get("change") == "added":
-            action = "🪫 додали відключення"
-            bits.append(f"{action} ▶️ {span}" if span else action)
-        else:
-            action = "🔋 скасували відключення"
-            bits.append(f"{action} ▶️ <s>{span}</s>" if span else action)
-    if bits:
-        head = f"🔔 Для черг <b>{_html_esc(lab)}</b> " + "; ".join(bits)
-    else:
-        head = f"🔔 Оновлення графіка для черг <b>{_html_esc(lab)}</b>"
-    return f"{head}\n\n📅 {_html_esc(date_str)}"
+
+def build_schedule_text(
+    queue_labels_with_addr: Sequence[Tuple[str, dict]],
+    *,
+    changes: Optional[Dict[str, List[dict]]] = None,
+    date_str: str = "",
+) -> str:
+    """
+    Наступне повідомлення: дата → адреси «Світла не буде…»,
+    потім знову дата → знову адреси (якщо кілька днів).
+    """
+    dates = _dates_from_changes(changes, date_str)
+    items = list(queue_labels_with_addr)
+    if not items:
+        return ""
+
+    parts: List[str] = []
+    for d in dates:
+        parts.append(f"📅 <b>{_html_esc(_fmt_date_display(d))}</b>")
+        parts.append("")
+        for lab, addr in items:
+            parts.append("—")
+            parts.append(_schedule_block(lab, addr, d))
+            parts.append("")
+    return "\n".join(parts).strip()
 
 
 def build_personal_dm(
@@ -641,21 +731,14 @@ def build_personal_dm(
     changes: Optional[Dict[str, List[dict]]] = None,
     date_str: str = "",
 ) -> str:
+    """Залишено для сумісності: зміни + розклад одним текстом."""
     if not date_str:
         date_str = datetime.now().strftime("%d.%m.%Y")
-    changes = changes or {}
-    items = list(queue_labels_with_addr)
-    if not items:
-        return "🔔 Оновлення графіка"
-
-    header = _changes_header(items, changes, date_str)
-
-    parts = [header, ""]
-    for lab, addr in items:
-        parts.append("—")
-        parts.append(_schedule_block(lab, addr, date_str))
-        parts.append("")
-    return "\n".join(parts).strip()
+    a = build_changes_text(queue_labels_with_addr, changes, date_str)
+    b = build_schedule_text(queue_labels_with_addr, changes=changes, date_str=date_str)
+    if a and b:
+        return f"{a}\n\n{b}"
+    return a or b or "🔔 Оновлення графіка"
 
 
 def notify_bot_users_with_images(
@@ -668,7 +751,13 @@ def notify_bot_users_with_images(
     personalize: bool = True,
     changes: Optional[Dict[str, List[dict]]] = None,
 ) -> None:
-    """ОДНЕ повідомлення на користувача (1 фото + усі його адреси)."""
+    """
+    Формат DM:
+      1) скрін + caption = блок змін (як у каналі під фото)
+         якщо caption > 1024 → фото з 📸, далі окремо текст змін
+      2) наступне повідомлення: 📅 дата + «Світла не буде» по адресах
+         (якщо кілька дат — дата, блоки, знов дата, блоки)
+    """
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
         log_to_buffer("⚠️ Немає токена бота — DM не шлемо")
@@ -701,54 +790,56 @@ def notify_bot_users_with_images(
     failed = 0
     for tid, qs_with_addr in targets.items():
         labs = sorted({lab for lab, _ in qs_with_addr})
+
         if personalize:
-            body = build_personal_dm(
-                qs_with_addr,
-                changes=changes,
-                date_str=date_str,
+            changes_text = build_changes_text(qs_with_addr, changes, date_str)
+            schedule_text = build_schedule_text(
+                qs_with_addr, changes=changes, date_str=date_str
             )
         else:
-            body = (
+            changes_text = (
                 (message or header or "🔔 Оновлення")
-                + f"\n\n📌 Твої черги: <b>{', '.join(labs)}</b>"
+                + f"\n\n📌 Твої черги: <b>{', '.join(_html_esc(x) for x in labs)}</b>"
             )
-
-        # Caption для фото: короткий і валідний HTML (не ріжемо body посеред тегів).
-        # Повний персональний текст — окремим повідомленням, якщо не влазить в 1024.
-        short_cap = (
-            f"🔔 Оновлення графіка · черги <b>{', '.join(_html_esc(x) for x in labs)}</b>\n"
-            f"📅 {_html_esc(date_str)}"
-        )
-        if len(short_cap) > 1024:
-            short_cap = short_cap[:1000] + "…"
+            schedule_text = ""
 
         ok = False
         photo_ok = False
 
+        # --- 1) скрін + блок змін ---
         if images:
-            # 1) фото + короткий caption
-            if len(body) <= 1024:
-                photo_ok = send_photos_sync(tid, images, body, bot_token=bot_token)
+            if len(changes_text) <= 1024:
+                photo_ok = send_photos_sync(
+                    tid, images, changes_text, bot_token=bot_token
+                )
+                ok = photo_ok
             else:
-                photo_ok = send_photos_sync(tid, images, short_cap, bot_token=bot_token)
-
-            if photo_ok and len(body) > 1024:
-                # 2) повний текст ОДНИМ повідомленням (без другого фото)
-                text_ok = send_photos_sync(tid, [], body[:4096], bot_token=bot_token)
+                # як у каналі: фото з 📸, потім текст змін
+                photo_ok = send_photos_sync(tid, images, "📸", bot_token=bot_token)
+                text_ok = send_photos_sync(
+                    tid, [], changes_text[:4096], bot_token=bot_token
+                )
                 ok = photo_ok or text_ok
-            elif photo_ok:
-                ok = True
-            else:
-                # фото не пішло — лише текст, один раз
-                log_to_buffer(f"⚠️ DM photo fail tid={tid}, шлю тільки текст")
-                ok = send_photos_sync(tid, [], body[:4096], bot_token=bot_token)
+            if not ok:
+                log_to_buffer(f"⚠️ DM photo/changes fail tid={tid}, шлю текст змін")
+                ok = send_photos_sync(
+                    tid, [], changes_text[:4096], bot_token=bot_token
+                )
         else:
-            ok = send_photos_sync(tid, [], body[:4096], bot_token=bot_token)
+            ok = send_photos_sync(tid, [], changes_text[:4096], bot_token=bot_token)
+
+        # --- 2) розклад по датах/адресах ---
+        if schedule_text:
+            sched_ok = send_photos_sync(
+                tid, [], schedule_text[:4096], bot_token=bot_token
+            )
+            ok = ok or sched_ok
 
         if ok:
             sent += 1
             log_to_buffer(
-                f"✓ DM tid={tid} queues={labs} photo={photo_ok} body_len={len(body)}"
+                f"✓ DM tid={tid} queues={labs} photo={photo_ok} "
+                f"changes_len={len(changes_text)} sched_len={len(schedule_text)}"
             )
         else:
             failed += 1

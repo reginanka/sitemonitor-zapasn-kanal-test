@@ -686,10 +686,14 @@ def _extract_changes_for_dm(diff: Dict) -> Dict[str, List[dict]]:
                     "end": r.get("end") or "",
                     "date": date,
                 })
-        # якщо лише нові дати — теж показуємо як «додали»
-        if not items and info.get("new_dates"):
-            # інтервали візьме build_personal_dm з Mongo після sync
-            items.append({"change": "added", "start": "", "end": "", "date": ""})
+        # нові дати — з реальною датою (для header і розкладу на завтра)
+        for nd in info.get("new_dates") or []:
+            items.append({
+                "change": "new",
+                "start": "",
+                "end": "",
+                "date": nd,
+            })
         if items:
             out[q] = items
     return out
