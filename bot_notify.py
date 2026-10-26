@@ -713,19 +713,43 @@ def notify_bot_users_with_images(
                 + f"\n\n📌 Твої черги: <b>{', '.join(labs)}</b>"
             )
 
-        caption = body if len(body) <= 1024 else (body[:1000] + "\n…")
-        ok = send_photos_sync(tid, images, caption, bot_token=bot_token)
-        # fallback: лише текст (коли фото/HTML падає, або користувач не /start)
-        if not ok:
+        # Caption для фото: короткий і валідний HTML (не ріжемо body посеред тегів).
+        # Повний персональний текст — окремим повідомленням, якщо не влазить в 1024.
+        short_cap = (
+            f"🔔 Оновлення графіка · черги <b>{', '.join(_html_esc(x) for x in labs)}</b>\n"
+            f"📅 {_html_esc(date_str)}"
+        )
+        if len(short_cap) > 1024:
+            short_cap = short_cap[:1000] + "…"
+
+        ok = False
+        photo_ok = False
+
+        if images:
+            # 1) фото + короткий caption
+            if len(body) <= 1024:
+                photo_ok = send_photos_sync(tid, images, body, bot_token=bot_token)
+            else:
+                photo_ok = send_photos_sync(tid, images, short_cap, bot_token=bot_token)
+
+            if photo_ok and len(body) > 1024:
+                # 2) повний текст ОДНИМ повідомленням (без другого фото)
+                text_ok = send_photos_sync(tid, [], body[:4096], bot_token=bot_token)
+                ok = photo_ok or text_ok
+            elif photo_ok:
+                ok = True
+            else:
+                # фото не пішло — лише текст, один раз
+                log_to_buffer(f"⚠️ DM photo fail tid={tid}, шлю тільки текст")
+                ok = send_photos_sync(tid, [], body[:4096], bot_token=bot_token)
+        else:
             ok = send_photos_sync(tid, [], body[:4096], bot_token=bot_token)
+
         if ok:
             sent += 1
-            if len(body) > 1024 and images:
-                try:
-                    send_photos_sync(tid, [], body[:4096], bot_token=bot_token)
-                except Exception:
-                    pass
-            log_to_buffer(f"✓ DM tid={tid} queues={labs}")
+            log_to_buffer(
+                f"✓ DM tid={tid} queues={labs} photo={photo_ok} body_len={len(body)}"
+            )
         else:
             failed += 1
             log_to_buffer(
