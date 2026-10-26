@@ -30,14 +30,74 @@ except Exception:
 
 from telegram_handler import send_notification
 
-try:
-    from log_utils import log_to_buffer, send_log_to_channel
-except Exception:  # pragma: no cover
-    def log_to_buffer(msg: str) -> None:
-        print(msg)
+# --- logging buffer (сумісно з log_utils + fallback) ---
+_log_lines: list[str] = []
 
-    def send_log_to_channel(title: str = "📊 ЛОГ · АВАРІЇ ЖОЕ") -> None:
+try:
+    from log_utils import log_to_buffer as _lu_log, send_log_to_channel as _lu_send
+    _HAS_LOG_UTILS = True
+except Exception:
+    _HAS_LOG_UTILS = False
+
+    def _lu_log(msg: str) -> None:
         pass
+
+    def _lu_send(title: str = "") -> None:
+        pass
+
+
+def log_to_buffer(msg: str) -> None:
+    """Пише в консоль + буфер + log_utils (якщо є)."""
+    print(msg)
+    _log_lines.append(msg)
+    try:
+        _lu_log(msg)
+    except Exception:
+        pass
+
+
+def send_log_to_channel(title: str = "📊 ЛОГ · АВАРІЇ ЖОЕ") -> None:
+    """
+    Шле лог у TELEGRAM_LOG_CHANNEL_ID.
+    1) пробує log_utils
+    2) fallback на httpx (якщо log_utils/requests злетіли)
+    """
+    try:
+        if _HAS_LOG_UTILS:
+            _lu_send(title)
+    except Exception as e:
+        print(f"log_utils send failed: {e}")
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+    chat_id = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or ""
+    if not token or not chat_id or not _log_lines:
+        if not chat_id:
+            print("⚠️ TELEGRAM_LOG_CHANNEL_ID не задано — лог у канал не піде")
+        return
+
+    try:
+        body = "\n".join(_log_lines)
+        text_msg = f"{title}\n\n<pre>{body}</pre>"
+        if len(text_msg) > 4000:
+            text_msg = text_msg[:3900] + "\n…</pre>"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        r = httpx.post(
+            url,
+            data={
+                "chat_id": chat_id,
+                "text": text_msg,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "true",
+            },
+            timeout=15,
+        )
+        if r.status_code == 200:
+            print(f"✓ Лог відправлено в {chat_id}")
+        else:
+            print(f"❌ Лог Telegram HTTP {r.status_code}: {r.text[:300]}")
+    except Exception as e:
+        print(f"❌ Лог fallback failed: {e}")
+
 
 logging.basicConfig(
     level=logging.INFO,
