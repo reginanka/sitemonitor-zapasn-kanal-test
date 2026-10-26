@@ -23,8 +23,6 @@ jobs:
       ZTOE_MONGO_DB: ${{ secrets.ZTOE_MONGO_DB }}
       UKRENERGO_SITE_URL: ${{ secrets.UKRENERGO_SITE_URL }}
       UKRENERGO2_SYNC_REGIONSTATUS: "1"
-      REGENERATE_OPERATOR: "Житомиробленерго"
-      RENDER_SCHEDULE_IMAGES: "1"
 
     steps:
       - name: Checkout repository
@@ -38,8 +36,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-telegram-bot==20.8 pytz "pymongo>=4.6" playwright
-          python -m playwright install chromium --with-deps
+          pip install requests python-telegram-bot==20.8 pytz "pymongo>=4.6"
 
       - name: Run Ukrenergo 2 monitor
         run: python ukrenergo2_monitor.py

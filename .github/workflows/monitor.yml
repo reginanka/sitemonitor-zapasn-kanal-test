@@ -37,7 +37,6 @@ jobs:
           MONGO_URI: ${{ secrets.MAYACHOK_MONGO_URI }}
           MONGO_DB: ${{ secrets.ZTOE_MONGO_DB }}
           ZTOE_BOT_TOKEN: ${{ secrets.ZTOE_BOT_TOKEN }}
-          RENDER_SCHEDULE_IMAGES: "1"
         run: python monitor.py
 
       - name: Commit changes
