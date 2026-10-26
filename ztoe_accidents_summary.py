@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Погодинний звіт про аварійні відключення в Житомирській області (ЖОЕ).
+Звіт про аварійні відключення в Житомирській області (ЖОЕ).
 
 - Тягне всі записи з /pw_accidents
 - Рахує унікальні вулиці / нас. пункти по РЕМ
 - Під кожним РЕМ — топ населених пунктів (географія)
-- Сортує від найгіршої ситуації
-- Зберігає знімок у Mongo (колекція accidents_summary)
-- Шле в Telegram-канал + лог у TELEGRAM_LOG_CHANNEL_ID
+- Завжди зберігає знімок у Mongo (accidents_summary: latest + історія по годині)
+- У Telegram-канал шле лише при ескалації рівня або першому WARN+ за день
+  (антиспам: last_notified_date / last_notified_level у Mongo)
+- FORCE_NOTIFY=1 — примусово в канал
+- Лог у TELEGRAM_LOG_CHANNEL_ID
+
+Рівні (за кількістю н.п.):
+  NORM <30 | WARN 30–150 | HIGH 150–400 | CRITICAL >400
 """
 
 from __future__ import annotations
@@ -142,6 +147,102 @@ TOP_CITIES_PER_REM = 5
 CITY_PREFIX = {
     "Житомир", "Звягель", "Бердичів", "Овруч", "Коростень", "Малин",
 }
+
+
+
+# Рівень по кількості населених пунктів (область ~1400 н.п.)
+# 🟢 NORM     < 30
+# 🟡 WARN     30–150
+# 🟠 HIGH     150–400
+# 🔴 CRITICAL > 400
+LEVEL_ORDER = {"NORM": 0, "WARN": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+def level_from_cities(total_cities: int) -> Tuple[str, str, str]:
+    """Повертає (code, emoji, label)."""
+    n = int(total_cities or 0)
+    if n > 400:
+        return "CRITICAL", "🔴", "CRITICAL"
+    if n >= 150:
+        return "HIGH", "🟠", "HIGH"
+    if n >= 30:
+        return "WARN", "🟡", "WARN"
+    return "NORM", "🟢", "NORM"
+
+
+def get_mongo_col():
+    """Колекція accidents_summary або None."""
+    uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
+    if not uri:
+        return None
+    db_name = (
+        os.getenv("ZTOE_MONGO_DB")
+        or os.getenv("MONGO_DB")
+        or os.getenv("MAYACHOK_MONGO_DB")
+        or "vidkluchennya"
+    )
+    try:
+        from pymongo import MongoClient
+
+        client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+        return client[db_name]["accidents_summary"]
+    except Exception as e:
+        log_to_buffer(f"⚠️ Mongo connect failed: {e}")
+        return None
+
+
+def load_latest_summary() -> dict | None:
+    col = get_mongo_col()
+    if col is None:
+        return None
+    try:
+        return col.find_one({"_id": "latest"})
+    except Exception as e:
+        log_to_buffer(f"⚠️ Mongo read latest failed: {e}")
+        return None
+
+
+def should_notify_channel(
+    level: str,
+    prev: dict | None,
+    as_of: datetime,
+) -> Tuple[bool, str]:
+    """
+    Mongo — завжди. Канал — без щогодинного спаму.
+
+    1) FORCE_NOTIFY=1/true/yes — завжди слати
+    2) Ескалація відносно last_notified_level (WARN+) — слати
+    3) Сьогодні ще не слали і рівень WARN+ — слати
+    4) Сьогодні вже слали і рівень не виріс — НЕ слати
+    5) NORM — у канал не слати
+    """
+    force = (os.getenv("FORCE_NOTIFY") or "").strip().lower() in ("1", "true", "yes")
+    if force:
+        return True, "FORCE_NOTIFY"
+
+    rank = LEVEL_ORDER.get(level, 0)
+    today = as_of.strftime("%Y-%m-%d")
+    prev = prev or {}
+
+    last_date = str(prev.get("last_notified_date") or "")[:10]
+    last_notified_level = prev.get("last_notified_level") or ""
+    last_rank = (
+        LEVEL_ORDER.get(last_notified_level, -1) if last_notified_level else -1
+    )
+
+    # Ескалація (навіть якщо вже писали сьогодні)
+    if rank > last_rank and rank >= LEVEL_ORDER["WARN"]:
+        return True, f"ескалація {last_notified_level or '—'} → {level}"
+
+    # Сьогодні вже є сповіщення — не спамимо
+    if last_date == today and last_rank >= 0:
+        return False, f"вже сповіщали сьогодні ({last_notified_level}, {last_date})"
+
+    # Перше за день при WARN+
+    if rank >= LEVEL_ORDER["WARN"]:
+        return True, f"перше сповіщення за день, рівень {level}"
+
+    return False, f"рівень {level}, у канал не шлемо"
 
 
 def severity_emoji(streets: int) -> str:
@@ -280,15 +381,26 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
     }
 
 
-def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
+def format_message(
+    stats: Dict[str, Any],
+    as_of: datetime,
+    level_meta: Tuple[str, str, str] | None = None,
+) -> str:
     time_full = as_of.strftime("%d.%m.%Y %H:%M")
     time_short = as_of.strftime("%H:%M %d.%m")
 
     total_cities = stats["total_cities"]
     total_streets = stats["total_streets"]
 
+    if level_meta is None:
+        level_meta = level_from_cities(total_cities)
+    _level_code, level_emoji, level_label = level_meta
+
     lines: List[str] = [
         "⚡️ <b>Стан електромереж у Житомирській області</b>",
+        f"(станом на {time_full})",
+        "",
+        f"{level_emoji} Рівень: <b>{level_label}</b>",
         "",
         (
             f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
@@ -298,7 +410,6 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
         "⚠️ <b>Ситуація по РЕМ</b> (від найбільш проблемних):",
     ]
 
-    # сортування РЕМ: вулиці → нас. пункти → records
     rem_sorted = sorted(
         stats["rem"].items(),
         key=lambda x: (-x[1]["streets"], -x[1]["cities"], -x[1]["records"]),
@@ -315,7 +426,6 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
             f"{st['streets']:,} вул.".replace(",", " ")
         )
 
-        # топ населених пунктів у цьому РЕМ (географія)
         cities_sorted = sorted(
             st.get("city_streets", {}).items(),
             key=lambda x: -x[1],
@@ -332,7 +442,6 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
 
     lines.append("")
 
-    # футер
     footer_parts: List[str] = []
     if AVARII_ZHOE:
         footer_parts.append(f'<a href="{AVARII_ZHOE}">🔗 Сайт "ЖОЕ"</a>')
@@ -342,12 +451,27 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
         lines.append("  ".join(footer_parts))
     lines.append(f"🕐 {time_short}")
 
-    return "\n".join(lines)
+    return '\n'.join(lines)
 
 
-def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
-    uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
-    if not uri:
+
+def save_to_mongo(
+    stats: Dict[str, Any],
+    as_of: datetime,
+    message: str,
+    *,
+    level: str,
+    level_emoji: str,
+    notified: bool,
+    prev: dict | None = None,
+) -> None:
+    """
+    Завжди пише latest + історію по годині.
+    notified=True → оновлює last_notified_* (антиспам на день).
+    notified=False → зберігає попередні last_notified_* з prev.
+    """
+    col = get_mongo_col()
+    if col is None:
         log_to_buffer("⚠️ Немає MONGO_URI — пропускаємо запис у Mongo")
         return
 
@@ -359,13 +483,20 @@ def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
     )
 
     try:
-        from pymongo import MongoClient
+        prev = prev or {}
+        today = as_of.strftime("%Y-%m-%d")
 
-        client = MongoClient(uri, serverSelectionTimeoutMS=8000)
-        db = client[db_name]
-        col = db["accidents_summary"]
+        if notified:
+            last_notified_date = today
+            last_notified_level = level
+            last_notified_at = datetime.now(timezone.utc)
+            last_notified_cities = stats["total_cities"]
+        else:
+            last_notified_date = prev.get("last_notified_date")
+            last_notified_level = prev.get("last_notified_level")
+            last_notified_at = prev.get("last_notified_at")
+            last_notified_cities = prev.get("last_notified_cities")
 
-        # city_streets вкладені — ок для Mongo
         doc = {
             "_id": "latest",
             "as_of": as_of.isoformat(),
@@ -376,26 +507,41 @@ def save_to_mongo(stats: Dict[str, Any], as_of: datetime, message: str) -> None:
             "zhytomyr_streets": stats["zhytomyr_streets"],
             "rem": stats["rem"],
             "message": message,
+            "level": level,
+            "level_emoji": level_emoji,
             "updated_at": datetime.now(timezone.utc),
+            "last_notified_date": last_notified_date,
+            "last_notified_level": last_notified_level,
+            "last_notified_at": last_notified_at,
+            "last_notified_cities": last_notified_cities,
         }
         col.update_one({"_id": "latest"}, {"$set": doc}, upsert=True)
 
         history_id = as_of.strftime("%Y-%m-%dT%H")
-        col.update_one(
-            {"_id": history_id},
-            {"$set": {**{k: v for k, v in doc.items() if k != "_id"}, "_id": history_id}},
-            upsert=True,
+        hist = {k: v for k, v in doc.items() if k != "_id"}
+        hist["_id"] = history_id
+        col.update_one({"_id": history_id}, {"$set": hist}, upsert=True)
+
+        log_to_buffer(
+            f"🗄 Mongo: {db_name}.accidents_summary (latest + {history_id}), "
+            f"level={level}, notified={notified}"
         )
-        log_to_buffer(f"🗄 Mongo: {db_name}.accidents_summary (latest + {history_id})")
     except Exception as e:
         log_to_buffer(f"❌ Mongo write failed: {e}")
 
 
+
 def main() -> int:
     log_to_buffer("=" * 40)
-    log_to_buffer("🚀 СТАРТ · Зведення аварій ЖОЕ (погодинний)")
+    log_to_buffer("🚀 СТАРТ · Зведення аварій ЖОЕ")
     log_to_buffer(f"ZTOE_API_BASE={'задано' if API_BASE else 'НЕМАЄ'}")
-    log_to_buffer(f"AVARII_ZHOE={'є' if AVARII_ZHOE else 'немає'} · SUBSCRIBE={'є' if SUBSCRIBE else 'немає'}")
+    log_to_buffer(
+        f"AVARII_ZHOE={'є' if AVARII_ZHOE else 'немає'} · "
+        f"SUBSCRIBE={'є' if SUBSCRIBE else 'немає'}"
+    )
+    force = (os.getenv("FORCE_NOTIFY") or "").strip()
+    if force:
+        log_to_buffer(f"FORCE_NOTIFY={force}")
 
     try:
         accidents = fetch_all_accidents()
@@ -405,35 +551,55 @@ def main() -> int:
         return 1
 
     as_of = datetime.now(KYIV)
+    prev = load_latest_summary()
 
     if not accidents:
         log_to_buffer("⚠️ Порожня відповідь API")
+        stats = {
+            "total_records": 0,
+            "total_streets": 0,
+            "total_cities": 0,
+            "zhytomyr_streets": 0,
+            "rem": {},
+        }
+        level, level_emoji, level_label = level_from_cities(0)
         msg = (
             "⚡️ <b>Стан електромереж у Житомирській області</b>\n"
             f"(станом на {as_of.strftime('%d.%m.%Y %H:%M')})\n\n"
+            f"{level_emoji} Рівень: <b>{level_label}</b>\n\n"
             "Зараз аварійних відключень за даними API немає."
         )
         if AVARII_ZHOE or SUBSCRIBE:
             parts = []
             if AVARII_ZHOE:
-                parts.append(f'<a href="{AVARII_ZHOE}">Чому немає світла?|ЖОЕ</a>')
+                parts.append(f'<a href="{AVARII_ZHOE}">🔗 Сайт "ЖОЕ"</a>')
             if SUBSCRIBE:
                 parts.append(f'<a href="{SUBSCRIBE}">⚡️ ПІДПИСАТИСЯ</a>')
             msg += "\n\n" + "  ".join(parts)
             msg += f"\n🕐 {as_of.strftime('%H:%M %d.%m')}"
-        ok = send_notification(msg)
-        log_to_buffer(f"Telegram (empty): {'✓' if ok else '✗'}")
+
+        do_notify, reason = should_notify_channel(level, prev, as_of)
+        log_to_buffer(f"📢 notify={do_notify} ({reason})")
+        save_to_mongo(
+            stats, as_of, msg,
+            level=level, level_emoji=level_emoji,
+            notified=False,  # порожньо / NORM — не ставимо мітку «вже слали»
+            prev=prev,
+        )
+        # при порожньому API в канал не шлемо (база оновлена)
         send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ")
         return 0
 
     stats = aggregate(accidents)
-    msg = format_message(stats, as_of)
+    level, level_emoji, level_label = level_from_cities(stats["total_cities"])
+    msg = format_message(stats, as_of, (level, level_emoji, level_label))
 
     log_to_buffer(
         f"📊 records={stats['total_records']} "
         f"streets={stats['total_streets']} "
         f"cities={stats['total_cities']} "
-        f"zhytomyr={stats['zhytomyr_streets']}"
+        f"zhytomyr={stats['zhytomyr_streets']} "
+        f"level={level}"
     )
     top_rem = sorted(
         stats["rem"].items(),
@@ -446,16 +612,34 @@ def main() -> int:
             f"  REM {name}: streets={st['streets']} cities={st['cities']} [{cities_s}]"
         )
 
-    save_to_mongo(stats, as_of, msg)
+    do_notify, reason = should_notify_channel(level, prev, as_of)
+    log_to_buffer(f"📢 notify={do_notify} ({reason})")
 
-    ok = send_notification(msg)
-    if ok:
-        log_to_buffer(f"✓ Telegram: звіт відправлено ({len(msg)} символів)")
+    notified_ok = False
+    if do_notify:
+        ok = send_notification(msg)
+        if ok:
+            notified_ok = True
+            log_to_buffer(f"✓ Telegram: звіт відправлено ({len(msg)} символів)")
+        else:
+            log_to_buffer("❌ Telegram: не вдалося відправити")
     else:
-        log_to_buffer("❌ Telegram: не вдалося відправити")
+        log_to_buffer("⏭ Telegram: пропущено (антиспам / рівень)")
+
+    # Mongo завжди; мітку last_notified оновлюємо лише якщо реально відправили
+    save_to_mongo(
+        stats, as_of, msg,
+        level=level,
+        level_emoji=level_emoji,
+        notified=notified_ok,
+        prev=prev,
+    )
 
     send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ")
-    return 0 if ok else 1
+    if do_notify and not notified_ok:
+        return 1
+    return 0
+
 
 
 if __name__ == "__main__":
