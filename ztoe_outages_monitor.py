@@ -5,8 +5,8 @@
 - Усі сторінки API
 - Дедуп по fingerprint (не спам на новий id)
 - План після відомої аварії не дублює
-- Full docs у Mongo outages (+ queue_key) → /check і PNG (planned/emerg)
-- При новій події: перегенерація PNG черги + повідомлення з картинкою
+- Full docs у Mongo outages (+ queue_key) → /check
+- При новій події: текстове сповіщення підписникам (без PNG)
 """
 
 from __future__ import annotations
@@ -156,15 +156,27 @@ def format_outage(outage: dict) -> str:
     return text
 
 
+def _norm_street(name: str) -> str:
+    s = (name or "").strip().lower()
+    for pfx in ("вул.", "вул ", "пров.", "провулок ", "проспект ", "пр.", "бульвар ", "пл.", "площа "):
+        if s.startswith(pfx):
+            s = s[len(pfx):].strip()
+    return s
+
+
 def matches_street(outage: dict, street_id, street_name: str) -> bool:
     o_street = outage.get("street") or {}
     o_street_id = o_street.get("id")
     o_street_name = (o_street.get("name") or "").lower()
-    if street_id and o_street_id == street_id:
+    if street_id and o_street_id is not None and str(o_street_id) == str(street_id):
         return True
-    if street_name and street_name in o_street_name:
+    a = _norm_street(street_name)
+    b = _norm_street(o_street_name)
+    if a and b and (a in b or b in a):
         return True
-    if street_name and o_street_name and o_street_name in street_name:
+    if street_name and street_name.lower() in o_street_name:
+        return True
+    if street_name and o_street_name and o_street_name in street_name.lower():
         return True
     return False
 
@@ -280,6 +292,16 @@ def main() -> int:
             log.error("Fetch otg=%s city=%s: %s", otg_id, city_id, e)
             continue
 
+        # Якщо з city_id порожньо — пробуємо без фільтра міста (часто плани висять на ОТГ)
+        if not outages and city_id:
+            try:
+                outages = fetch_all_outages(otg_id, None)
+                log.info("otg=%s city=%s: empty with city filter → retry without city → %s",
+                         otg_id, city_id, len(outages))
+            except Exception as e:
+                log.error("Fetch otg=%s (no city): %s", otg_id, e)
+                continue
+
         groups_checked += 1
         current_ids = {make_outage_key(o) for o in outages}
         current_fps = {content_fingerprint(o) for o in outages}
@@ -302,20 +324,12 @@ def main() -> int:
             filtered.append(o)
         new_outages = filtered
 
-        outages_col.update_one(
-            {"_id": cache_key},
-            {
-                "$set": {
-                    "ids": list(current_ids),
-                    "fps": list(current_fps),
-                    "soft_fps": list(current_soft | prev_soft),
-                    "updated_at": datetime.now(timezone.utc),
-                    "count": len(current_ids),
-                }
-            },
-            upsert=True,
+        log.info(
+            "otg=%s city=%s fetched=%s cache_fps=%s new=%s",
+            otg_id, city_id, len(outages), len(prev_fps), len(new_outages),
         )
 
+        # Повні docs у Mongo (для /check) — завжди
         for o in outages:
             doc = outage_to_mongo_doc(o)
             outages_full.update_one(
@@ -324,45 +338,91 @@ def main() -> int:
                 upsert=True,
             )
 
-        if not new_outages:
-            continue
+        matched_fps: set = set()
+        match_attempts = 0
 
-        log.info("otg=%s city=%s new=%s", otg_id, city_id, len(new_outages))
+        if new_outages:
+            for user, addr in group_pairs:
+                tid = user.get("telegram_id")
+                if not tid:
+                    continue
+                street_id = addr.get("street_id") or addr.get("streetId")
+                street_name = (addr.get("street_name") or addr.get("street") or "").strip().lower()
+                house = addr.get("house") or addr.get("building") or ""
+                uqk = user_queue_key(addr)
 
-        # Прив'язка queue_key + PNG для ВСІХ поточних outages по адресах
-        # (навіть якщо сповіщення не шлемо — щоб /check і картинки були актуальні)
-        for user, addr in group_pairs:
-            street_id = addr.get("street_id")
-            street_name = (addr.get("street_name") or "").lower()
-            house = addr.get("house") or addr.get("building") or addr.get("bud") or ""
-            uqk = user_queue_key(addr)
-            tid = user["telegram_id"]
-            for outage in outages:
-                if not matches_street(outage, street_id, street_name):
-                    continue
-                if not matches_building(outage, str(house)):
-                    continue
-                if uqk:
-                    doc = outage_to_mongo_doc(outage, queue_key=uqk)
-                    outages_full.update_one(
-                        {"source": doc["source"], "source_id": doc["source_id"]},
-                        {"$set": doc},
-                        upsert=True,
+                for outage in outages:
+                    if not matches_street(outage, street_id, street_name):
+                        continue
+                    if not matches_building(outage, str(house)):
+                        continue
+                    if uqk:
+                        doc = outage_to_mongo_doc(outage, queue_key=uqk)
+                        outages_full.update_one(
+                            {"source": doc["source"], "source_id": doc["source_id"]},
+                            {"$set": doc},
+                            upsert=True,
+                        )
+                        outage["_user_queue"] = uqk
+
+                for outage in new_outages:
+                    match_attempts += 1
+                    if not matches_street(outage, street_id, street_name):
+                        continue
+                    if not matches_building(outage, str(house)):
+                        continue
+                    if uqk:
+                        outage["_user_queue"] = uqk
+                    notified.setdefault(tid, [])
+                    fp = content_fingerprint(outage)
+                    if any(content_fingerprint(x) == fp for x in notified[tid]):
+                        continue
+                    notified[tid].append(outage)
+                    matched_fps.add(fp)
+
+            log.info(
+                "otg=%s city=%s matched_new=%s (addrs=%s)",
+                otg_id, city_id, len(matched_fps), len(group_pairs),
+            )
+            if new_outages and not matched_fps:
+                # Підказка в лог: що прийшло з API, але не збіглося з адресами
+                sample = []
+                for o in new_outages[:5]:
+                    st = (o.get("street") or {}).get("name") or "?"
+                    bld = (o.get("buildingNames") or "")[:30]
+                    sample.append(f"{st}|{bld}|type={o.get('typeOff')}")
+                log.info("no street match; API sample: %s", " || ".join(sample))
+                for user, addr in group_pairs:
+                    log.info(
+                        "  user street=%r id=%s house=%r",
+                        addr.get("street_name") or addr.get("street"),
+                        addr.get("street_id") or addr.get("streetId"),
+                        addr.get("house"),
                     )
-                    outage["_user_queue"] = uqk
-            # сповіщення лише по new_outages
-            for outage in new_outages:
-                if not matches_street(outage, street_id, street_name):
-                    continue
-                if not matches_building(outage, str(house)):
-                    continue
-                if uqk:
-                    outage["_user_queue"] = uqk
-                notified.setdefault(tid, [])
-                fp = content_fingerprint(outage)
-                if any(content_fingerprint(x) == fp for x in notified[tid]):
-                    continue
-                notified[tid].append(outage)
+
+        # Кеш: усі поточні fps (щоб не спамити нерелевантним),
+        # але якщо був force (prev порожній) і нічого не зматчилось —
+        # НЕ записуємо fps, щоб наступний прогін міг ще раз спробувати після фіксу адрес.
+        if prev_fps or matched_fps or not new_outages:
+            outages_col.update_one(
+                {"_id": cache_key},
+                {
+                    "$set": {
+                        "ids": list(current_ids),
+                        "fps": list(current_fps),
+                        "soft_fps": list(current_soft | prev_soft),
+                        "updated_at": datetime.now(timezone.utc),
+                        "count": len(current_ids),
+                    }
+                },
+                upsert=True,
+            )
+        else:
+            log.warning(
+                "otg=%s city=%s: new=%s but 0 matched — cache NOT updated (можна виправити адреси і повторити)",
+                otg_id, city_id, len(new_outages),
+            )
+
 
     sent = 0
     for tid, outage_list in notified.items():
@@ -387,25 +447,32 @@ def main() -> int:
         except Exception as e:
             log.error("Send fail %s: %s", tid, e)
 
-    # короткий звіт у лог (і опційно в ADMIN_CHAT_ID)
+    # короткий звіт
+    n_events = sum(len(v) for v in notified.values())
     summary = (
         f"✅ Перевірка відключень\n"
         f"Підписників: {len(users)}\n"
         f"Локацій: {groups_checked}\n"
-        f"Сповіщень: {sent}\n"
-        f"PNG: вимкнено"
+        f"Подій для розсилки: {n_events}\n"
+        f"Сповіщень: {sent}"
     )
     log.info("%s", summary.replace("\n", " | "))
-    admin = os.getenv("ADMIN_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
-    if admin and sent:
-        try:
-            async def _adm():
-                await bot.send_message(chat_id=int(admin), text=summary)
-            asyncio.run(_adm())
-        except Exception as e:
-            log.warning("admin summary: %s", e)
 
-    log.info("Готово groups=%s sent=%s", groups_checked, sent)
+    # Лог-канал (якщо задано)
+    log_chat = (
+        os.getenv("TELEGRAM_LOG_CHANNEL_ID")
+        or os.getenv("ADMIN_CHAT_ID")
+        or os.getenv("TELEGRAM_CHAT_ID")
+    )
+    if log_chat:
+        try:
+            async def _log():
+                await bot.send_message(chat_id=int(log_chat), text=summary)
+            asyncio.run(_log())
+        except Exception as e:
+            log.warning("log channel: %s", e)
+
+    log.info("Готово groups=%s sent=%s events=%s", groups_checked, sent, n_events)
     return 0
 
 
