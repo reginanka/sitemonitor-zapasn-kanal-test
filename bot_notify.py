@@ -23,6 +23,15 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from mongo_store import get_db, get_site_screenshot
 from telegram_handler import send_photos_sync
 
+def _html_esc(s: str) -> str:
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 try:
     from log_utils import log_to_buffer
 except Exception:  # pragma: no cover
@@ -484,9 +493,10 @@ def _dedupe_by_priority(
 
 
 def _format_slots_line(prefix: str, slots: List[Tuple[str, str]]) -> str:
+    """Рядок деталей; час жирний+підкреслений."""
     if not slots:
         return f"{prefix}: немає"
-    parts = [f"{a}–{b}" for a, b in slots]
+    parts = [f"<b><u>{a}–{b}</u></b>" for a, b in slots]
     h = _total_hours(slots)
     return f"{prefix}: {', '.join(parts)} ({_fmt_hours(h)} год)"
 
@@ -499,7 +509,11 @@ def _short_time(t: str) -> str:
     return f"{int(m.group(1))}:{m.group(2)}"
 
 
-def _schedule_block(lab: str, addr: dict, date_str: str, *, with_queue_tag: bool) -> str:
+def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
+    """
+    Зовні: адреса + <b>Черга</b>.
+    Згорнутий блок: Світла не буде + час <b><u>…</u></b> + Деталі.
+    """
     scheduled = _slots_from_doc(load_queue_doc(lab))
     buckets = _outages_bucketed(addr, date_str)
     scheduled, emerg, repair, other = _dedupe_by_priority(
@@ -511,78 +525,93 @@ def _schedule_block(lab: str, addr: dict, date_str: str, *, with_queue_tag: bool
 
     all_merged = _merge_intervals(scheduled + emerg + repair + other)
     total_h = _total_hours(all_merged)
-    addr_str = format_address(addr)
+    addr_str = _html_esc(format_address(addr))
+    lab_esc = _html_esc(lab)
 
-    if with_queue_tag:
-        head = f"Графік на {date_str} за адресою → {addr_str} (Черга {lab})"
-    else:
-        head = f"Графік на {date_str} за адресою → {addr_str}"
-
-    lines = [head, "⬇️⬇️⬇️", ""]
     if all_merged:
-        lines.append(
+        t0, t1 = all_merged[0][0], all_merged[-1][1]
+        summary = (
             f"Світла не буде ({_fmt_hours(total_h)} год): "
-            f"{all_merged[0][0]}–{all_merged[-1][1]}"
+            f"<b><u>{t0}–{t1}</u></b>"
         )
-        lines.append("")
     else:
-        lines.append("Світла не буде: немає відключень")
-        lines.append("")
+        summary = "Світла не буде: немає відключень"
 
-    lines.append(_format_slots_line("⏰ Погодинні", scheduled))
-    lines.append(_format_slots_line("🔴 Аварійні", emerg))
-    lines.append(_format_slots_line("🟠 Ремонтні", repair))
+    detail_lines = [
+        summary,
+        "⬇️⬇️⬇️",
+        "Деталі:",
+        _format_slots_line("⏰ Погодинні", scheduled),
+        _format_slots_line("🔴 Аварійні", emerg),
+        _format_slots_line("🟠 Ремонтні", repair),
+    ]
     if other:
-        lines.append(_format_slots_line("⚪ Інші", other))
-    return "\n".join(lines)
+        detail_lines.append(_format_slots_line("⚪ Інші", other))
+
+    # HTML усередині blockquote (теги залишаємо, текст адрес вже escaped зовні)
+    body = "\n".join(detail_lines)
+    return (
+        f"{addr_str} (<b>Черга {lab_esc}</b>)\n"
+        f"<blockquote expandable>{body}</blockquote>"
+    )
 
 
 def _changes_header(
     queue_labels_with_addr: Sequence[Tuple[str, dict]],
     changes: Dict[str, List[dict]],
+    date_str: str,
 ) -> str:
     labs_order = []
     for lab, _ in queue_labels_with_addr:
         if lab not in labs_order:
             labs_order.append(lab)
 
-    if len(labs_order) <= 1:
-        lab = labs_order[0] if labs_order else ""
-        bits = []
-        for c in changes.get(lab, []):
-            action = (
-                "🪫 додали відключення"
-                if c.get("change") == "added"
-                else "🔋 скасували відключення"
-            )
-            start = _short_time(c.get("start") or "")
-            end = _short_time(c.get("end") or "")
-            if start and end:
-                bits.append(f"{action} ▶️ {start}-{end}")
-            else:
-                bits.append(action)
-        if bits:
-            return f"🔔 Для черг {lab} " + "; ".join(bits)
-        return f"🔔 Оновлення графіка для черг {lab}"
+    def _change_line(c: dict) -> str:
+        s = _html_esc(_short_time(c.get("start") or ""))
+        e = _html_esc(_short_time(c.get("end") or ""))
+        span = f"{s}-{e}" if s or e else ""
+        if c.get("change") == "added":
+            # додані — звичайний час
+            return f"{span} 🪫 додали відключення" if span else "🪫 додали відключення"
+        # скасовані — закреслений час
+        if span:
+            return f"<s>{span}</s> 🔋 скасували відключення"
+        return "🔋 скасували відключення"
 
-    lines = [
-        f"Для черг {', '.join(labs_order)} 🔔 ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!",
-        "____",
-    ]
-    for lab in labs_order:
-        lines.append(f"▶️ Черга {lab}:")
-        items = changes.get(lab) or []
-        if not items:
-            lines.append("оновлення графіка")
-            continue
-        for c in items:
-            s = _short_time(c.get("start") or "")
-            e = _short_time(c.get("end") or "")
-            if c.get("change") == "added":
-                lines.append(f"{s}-{e} 🪫 додали відключення")
-            else:
-                lines.append(f"{s}-{e} 🔋 скасували відключення")
-    return "\n".join(lines)
+    if len(labs_order) > 1:
+        lines = [
+            f"Для черг {', '.join(_html_esc(x) for x in labs_order)} 🔔 ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!",
+            "",
+            f"📅 {_html_esc(date_str)}",
+            "",
+        ]
+        for lab in labs_order:
+            lines.append(f"▶️ Черга <b>{_html_esc(lab)}</b>:")
+            items = changes.get(lab) or []
+            if not items:
+                lines.append("оновлення графіка")
+                continue
+            for c in items:
+                lines.append(_change_line(c))
+        return "\n".join(lines)
+
+    lab = labs_order[0] if labs_order else ""
+    bits = []
+    for c in changes.get(lab, []):
+        s = _html_esc(_short_time(c.get("start") or ""))
+        e = _html_esc(_short_time(c.get("end") or ""))
+        span = f"{s}-{e}" if s or e else ""
+        if c.get("change") == "added":
+            action = "🪫 додали відключення"
+            bits.append(f"{action} ▶️ {span}" if span else action)
+        else:
+            action = "🔋 скасували відключення"
+            bits.append(f"{action} ▶️ <s>{span}</s>" if span else action)
+    if bits:
+        head = f"🔔 Для черг <b>{_html_esc(lab)}</b> " + "; ".join(bits)
+    else:
+        head = f"🔔 Оновлення графіка для черг <b>{_html_esc(lab)}</b>"
+    return f"{head}\n\n📅 {_html_esc(date_str)}"
 
 
 def build_personal_dm(
@@ -598,19 +627,14 @@ def build_personal_dm(
     if not items:
         return "🔔 Оновлення графіка"
 
-    header = _changes_header(items, changes)
+    header = _changes_header(items, changes, date_str)
 
-    if len(items) == 1:
-        lab, addr = items[0]
-        body = _schedule_block(lab, addr, date_str, with_queue_tag=False)
-        return f"{header}\n____\n{body}".strip()
-
-    parts = [header, "____", ""]
+    parts = [header, ""]
     for lab, addr in items:
-        parts.append(_schedule_block(lab, addr, date_str, with_queue_tag=True))
-        parts.append("____")
+        parts.append("—")
+        parts.append(_schedule_block(lab, addr, date_str))
         parts.append("")
-    return "\n".join(parts).strip().rstrip("_").strip()
+    return "\n".join(parts).strip()
 
 
 def notify_bot_users_with_images(
