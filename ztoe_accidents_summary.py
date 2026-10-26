@@ -159,15 +159,19 @@ LEVEL_ORDER = {"NORM": 0, "WARN": 1, "HIGH": 2, "CRITICAL": 3}
 
 
 def level_from_cities(total_cities: int) -> Tuple[str, str, str]:
-    """Повертає (code, emoji, label)."""
+    """Повертає (code, emoji, label_uk).
+
+    Код (NORM/WARN/HIGH/CRITICAL) — для антиспаму в Mongo.
+    label_uk — для повідомлення в канал (варіант A).
+    """
     n = int(total_cities or 0)
     if n > 400:
-        return "CRITICAL", "🔴", "CRITICAL"
+        return "CRITICAL", "🔴", "КРИТИЧНО"
     if n >= 150:
-        return "HIGH", "🟠", "HIGH"
+        return "HIGH", "🟠", "СКЛАДНО"
     if n >= 30:
-        return "WARN", "🟡", "WARN"
-    return "NORM", "🟢", "NORM"
+        return "WARN", "🟡", "УВАГА"
+    return "NORM", "🟢", "СТАБІЛЬНО"
 
 
 def get_mongo_col():
@@ -397,10 +401,7 @@ def format_message(
     _level_code, level_emoji, level_label = level_meta
 
     lines: List[str] = [
-        "⚡️ <b>Стан електромереж у Житомирській області</b>",
-        f"(станом на {time_full})",
-        "",
-        f"{level_emoji} Рівень: <b>{level_label}</b>",
+        f"⚡️ <b>Стан електромереж у Житомирській області: {level_emoji} {level_label}</b>",
         "",
         (
             f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
@@ -564,9 +565,7 @@ def main() -> int:
         }
         level, level_emoji, level_label = level_from_cities(0)
         msg = (
-            "⚡️ <b>Стан електромереж у Житомирській області</b>\n"
-            f"(станом на {as_of.strftime('%d.%m.%Y %H:%M')})\n\n"
-            f"{level_emoji} Рівень: <b>{level_label}</b>\n\n"
+            f"⚡️ <b>Стан електромереж у Житомирській області: {level_emoji} {level_label}</b>\n\n"
             "Зараз аварійних відключень за даними API немає."
         )
         if AVARII_ZHOE or SUBSCRIBE:
