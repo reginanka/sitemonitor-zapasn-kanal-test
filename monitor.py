@@ -716,6 +716,11 @@ def notify_bot_users(
             header = msg.split("\n")[0].strip()
 
         changes = _extract_changes_for_dm(diff or {})
+        log_to_buffer(
+            f"📬 DM prepare: queues={changed_queues} "
+            f"changes_keys={list(changes.keys())} "
+            f"has_ztoe_token={bool(os.getenv('ZTOE_BOT_TOKEN'))}"
+        )
 
         notify_bot_users_with_images(
             msg,

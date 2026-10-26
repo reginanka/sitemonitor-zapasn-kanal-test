@@ -137,12 +137,14 @@ def collect_notify_targets(
 
     keys = [str(k).strip() for k in (queue_keys or []) if str(k).strip()]
     targets: Dict[int, List[Tuple[str, dict]]] = {}
+    all_labels: List[str] = []
 
     for u in users:
         tid = u.get("telegram_id")
         if tid is None:
             continue
         matched: List[Tuple[str, dict]] = []
+        user_labs: List[str] = []
         for addr in user_addresses(u):
             if not isinstance(addr, dict):
                 continue
@@ -151,6 +153,8 @@ def collect_notify_targets(
             if not q:
                 continue
             label = queue_label(q, sq)
+            if label:
+                user_labs.append(label)
             if keys:
                 for qk in keys:
                     if addr_matches_queue(addr, qk):
@@ -170,9 +174,22 @@ def collect_notify_targets(
                     for m in matched
                 ):
                     matched.append((label, addr))
+        if user_labs:
+            all_labels.append(f"tid={tid}:[{','.join(user_labs)}]")
         if matched:
-            targets[int(tid)] = matched
+            try:
+                targets[int(tid)] = matched
+            except (TypeError, ValueError):
+                log_to_buffer(f"⚠️ bad telegram_id={tid!r}")
 
+    log_to_buffer(
+        f"📬 notify users={len(users)} keys={keys} targets={len(targets)}"
+    )
+    if keys and not targets and all_labels:
+        log_to_buffer(
+            "⚠️ жоден підписник не збігся з чергами змін; адреси: "
+            + "; ".join(all_labels[:20])
+        )
     return targets
 
 
@@ -666,7 +683,10 @@ def notify_bot_users_with_images(
         targets = collect_notify_targets(queue_keys)
 
     if not targets:
-        log_to_buffer("ℹ️ Немає підписників бота для DM")
+        log_to_buffer(
+            "ℹ️ Немає підписників бота для DM "
+            "(перевір notify=true, queue/subqueue, ZTOE_BOT_TOKEN, /start бота)"
+        )
         return
 
     if not date_str:
@@ -674,10 +694,13 @@ def notify_bot_users_with_images(
 
     site_png = get_site_screenshot()
     images = [site_png] if site_png else []
+    if not images:
+        log_to_buffer("⚠️ немає скріну ЖОЕ в Mongo — DM лише текстом")
 
     sent = 0
     failed = 0
     for tid, qs_with_addr in targets.items():
+        labs = sorted({lab for lab, _ in qs_with_addr})
         if personalize:
             body = build_personal_dm(
                 qs_with_addr,
@@ -685,7 +708,6 @@ def notify_bot_users_with_images(
                 date_str=date_str,
             )
         else:
-            labs = sorted({lab for lab, _ in qs_with_addr})
             body = (
                 (message or header or "🔔 Оновлення")
                 + f"\n\n📌 Твої черги: <b>{', '.join(labs)}</b>"
@@ -693,15 +715,23 @@ def notify_bot_users_with_images(
 
         caption = body if len(body) <= 1024 else (body[:1000] + "\n…")
         ok = send_photos_sync(tid, images, caption, bot_token=bot_token)
+        # fallback: лише текст (коли фото/HTML падає, або користувач не /start)
+        if not ok:
+            ok = send_photos_sync(tid, [], body[:4096], bot_token=bot_token)
         if ok:
             sent += 1
-            if len(body) > 1024:
+            if len(body) > 1024 and images:
                 try:
                     send_photos_sync(tid, [], body[:4096], bot_token=bot_token)
                 except Exception:
                     pass
+            log_to_buffer(f"✓ DM tid={tid} queues={labs}")
         else:
             failed += 1
+            log_to_buffer(
+                f"❌ DM fail tid={tid} queues={labs} "
+                f"(бот інший? користувач не /start? блок?)"
+            )
         time.sleep(0.05)
 
     log_to_buffer(
