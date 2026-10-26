@@ -750,6 +750,12 @@ def main():
         )
         log_to_buffer(f"🔐 Витягнено хеші для {len(current_main_hashes)} черг")
 
+        if not current_main_hashes:
+            log_to_buffer(
+                "❌ Усі черги з помилкою API — current.json і last_hash.json не чіпаю"
+            )
+            return
+
         # 3. Зберегти поточні нормалізовані дані (локально для diff)
         if CURRENT_FILE.exists():
             shutil.copy(CURRENT_FILE, PREVIOUS_FILE)
