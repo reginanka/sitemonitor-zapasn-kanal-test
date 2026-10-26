@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Примусово очищає outages_cache, щоб наступний ztoe_outages_monitor
-побачив усі поточні події як нові → перемалював PNG і надіслав сповіщення.
+Примусово очищає outages_cache (+ опційно старі outages),
+щоб наступний ztoe_outages_monitor побачив події як нові.
 
-Аналог ukrenergo2_force_diff.py для тестового бота.
+НЕ чистить queue_schedules і users.
 
 Використання:
   python ztoe_outages_force_diff.py
-
-Потім запусти звичайний:
+  # потім:
   python ztoe_outages_monitor.py
   (або workflow ztoe-outages.yml)
 """
@@ -17,7 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from pymongo import MongoClient
 
@@ -36,15 +35,34 @@ def main() -> int:
 
     client = MongoClient(uri, serverSelectionTimeoutMS=8000)
     db = client[db_name]
-    col = db["outages_cache"]
+    now = datetime.now(timezone.utc)
+    now_s = now.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    before = col.count_documents({})
-    result = col.delete_many({})
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    # 1) cache — завжди
+    cache = db["outages_cache"]
+    before_cache = cache.count_documents({})
+    r1 = cache.delete_many({})
+    print(f"[{now_s}] outages_cache: видалено {r1.deleted_count} (було {before_cache})")
 
-    print(f"[{now}] outages_cache: видалено {result.deleted_count} документів (було {before})")
-    print("Тепер запусти ztoe_outages_monitor.py — він побачить усі outages як нові")
-    print("і перемалює PNG з аварійними/плановими смугами.")
+    # 2) старі outages (старіше 3 днів) — щоб DM не тягнув сміття
+    outages = db["outages"]
+    cutoff = now - timedelta(days=3)
+    before_out = outages.count_documents({})
+    # updated_at або dateEvent
+    r2 = outages.delete_many({
+        "$or": [
+            {"updated_at": {"$lt": cutoff}},
+            {"dateEvent": {"$lt": (cutoff).strftime("%Y-%m-%d")}},
+            {"date_from": {"$lt": (cutoff).strftime("%Y-%m-%d")}},
+        ]
+    })
+    after_out = outages.count_documents({})
+    print(
+        f"[{now_s}] outages: видалено старих {r2.deleted_count} "
+        f"(було {before_out}, лишилось {after_out})"
+    )
+
+    print("Тепер запусти ztoe_outages_monitor — він заново заповнить outages і cache.")
     return 0
 
 
