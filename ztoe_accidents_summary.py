@@ -289,7 +289,6 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
 
     lines: List[str] = [
         "⚡️ <b>Стан електромереж у Житомирській області</b>",
-        f"(станом на {time_full})",
         "",
         (
             f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
