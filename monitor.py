@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import requests
 from log_utils import log_to_buffer, send_log_to_channel
-from site_content import get_schedule_content, take_screenshot_between_elements
+from site_content import fetch_site_update_and_screenshot
 from telegram_handler import send_notification
 
 API_BASE_URL = os.getenv("API_BASE_URL")
@@ -773,11 +773,8 @@ def main():
         log_to_buffer(f"🔔 Зміни виявлено для: {', '.join(diff['queues'])}")
 
 
-        # 6. Отримати дату оновлення з сайту
-        _, date_content = get_schedule_content()
-
-        # 7. Скріншот із сайту
-        screenshot_path, screenshot_hash = take_screenshot_between_elements()
+        # 6+7. Дата + скрін одним проходом Chromium (тільки при змінах)
+        date_content, screenshot_path, screenshot_hash = fetch_site_update_and_screenshot()
         if not screenshot_path:
             log_to_buffer("⚠️ Не вдалося створити скріншот")
 
