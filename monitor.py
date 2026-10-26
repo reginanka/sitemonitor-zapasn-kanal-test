@@ -14,9 +14,6 @@ from telegram_handler import send_notification
 API_BASE_URL = os.getenv("API_BASE_URL")
 URL = os.environ.get('URL')
 SUBSCRIBE = os.environ.get('SUBSCRIBE')
-# PNG черг вимкнено назавжди (файли render_schedule видалені)
-RENDER_SCHEDULE_IMAGES = False
-
 
 QUEUES = [(i, j) for i in range(1, 7) for j in range(1, 2 + 1)]
 
@@ -608,7 +605,7 @@ def sync_schedules_to_mongo(
     queue_keys: Optional[List[str]] = None,
 ) -> None:
     """
-    Пише слоти у Mongo (queue_schedules) лише для вказаних черг (без PNG).
+    Пише слоти у Mongo (queue_schedules) лише для вказаних черг.
     Викликати ТІЛЬКИ коли є зміни в графіку.
     """
     mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
@@ -672,16 +669,42 @@ def sync_schedules_to_mongo(
     )
 
 
+def _extract_changes_for_dm(diff: Dict) -> Dict[str, List[dict]]:
+    """
+    З diff['per_queue'] збирає для DM:
+      { "6.1": [ {"change": "added"|"removed", "start": "12:00", "end": "13:00"}, ... ] }
+    Бере змінені дати (не new_dates), усі діапазони.
+    """
+    out: Dict[str, List[dict]] = {}
+    for q, info in (diff.get("per_queue") or {}).items():
+        items = []
+        for date, ranges in (info.get("changed_dates") or {}).items():
+            for r in ranges:
+                items.append({
+                    "change": r.get("change") or "added",
+                    "start": r.get("start") or "",
+                    "end": r.get("end") or "",
+                    "date": date,
+                })
+        # якщо лише нові дати — теж показуємо як «додали»
+        if not items and info.get("new_dates"):
+            # інтервали візьме build_personal_dm з Mongo після sync
+            items.append({"change": "added", "start": "", "end": "", "date": ""})
+        if items:
+            out[q] = items
+    return out
+
+
 def notify_bot_users(
     changed_queues: List[str],
     channel_message: str,
+    diff: Optional[Dict] = None,
 ) -> None:
     """
     Сповіщення підписникам бота ztoe (users.notify=true),
     у яких адреса з чергою з changed_queues.
 
-    Текст — ЛИШЕ черги цього користувача (не весь список каналу).
-    Текст + опційно один скрін ЖОЕ (без PNG черг).
+    Новий короткий формат + один скрін ЖОЕ.
     """
     try:
         from bot_notify import notify_bot_users_with_images
@@ -691,6 +714,9 @@ def notify_bot_users(
         msg = (channel_message or "").strip()
         if msg.startswith("🔔"):
             header = msg.split("\n")[0].strip()
+
+        changes = _extract_changes_for_dm(diff or {})
+
         notify_bot_users_with_images(
             msg,
             queue_keys=changed_queues or [],
@@ -698,6 +724,7 @@ def notify_bot_users(
             header=header,
             date_str=_dt.now().strftime("%d.%m.%Y"),
             personalize=True,
+            changes=changes,
         )
     except Exception as e:
         log_to_buffer(f"❌ notify_bot_users: {e}")
@@ -739,7 +766,7 @@ def main():
         diff = build_diff(norm_by_queue, current_main_hashes, current_span_hashes, last_state)
 
         if not diff["queues"] and not diff["new_dates"]:
-            log_to_buffer("✅ Дані по всіх чергах не змінилися — Mongo/PNG/DM не чіпаємо")
+            log_to_buffer("✅ Дані по всіх чергах не змінилися — Mongo/DM не чіпаємо")
             save_state(current_main_hashes, current_span_hashes, timestamp)
             return
 
@@ -835,7 +862,7 @@ def main():
                 else:
                     log_to_buffer("❌ Помилка надсилання повідомлення про новий графік")
 
-        # 9b. Тільки при змінах: Mongo (слоти + PNG) і DM підписникам бота
+        # 9b. Тільки при змінах: Mongo (слоти) і DM підписникам бота
         changed_queues = list(diff.get("queues") or [])
         try:
             sync_schedules_to_mongo(norm_by_queue, queue_keys=changed_queues)
@@ -843,7 +870,11 @@ def main():
             log_to_buffer(f"❌ sync_schedules_to_mongo: {e}")
 
         try:
-            notify_bot_users(changed_queues, dm_text or "🔔 Оновлення графіка відключень")
+            notify_bot_users(
+                changed_queues,
+                dm_text or "🔔 Оновлення графіка відключень",
+                diff=diff,
+            )
         except Exception as e:
             log_to_buffer(f"❌ notify_bot_users: {e}")
 

@@ -1,17 +1,18 @@
 """
 Спільна розсилка підписникам бота ztoe:
-  - текст під картинкою (caption)
-  - кілька PNG одним повідомленням (media group)
-  - у тексті ЛИШЕ черги користувача (не всі з каналу)
+  - текст + один скрін ЖОЕ (site screenshot)
+  - у тексті ЛИШЕ черги користувача + адреса + розбивка погодинних/аварійних
 
 Використовується з monitor.py (зміна графіків) і ukrenergo2_monitor.py (зміна статусу).
+PNG по чергах більше НЕ генеруються і НЕ відправляються.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from mongo_store import get_db, get_site_screenshot
@@ -80,12 +81,37 @@ def queue_label(queue: str, subqueue: str = "") -> str:
     return f"{q}.{sq}" if sq else q
 
 
+def format_address(addr: dict) -> str:
+    """Коротка адреса для повідомлення: Купеч, вул. ЦЕНТРАЛЬНА, буд. 120"""
+    if not isinstance(addr, dict):
+        return "—"
+    city = (addr.get("city_name") or addr.get("city") or "").strip()
+    street = (addr.get("street_name") or addr.get("street") or "").strip()
+    house = (
+        addr.get("house")
+        or addr.get("building")
+        or addr.get("house_number")
+        or ""
+    ).strip()
+    parts = []
+    if city:
+        parts.append(city)
+    if street:
+        # якщо вже є «вул.» — не дублюємо
+        if not re.match(r"^(вул\.?|пров\.?|пр\.?|бульвар|площа)\s", street, re.I):
+            street = f"вул. {street}"
+        parts.append(street)
+    if house:
+        parts.append(f"буд. {house}")
+    return ", ".join(parts) if parts else "—"
+
+
 def collect_notify_targets(
     queue_keys: Optional[Sequence[str]] = None,
-) -> Dict[int, List[str]]:
+) -> Dict[int, List[Tuple[str, dict]]]:
     """
-    telegram_id → список queue keys (4.2).
-    Якщо queue_keys=None — усі черги з адрес користувача (для зміни статусу області).
+    telegram_id → список (queue_label, addr_dict).
+    Якщо queue_keys=None — усі черги з адрес користувача.
     """
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
@@ -100,13 +126,13 @@ def collect_notify_targets(
         return {}
 
     keys = [str(k).strip() for k in (queue_keys or []) if str(k).strip()]
-    targets: Dict[int, List[str]] = {}
+    targets: Dict[int, List[Tuple[str, dict]]] = {}
 
     for u in users:
         tid = u.get("telegram_id")
         if tid is None:
             continue
-        matched: List[str] = []
+        matched: List[Tuple[str, dict]] = []
         for addr in user_addresses(u):
             if not isinstance(addr, dict):
                 continue
@@ -120,43 +146,40 @@ def collect_notify_targets(
                     if addr_matches_queue(addr, qk):
                         ch, pid = _queue_parts(qk)
                         lab = f"{ch}.{pid}" if pid else ch
-                        if lab not in matched:
-                            matched.append(lab)
+                        if not any(m[0] == lab for m in matched):
+                            matched.append((lab, addr))
             else:
-                if label and label not in matched:
-                    matched.append(label)
+                if label and not any(m[0] == label for m in matched):
+                    matched.append((label, addr))
         if matched:
             targets[int(tid)] = matched
 
     return targets
 
 
-def pngs_for_queues(queue_labels: Sequence[str]) -> List[bytes]:
-    """Залишено для сумісності. PNG черг більше немає — лише скрін ЖОЕ (1 шт)."""
-    site = get_site_screenshot()
-    return [site] if site else []
+def _parse_time(t: str) -> Optional[int]:
+    """'12:00' / '12:00:00' → хвилини від опівночі."""
+    t = (t or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})", t)
+    if not m:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2))
 
 
+def _duration_hours(start: str, end: str) -> float:
+    a = _parse_time(start)
+    b = _parse_time(end)
+    if a is None or b is None:
+        return 0.0
+    if b <= a:
+        b += 24 * 60
+    return round((b - a) / 60.0, 1)
 
-def _slots_line_from_doc(doc: dict | None) -> str:
-    """🪫12:00-14:00, 18:00-20:00 або «немає відключень»."""
-    if not doc:
-        return "немає даних"
-    slots = doc.get("slots") or doc.get("events") or []
-    parts = []
-    for s in slots:
-        if not isinstance(s, dict):
-            continue
-        fr = s.get("from") or s.get("start") or ""
-        to = s.get("to") or s.get("end") or ""
-        if fr and to:
-            parts.append(f"{fr}-{to}")
-    if parts:
-        return "🪫" + ", ".join(parts)
-    text = (doc.get("text") or "").strip()
-    if text and text.lower() not in ("немає відключень",):
-        return text
-    return "немає відключень"
+
+def _fmt_hours(h: float) -> str:
+    if h == int(h):
+        return str(int(h))
+    return f"{h:.1f}".rstrip("0").rstrip(".")
 
 
 def load_queue_doc(label: str) -> dict | None:
@@ -178,23 +201,177 @@ def load_queue_doc(label: str) -> dict | None:
     return None
 
 
-def build_personal_schedule_message(
-    queue_labels: Sequence[str],
+def _slots_from_doc(doc: dict | None) -> List[Tuple[str, str]]:
+    """Список (from, to) з queue_schedules."""
+    if not doc:
+        return []
+    slots = doc.get("slots") or doc.get("events") or []
+    out = []
+    for s in slots:
+        if not isinstance(s, dict):
+            continue
+        fr = (s.get("from") or s.get("start") or "").strip()
+        to = (s.get("to") or s.get("end") or "").strip()
+        if fr and to:
+            out.append((fr, to))
+    return out
+
+
+def _emergency_slots_for_addr(addr: dict, date_str: str) -> List[Tuple[str, str]]:
+    """
+    Аварійні інтервали на дату для адреси з колекції outages.
+    date_str: DD.MM.YYYY
+    Повертає список (HH:MM, HH:MM).
+    """
+    try:
+        db = get_db()
+    except Exception:
+        return []
+
+    city = (addr.get("city_name") or addr.get("city") or "").strip()
+    street = (addr.get("street_name") or addr.get("street") or "").strip()
+    house = (addr.get("house") or addr.get("building") or "").strip()
+
+    if not city and not street:
+        return []
+
+    # date_str → YYYY-MM-DD для порівняння
+    try:
+        d = datetime.strptime(date_str, "%d.%m.%Y")
+        ymd = d.strftime("%Y-%m-%d")
+    except ValueError:
+        ymd = date_str
+
+    query = {"typeOff": 1}  # аварійне
+    # м'який пошук по місту/вулиці
+    cursor = db["outages"].find(query).limit(200)
+    result = []
+    for doc in cursor:
+        dc = (doc.get("city_name") or "").strip()
+        ds = (doc.get("street_name") or "").strip()
+        if city and city.lower() not in dc.lower() and dc.lower() not in city.lower():
+            continue
+        if street:
+            sn = street.lower().replace("вул.", "").replace("вул ", "").strip()
+            dn = ds.lower().replace("вул.", "").replace("вул ", "").strip()
+            if sn and dn and sn not in dn and dn not in sn:
+                continue
+        # дата
+        de = (doc.get("dateEvent") or doc.get("date_from") or "")[:10]
+        dp = (doc.get("datePlanIn") or doc.get("date_to") or "")[:10]
+        if de and de[:10] != ymd and (not dp or dp[:10] != ymd):
+            # якщо дата не збігається — пропускаємо
+            if ymd not in (de, dp):
+                continue
+        # будинок (якщо вказано)
+        buildings = (doc.get("buildingNames") or doc.get("buildings") or "").strip()
+        if house and buildings:
+            tokens = {p.strip().lower() for p in buildings.replace(";", ",").split(",") if p.strip()}
+            h = house.lower().lstrip("0") or "0"
+            if h not in tokens and not any(t.lstrip("0") == h for t in tokens):
+                continue
+
+        # інтервал
+        start_raw = (doc.get("dateEvent") or "")[11:16] or "00:00"
+        end_raw = (doc.get("datePlanIn") or "")[11:16] or ""
+        if start_raw and end_raw:
+            result.append((start_raw, end_raw))
+    return result
+
+
+def build_personal_dm(
+    queue_labels_with_addr: Sequence[Tuple[str, dict]],
     *,
-    header: str = "🔔 Оновлення графіка відключень",
+    changes: Optional[Dict[str, List[dict]]] = None,
     date_str: str = "",
 ) -> str:
-    """Текст ТІЛЬКИ по чергах користувача (не весь канал)."""
-    lines = [header, ""]
-    if date_str:
-        lines.append(f"🗓 {date_str}")
-        lines.append("")
-    for lab in queue_labels:
+    """
+    Новий короткий формат для DM.
+
+    changes: { "6.1": [ {"change": "added"|"removed", "start": "12:00", "end": "13:00"}, ... ] }
+    """
+    if not date_str:
+        date_str = datetime.now().strftime("%d.%m.%Y")
+
+    changes = changes or {}
+
+    # --- рядок змін ---
+    change_bits = []
+    for lab, _ in queue_labels_with_addr:
+        for c in changes.get(lab, []):
+            action = "🪫 додали відключення" if c.get("change") == "added" else "🔋 скасували відключення"
+            start = c.get("start") or ""
+            end = c.get("end") or ""
+            change_bits.append(f"{lab} {action} ▶️ {start}-{end}")
+
+    if change_bits:
+        header = "🔔 Для черг " + "; ".join(change_bits)
+    else:
+        labs = ", ".join(lab for lab, _ in queue_labels_with_addr)
+        header = f"🔔 Оновлення графіка для черг {labs}"
+
+    # беремо першу адресу (зазвичай одна черга на повідомлення)
+    addr = queue_labels_with_addr[0][1] if queue_labels_with_addr else {}
+    addr_str = format_address(addr)
+
+    lines = [
+        header,
+        "____",
+        f"Графік на {date_str} за адресою → {addr_str}",
+        "⬇️⬇️⬇️",
+        "",
+    ]
+
+    # --- погодинні ---
+    scheduled: List[Tuple[str, str]] = []
+    for lab, _ in queue_labels_with_addr:
         doc = load_queue_doc(lab)
-        line = _slots_line_from_doc(doc)
-        lines.append(f"Черга {lab}:")
-        lines.append(line)
+        scheduled.extend(_slots_from_doc(doc))
+
+    # унікальні + сортування
+    seen = set()
+    scheduled_unique = []
+    for fr, to in sorted(scheduled, key=lambda x: x[0]):
+        key = (fr, to)
+        if key not in seen:
+            seen.add(key)
+            scheduled_unique.append((fr, to))
+
+    # --- аварійні ---
+    emergency = _emergency_slots_for_addr(addr, date_str)
+
+    # загальний час без світла (просте об'єднання інтервалів)
+    all_intervals = scheduled_unique + emergency
+    total_h = sum(_duration_hours(a, b) for a, b in all_intervals)
+
+    if all_intervals:
+        # межі від найранішого до найпізнішого (спрощено)
+        starts = [a for a, _ in all_intervals]
+        ends = [b for _, b in all_intervals]
+        overall_start = min(starts)
+        overall_end = max(ends)
+        lines.append(
+            f"Світла не буде ({_fmt_hours(total_h)} год): {overall_start}–{overall_end}"
+        )
         lines.append("")
+    else:
+        lines.append("Світла не буде: немає відключень")
+        lines.append("")
+
+    if scheduled_unique:
+        sch_parts = [f"{a}–{b}" for a, b in scheduled_unique]
+        sch_h = sum(_duration_hours(a, b) for a, b in scheduled_unique)
+        lines.append(f"⏰ Погодинні: {', '.join(sch_parts)} ({_fmt_hours(sch_h)} год)")
+    else:
+        lines.append("⏰ Погодинні: немає")
+
+    if emergency:
+        em_parts = [f"{a}–{b}" for a, b in emergency]
+        em_h = sum(_duration_hours(a, b) for a, b in emergency)
+        lines.append(f"🔴 Аварійні: {', '.join(em_parts)} ({_fmt_hours(em_h)} год)")
+    else:
+        lines.append("🔴 Аварійні: немає")
+
     return "\n".join(lines).strip()
 
 
@@ -206,12 +383,13 @@ def notify_bot_users_with_images(
     header: str = "",
     date_str: str = "",
     personalize: bool = True,
+    changes: Optional[Dict[str, List[dict]]] = None,
 ) -> None:
     """
-    DM підписникам: текст + опційно один скрін ЖОЕ (без PNG черг).
+    DM підписникам: новий короткий текст + один скрін ЖОЕ.
 
-    personalize=True: текст збирається ЛИШЕ по чергах юзера з Mongo,
-    а не весь текст каналу (де всі 1.1–6.2).
+    changes — деталі diff з monitor.py:
+      { "6.1": [ {"change": "added", "start": "12:00", "end": "13:00"}, ... ] }
     """
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
@@ -232,25 +410,24 @@ def notify_bot_users_with_images(
 
     if not date_str:
         date_str = datetime.now().strftime("%d.%m.%Y")
-    if not header:
-        # якщо передали повний текст каналу — беремо лише перший рядок як заголовок
-        if message and message.strip().startswith("🔔"):
-            header = message.strip().split("\n")[0].strip()
-        else:
-            header = "🔔 Оновлення графіка відключень"
+
+    site_png = get_site_screenshot()
+    images = [site_png] if site_png else []
 
     sent = 0
     failed = 0
-    for tid, qs in targets.items():
+    for tid, qs_with_addr in targets.items():
         if personalize:
-            body = build_personal_schedule_message(
-                qs, header=header, date_str=date_str
+            body = build_personal_dm(
+                qs_with_addr,
+                changes=changes,
+                date_str=date_str,
             )
         else:
-            body = (message or header) + f"\n\n📌 Твої черги: <b>{', '.join(qs)}</b>"
+            labs = [lab for lab, _ in qs_with_addr]
+            body = (message or header or "🔔 Оновлення") + f"\n\n📌 Твої черги: <b>{', '.join(labs)}</b>"
 
         caption = body if len(body) <= 1024 else (body[:1000] + "\n…")
-        images = pngs_for_queues(qs)
 
         ok = send_photos_sync(tid, images, caption, bot_token=bot_token)
         if ok:
@@ -267,10 +444,3 @@ def notify_bot_users_with_images(
     log_to_buffer(
         f"📬 DM бота: sent={sent} failed={failed} users={len(targets)}"
     )
-
-
-def regenerate_queues_for_labels(labels: Sequence[str]) -> int:
-    """Вимкнено: PNG по чергах більше не генеруємо."""
-    log_to_buffer("ℹ️ regenerate_queues_for_labels: пропуск (PNG disabled)")
-    return 0
-

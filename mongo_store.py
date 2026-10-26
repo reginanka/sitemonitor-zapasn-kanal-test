@@ -4,6 +4,9 @@
 Env:
   MAYACHOK_MONGO_URI | MONGO_URI
   ZTOE_MONGO_DB | MONGO_DB | MAYACHOK_MONGO_DB  (default: vidkluchennya)
+
+PNG по чергах більше НЕ зберігаються.
+Залишено лише site screenshot (один скрін ЖОЕ).
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ def upsert_ukrenergo_state(snapshot: dict, slug: str = "zhytomyr") -> None:
     db["ukrenergo2_states"].update_one({"slug": slug}, {"$set": doc}, upsert=True)
 
 
-# ---------- queue_schedules + image ----------
+# ---------- queue_schedules (тільки дані, без PNG) ----------
 
 def upsert_queue_schedule(
     queue: str,
@@ -86,78 +89,6 @@ def upsert_queue_schedule(
         doc.update(extra)
     db["queue_schedules"].update_one({"_id": _id}, {"$set": doc}, upsert=True)
     return _id
-
-
-def save_schedule_png(
-    queue: str,
-    subqueue: str,
-    png_bytes: bytes,
-    *,
-    fingerprint: str = "",
-) -> Any:
-    """Зберігає PNG у GridFS bucket schedule_images і прив'язує до queue_schedules."""
-    db = get_db()
-    fs = GridFS(db, collection="schedule_images")
-    q = (queue or "").strip()
-    sq = (subqueue or "").strip()
-    _id = f"{q}|{sq}" if sq else q
-    filename = f"schedule_{q}_{sq or '0'}.png".replace(".", "_")
-
-    # прибрати старий файл з тим самим ім'ям
-    for old in fs.find({"filename": filename}):
-        fs.delete(old._id)
-
-    file_id = fs.put(
-        png_bytes,
-        filename=filename,
-        content_type="image/png",
-        queue=q,
-        subqueue=sq,
-        fingerprint=fingerprint,
-        uploaded_at=datetime.now(timezone.utc),
-    )
-    db["queue_schedules"].update_one(
-        {"_id": _id},
-        {
-            "$set": {
-                "image_file_id": file_id,
-                "image_filename": filename,
-                "image_fp": fingerprint or _fp(q, sq, str(len(png_bytes))),
-                "image_updated_at": datetime.now(timezone.utc),
-            }
-        },
-        upsert=True,
-    )
-    return file_id
-
-
-def get_schedule_png(
-    queue: str,
-    subqueue: str = "",
-) -> Optional[bytes]:
-    """Читає PNG черги з GridFS. None якщо немає."""
-    db = get_db()
-    q = (queue or "").strip()
-    sq = (subqueue or "").strip()
-    _id = f"{q}|{sq}" if sq else q
-    doc = db["queue_schedules"].find_one({"_id": _id}) or {}
-    file_id = doc.get("image_file_id")
-    if not file_id:
-        # fallback: спроба 4.2 як queue без subqueue
-        if sq:
-            alt = db["queue_schedules"].find_one({"_id": f"{q}.{sq}"}) or {}
-            file_id = alt.get("image_file_id")
-        if not file_id and "." in q and not sq:
-            parts = q.split(".", 1)
-            alt = db["queue_schedules"].find_one({"_id": f"{parts[0]}|{parts[1]}"}) or {}
-            file_id = alt.get("image_file_id")
-    if not file_id:
-        return None
-    fs = GridFS(db, collection="schedule_images")
-    try:
-        return fs.get(file_id).read()
-    except Exception:
-        return None
 
 
 def list_queue_schedule_ids() -> list[tuple[str, str]]:

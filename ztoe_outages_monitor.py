@@ -241,9 +241,6 @@ def user_queue_key(addr: dict) -> str:
     return f"{q}.{sq}" if sq else q
 
 
-def regenerate_queue_png(queue_key: str) -> bytes | None:
-    """Вимкнено."""
-    return None
 
 
 def main() -> int:
