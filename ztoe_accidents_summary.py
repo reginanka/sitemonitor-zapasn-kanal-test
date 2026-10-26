@@ -28,7 +28,32 @@ except Exception:
     import pytz
     KYIV = pytz.timezone("Europe/Kyiv")
 
-from telegram_handler import send_notification
+def send_notification(message: str, image_path=None) -> bool:
+    """Шле в TELEGRAM_CHANNEL_ID без preview лінків."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+    chat_id = os.getenv("TELEGRAM_CHANNEL_ID") or ""
+    if not token or not chat_id:
+        print("❌ TELEGRAM_BOT_TOKEN або TELEGRAM_CHANNEL_ID не налаштовані")
+        return False
+    try:
+        r = httpx.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": message[:4096],
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "true",
+            },
+            timeout=30,
+        )
+        if r.status_code == 200:
+            return True
+        print(f"❌ Telegram send HTTP {r.status_code}: {r.text[:300]}")
+        return False
+    except Exception as e:
+        print(f"❌ Telegram send failed: {e}")
+        return False
+
 
 # --- logging buffer (сумісно з log_utils + fallback) ---
 _log_lines: list[str] = []
@@ -311,7 +336,7 @@ def format_message(stats: Dict[str, Any], as_of: datetime) -> str:
     # футер
     footer_parts: List[str] = []
     if AVARII_ZHOE:
-        footer_parts.append(f'<a href="{AVARII_ZHOE}">Чому немає світла?|ЖОЕ</a>')
+        footer_parts.append(f'<a href="{AVARII_ZHOE}">🔗 Сайт "ЖОЕ"</a>')
     if SUBSCRIBE:
         footer_parts.append(f'<a href="{SUBSCRIBE}">⚡️ ПІДПИСАТИСЯ</a>')
     if footer_parts:
