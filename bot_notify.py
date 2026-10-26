@@ -1,10 +1,15 @@
 """
 Спільна розсилка підписникам бота ztoe:
-  - текст + один скрін ЖОЕ (site screenshot)
-  - у тексті ЛИШЕ черга цієї адреси + розбивка погодинних/аварійних
+  - 1 адреса → короткий формат
+  - кілька адрес/черг → одне зведене повідомлення + 1 скрін
 
-Використовується з monitor.py (зміна графіків) і ukrenergo2_monitor.py (зміна статусу).
-PNG по чергах більше НЕ генеруються і НЕ відправляються.
+Погодинні = queue_schedules (ГПВ API).
+Power-on (outages), пріоритет для ОДНОГО інтервалу часу:
+  1) Погодинні (вже в графіку / switchSubReason=2)
+  2) Аварійні  (typeOff=1 & switchSubReason=0, або switchSubReason 1/3)
+  3) Ремонтні  (typeOff 0/3)
+  4) Інші      (typeOff=2)
+Той самий час не дублюється в двох категоріях.
 """
 
 from __future__ import annotations
@@ -26,6 +31,8 @@ except Exception:  # pragma: no cover
         print(msg)
 
 
+# ---------- helpers: queues / addresses ----------
+
 def _queue_parts(queue_key: str) -> Tuple[str, str]:
     s = (queue_key or "").strip()
     if "|" in s:
@@ -38,7 +45,6 @@ def _queue_parts(queue_key: str) -> Tuple[str, str]:
 
 
 def addr_matches_queue(addr: dict, queue_key: str) -> bool:
-    """Чи адреса користувача належить до черги 4.2 / queue=4 subqueue=2."""
     if not isinstance(addr, dict):
         return False
     q = (addr.get("queue") or "").strip()
@@ -82,7 +88,6 @@ def queue_label(queue: str, subqueue: str = "") -> str:
 
 
 def format_address(addr: dict) -> str:
-    """Коротка адреса: Купеч, вул. ЦЕНТРАЛЬНА, буд. 120"""
     if not isinstance(addr, dict):
         return "—"
     city = (addr.get("city_name") or addr.get("city") or "").strip()
@@ -101,7 +106,6 @@ def format_address(addr: dict) -> str:
             street = f"вул. {street}"
         parts.append(street)
     if house:
-        # прибрати ведучі нулі в номері будинку для відображення
         house_disp = house.lstrip("0") or house
         parts.append(f"буд. {house_disp}")
     return ", ".join(parts) if parts else "—"
@@ -110,10 +114,6 @@ def format_address(addr: dict) -> str:
 def collect_notify_targets(
     queue_keys: Optional[Sequence[str]] = None,
 ) -> Dict[int, List[Tuple[str, dict]]]:
-    """
-    telegram_id → список (queue_label, addr_dict).
-    Кожна адреса окремо (не зливаємо черги).
-    """
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
         log_to_buffer("⚠️ ZTOE_BOT_TOKEN / TELEGRAM_BOT_TOKEN немає — пропуск DM")
@@ -147,16 +147,17 @@ def collect_notify_targets(
                     if addr_matches_queue(addr, qk):
                         ch, pid = _queue_parts(qk)
                         lab = f"{ch}.{pid}" if pid else ch
-                        # одна адреса = один запис (не дублюємо)
-                        if not any(m[1] is addr or (
+                        if not any(
                             m[0] == lab
                             and format_address(m[1]) == format_address(addr)
-                        ) for m in matched):
+                            for m in matched
+                        ):
                             matched.append((lab, addr))
                         break
             else:
                 if label and not any(
-                    m[0] == label and format_address(m[1]) == format_address(addr)
+                    m[0] == label
+                    and format_address(m[1]) == format_address(addr)
                     for m in matched
                 ):
                     matched.append((label, addr))
@@ -166,10 +167,9 @@ def collect_notify_targets(
     return targets
 
 
-# ---------- час / інтервали ----------
+# ---------- time / intervals ----------
 
 def _parse_time(t: str) -> Optional[int]:
-    """'12:00' / '12:00:00' / '24:00' → хвилини від опівночі."""
     t = (t or "").strip()
     m = re.match(r"^(\d{1,2}):(\d{2})", t)
     if not m:
@@ -187,7 +187,6 @@ def _minutes_to_str(m: int) -> str:
 
 
 def _merge_intervals(intervals: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-    """Злити перекриття/сусідні інтервали, прибрати дублікати."""
     parsed = []
     for fr, to in intervals:
         a = _parse_time(fr)
@@ -202,7 +201,7 @@ def _merge_intervals(intervals: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     parsed.sort()
     merged = [list(parsed[0])]
     for a, b in parsed[1:]:
-        if a <= merged[-1][1]:  # overlap or touch
+        if a <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], b)
         else:
             merged.append([a, b])
@@ -210,7 +209,6 @@ def _merge_intervals(intervals: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
 
 
 def _total_hours(intervals: List[Tuple[str, str]]) -> float:
-    """Сумарні години після merge (без подвійного рахунку)."""
     merged = _merge_intervals(intervals)
     total_min = 0
     for fr, to in merged:
@@ -222,7 +220,7 @@ def _total_hours(intervals: List[Tuple[str, str]]) -> float:
             b += 24 * 60
         total_min += b - a
     h = total_min / 60.0
-    return round(h, 1) if h != int(h) else float(int(h))
+    return float(int(h)) if h == int(h) else round(h, 1)
 
 
 def _fmt_hours(h: float) -> str:
@@ -230,6 +228,37 @@ def _fmt_hours(h: float) -> str:
         return str(int(h))
     return f"{h:.1f}".rstrip("0").rstrip(".")
 
+
+def _interval_key(fr: str, to: str) -> Tuple[int, int]:
+    a = _parse_time(fr) or -1
+    b = _parse_time(to) or -1
+    if a >= 0 and b >= 0 and b <= a:
+        b += 24 * 60
+    return (a, b)
+
+
+def _interval_covered_by(
+    slot: Tuple[str, str],
+    covers: List[Tuple[str, str]],
+) -> bool:
+    """Повне входження slot у будь-який з covers (після merge)."""
+    a, b = _interval_key(*slot)
+    if a < 0 or b < 0:
+        return False
+    for fr, to in _merge_intervals(covers):
+        ca, cb = _interval_key(fr, to)
+        if ca < 0:
+            continue
+        if ca <= a and b <= cb:
+            return True
+    return False
+
+
+def _same_interval(a: Tuple[str, str], b: Tuple[str, str]) -> bool:
+    return _interval_key(*a) == _interval_key(*b)
+
+
+# ---------- data loaders ----------
 
 def load_queue_doc(label: str) -> dict | None:
     db = get_db()
@@ -273,29 +302,75 @@ def _norm_street(name: str) -> str:
     ):
         if s.startswith(pfx):
             s = s[len(pfx):].strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
+    return re.sub(r"\s+", " ", s)
 
 
 def _date_on_day(iso_or_str: str, ymd: str) -> bool:
-    """Чи дата (dateEvent / datePlanIn) припадає на ymd (YYYY-MM-DD)."""
     s = (iso_or_str or "").strip()
     if not s:
         return False
-    # 2026-10-26T13:00:00 або 2026-10-26
-    day = s[:10]
-    return day == ymd
+    return s[:10] == ymd
 
 
-def _emergency_slots_for_addr(addr: dict, date_str: str) -> List[Tuple[str, str]]:
+def _classify_outage(doc: dict) -> Optional[str]:
     """
-    Унікальні аварійні інтервали на дату для КОНКРЕТНОЇ адреси.
-    Джерело: Mongo outages (typeOff=1).
+    Повертає: 'emergency' | 'repair' | 'other' | None (ігнорувати / ГПВ-дубль).
+
+    Логіка як на сайті ztoe-poweron (JS):
+      switchSubReason:
+        1 → ГАВ (аварійний графік)
+        2 → ГПВ (погодинні) → ігноруємо тут (є в queue_schedules)
+        3 → СГАВ
+      typeOff (якщо switchSubReason == 0 / немає):
+        0 → планове
+        1 → аварійне
+        2 → оперативні / інші
+        3 → планове (planeds)
     """
+    koment = (doc.get("koment") or "").upper()
+    # явний ГПВ у коментарі
+    if "ГПВ" in koment or "ГПВ-" in koment:
+        return None
+
+    try:
+        sub = int(doc.get("switchSubReason") or 0)
+    except (TypeError, ValueError):
+        sub = 0
+    try:
+        t = int(doc.get("typeOff"))
+    except (TypeError, ValueError):
+        t = -1
+
+    if sub == 2:
+        return None  # графік погодинних — не дублюємо
+    if sub in (1, 3):
+        return "emergency"
+    if sub > 0:
+        # невідомий sub > 0 — обережно як other
+        return "other"
+
+    if t == 1:
+        return "emergency"
+    if t in (0, 3):
+        return "repair"
+    if t == 2:
+        return "other"
+    return None
+
+
+def _outages_bucketed(
+    addr: dict,
+    date_str: str,
+) -> Dict[str, List[Tuple[str, str]]]:
+    """
+    З Mongo outages → {'emergency': [...], 'repair': [...], 'other': [...]}
+    з merge всередині категорії.
+    """
+    empty = {"emergency": [], "repair": [], "other": []}
     try:
         db = get_db()
     except Exception:
-        return []
+        return empty
 
     city = (addr.get("city_name") or addr.get("city") or "").strip()
     street = (addr.get("street_name") or addr.get("street") or "").strip()
@@ -303,7 +378,7 @@ def _emergency_slots_for_addr(addr: dict, date_str: str) -> List[Tuple[str, str]
     street_id = addr.get("street_id") or addr.get("streetId")
 
     if not city and not street and not street_id:
-        return []
+        return empty
 
     try:
         d = datetime.strptime(date_str, "%d.%m.%Y")
@@ -311,19 +386,21 @@ def _emergency_slots_for_addr(addr: dict, date_str: str) -> List[Tuple[str, str]
     except ValueError:
         ymd = date_str
 
-    # тільки аварійні
-    cursor = db["outages"].find({"typeOff": 1}).limit(500)
-    raw: List[Tuple[str, str]] = []
+    buckets: Dict[str, List[Tuple[str, str]]] = {
+        "emergency": [],
+        "repair": [],
+        "other": [],
+    }
     sn = _norm_street(street)
 
+    cursor = db["outages"].find({}).limit(800)
+
     for doc in cursor:
-        # --- дата: обов'язково сьогодні ---
         de = doc.get("dateEvent") or doc.get("date_from") or ""
         dp = doc.get("datePlanIn") or doc.get("date_to") or ""
         if not (_date_on_day(de, ymd) or _date_on_day(dp, ymd)):
             continue
 
-        # --- вулиця ---
         dc = (doc.get("city_name") or "").strip()
         ds = (doc.get("street_name") or "").strip()
         doc_street_id = doc.get("street_id")
@@ -338,12 +415,10 @@ def _emergency_slots_for_addr(addr: dict, date_str: str) -> List[Tuple[str, str]
         if not street_ok:
             continue
 
-        # --- місто (м'яко) ---
         if city and dc:
             if city.lower() not in dc.lower() and dc.lower() not in city.lower():
                 continue
 
-        # --- будинок ---
         buildings = (doc.get("buildingNames") or doc.get("buildings") or "").strip()
         if house and buildings:
             tokens = {
@@ -355,104 +430,187 @@ def _emergency_slots_for_addr(addr: dict, date_str: str) -> List[Tuple[str, str]
             if h not in tokens:
                 continue
         elif house and not buildings:
-            # немає списку будинків — пропускаємо (занадто широко)
             continue
 
-        # інтервал з часу
+        kind = _classify_outage(doc)
+        if not kind:
+            continue
+
         start_raw = ""
         end_raw = ""
         if isinstance(de, str) and len(de) >= 16:
             start_raw = de[11:16]
         if isinstance(dp, str) and len(dp) >= 16:
             end_raw = dp[11:16]
-        if start_raw and end_raw:
-            raw.append((start_raw, end_raw))
+        if not (start_raw and end_raw):
+            continue
 
-    return _merge_intervals(raw)
+        buckets[kind].append((start_raw, end_raw))
+
+    for k in buckets:
+        buckets[k] = _merge_intervals(buckets[k])
+    return buckets
 
 
-def build_personal_dm_for_one(
-    lab: str,
-    addr: dict,
-    *,
-    changes: Optional[Dict[str, List[dict]]] = None,
-    date_str: str = "",
-) -> str:
+def _dedupe_by_priority(
+    scheduled: List[Tuple[str, str]],
+    emergency: List[Tuple[str, str]],
+    repair: List[Tuple[str, str]],
+    other: List[Tuple[str, str]],
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], List[Tuple[str, str]], List[Tuple[str, str]]]:
     """
-    Одне повідомлення на ОДНУ чергу + ОДНУ адресу.
+    Пріоритет на один інтервал часу:
+      погодинні > аварійні > ремонтні > інші
+    Якщо час уже зайнятий вищою категорією — нижчу прибираємо.
     """
-    if not date_str:
-        date_str = datetime.now().strftime("%d.%m.%Y")
-    changes = changes or {}
+    claimed: List[Tuple[str, str]] = list(scheduled)
 
-    # --- рядок змін лише по цій черзі ---
-    change_bits = []
-    for c in changes.get(lab, []):
-        action = (
-            "🪫 додали відключення"
-            if c.get("change") == "added"
-            else "🔋 скасували відключення"
-        )
-        start = c.get("start") or ""
-        end = c.get("end") or ""
-        if start and end:
-            change_bits.append(f"{action} ▶️ {start}-{end}")
-        else:
-            change_bits.append(action)
+    def take(slots: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        out = []
+        for s in slots:
+            if _interval_covered_by(s, claimed):
+                continue
+            # також точний збіг з уже взятим
+            if any(_same_interval(s, c) for c in claimed):
+                continue
+            out.append(s)
+            claimed.append(s)
+        return _merge_intervals(out)
 
-    if change_bits:
-        header = f"🔔 Для черг {lab} " + "; ".join(change_bits)
-    else:
-        header = f"🔔 Оновлення графіка для черг {lab}"
+    em = take(emergency)
+    rp = take(repair)
+    ot = take(other)
+    return scheduled, em, rp, ot
 
-    addr_str = format_address(addr)
-    lines = [
-        header,
-        "____",
-        f"Графік на {date_str} за адресою → {addr_str}",
-        "⬇️⬇️⬇️",
-        "",
-    ]
 
-    # --- погодинні (лише ця черга) ---
+def _format_slots_line(prefix: str, slots: List[Tuple[str, str]]) -> str:
+    if not slots:
+        return f"{prefix}: немає"
+    parts = [f"{a}–{b}" for a, b in slots]
+    h = _total_hours(slots)
+    return f"{prefix}: {', '.join(parts)} ({_fmt_hours(h)} год)"
+
+
+def _short_time(t: str) -> str:
+    t = (t or "").strip()
+    m = re.match(r"^0?(\d{1,2}):(\d{2})", t)
+    if not m:
+        return t
+    return f"{int(m.group(1))}:{m.group(2)}"
+
+
+def _schedule_block(lab: str, addr: dict, date_str: str, *, with_queue_tag: bool) -> str:
     scheduled = _slots_from_doc(load_queue_doc(lab))
+    buckets = _outages_bucketed(addr, date_str)
+    scheduled, emerg, repair, other = _dedupe_by_priority(
+        scheduled,
+        buckets.get("emergency") or [],
+        buckets.get("repair") or [],
+        buckets.get("other") or [],
+    )
 
-    # --- аварійні (лише ця адреса) ---
-    emergency = _emergency_slots_for_addr(addr, date_str)
-
-    all_merged = _merge_intervals(scheduled + emergency)
+    all_merged = _merge_intervals(scheduled + emerg + repair + other)
     total_h = _total_hours(all_merged)
+    addr_str = format_address(addr)
 
+    if with_queue_tag:
+        head = f"Графік на {date_str} за адресою → {addr_str} (Черга {lab})"
+    else:
+        head = f"Графік на {date_str} за адресою → {addr_str}"
+
+    lines = [head, "⬇️⬇️⬇️", ""]
     if all_merged:
-        overall_start = all_merged[0][0]
-        overall_end = all_merged[-1][1]
         lines.append(
-            f"Світла не буде ({_fmt_hours(total_h)} год): {overall_start}–{overall_end}"
+            f"Світла не буде ({_fmt_hours(total_h)} год): "
+            f"{all_merged[0][0]}–{all_merged[-1][1]}"
         )
         lines.append("")
     else:
         lines.append("Світла не буде: немає відключень")
         lines.append("")
 
-    if scheduled:
-        sch_parts = [f"{a}–{b}" for a, b in scheduled]
-        sch_h = _total_hours(scheduled)
-        lines.append(
-            f"⏰ Погодинні: {', '.join(sch_parts)} ({_fmt_hours(sch_h)} год)"
-        )
-    else:
-        lines.append("⏰ Погодинні: немає")
+    lines.append(_format_slots_line("⏰ Погодинні", scheduled))
+    lines.append(_format_slots_line("🔴 Аварійні", emerg))
+    lines.append(_format_slots_line("🟠 Ремонтні", repair))
+    if other:
+        lines.append(_format_slots_line("⚪ Інші", other))
+    return "\n".join(lines)
 
-    if emergency:
-        em_parts = [f"{a}–{b}" for a, b in emergency]
-        em_h = _total_hours(emergency)
-        lines.append(
-            f"🔴 Аварійні: {', '.join(em_parts)} ({_fmt_hours(em_h)} год)"
-        )
-    else:
-        lines.append("🔴 Аварійні: немає")
 
-    return "\n".join(lines).strip()
+def _changes_header(
+    queue_labels_with_addr: Sequence[Tuple[str, dict]],
+    changes: Dict[str, List[dict]],
+) -> str:
+    labs_order = []
+    for lab, _ in queue_labels_with_addr:
+        if lab not in labs_order:
+            labs_order.append(lab)
+
+    if len(labs_order) <= 1:
+        lab = labs_order[0] if labs_order else ""
+        bits = []
+        for c in changes.get(lab, []):
+            action = (
+                "🪫 додали відключення"
+                if c.get("change") == "added"
+                else "🔋 скасували відключення"
+            )
+            start = _short_time(c.get("start") or "")
+            end = _short_time(c.get("end") or "")
+            if start and end:
+                bits.append(f"{action} ▶️ {start}-{end}")
+            else:
+                bits.append(action)
+        if bits:
+            return f"🔔 Для черг {lab} " + "; ".join(bits)
+        return f"🔔 Оновлення графіка для черг {lab}"
+
+    lines = [
+        f"Для черг {', '.join(labs_order)} 🔔 ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!",
+        "____",
+    ]
+    for lab in labs_order:
+        lines.append(f"▶️ Черга {lab}:")
+        items = changes.get(lab) or []
+        if not items:
+            lines.append("оновлення графіка")
+            continue
+        for c in items:
+            s = _short_time(c.get("start") or "")
+            e = _short_time(c.get("end") or "")
+            if c.get("change") == "added":
+                lines.append(f"{s}-{e} 🪫 додали відключення")
+            else:
+                lines.append(f"{s}-{e} 🔋 скасували відключення")
+    return "\n".join(lines)
+
+
+def build_personal_dm(
+    queue_labels_with_addr: Sequence[Tuple[str, dict]],
+    *,
+    changes: Optional[Dict[str, List[dict]]] = None,
+    date_str: str = "",
+) -> str:
+    if not date_str:
+        date_str = datetime.now().strftime("%d.%m.%Y")
+    changes = changes or {}
+    items = list(queue_labels_with_addr)
+    if not items:
+        return "🔔 Оновлення графіка"
+
+    header = _changes_header(items, changes)
+
+    if len(items) == 1:
+        lab, addr = items[0]
+        body = _schedule_block(lab, addr, date_str, with_queue_tag=False)
+        return f"{header}\n____\n{body}".strip()
+
+    parts = [header, "____", ""]
+    for lab, addr in items:
+        parts.append(_schedule_block(lab, addr, date_str, with_queue_tag=True))
+        parts.append("____")
+        parts.append("")
+    return "\n".join(parts).strip().rstrip("_").strip()
 
 
 def notify_bot_users_with_images(
@@ -465,12 +623,7 @@ def notify_bot_users_with_images(
     personalize: bool = True,
     changes: Optional[Dict[str, List[dict]]] = None,
 ) -> None:
-    """
-    DM підписникам: короткий текст (окремо на кожну адресу) + один скрін ЖОЕ.
-
-    changes — деталі diff з monitor.py:
-      { "6.1": [ {"change": "added", "start": "12:00", "end": "13:00"}, ... ] }
-    """
+    """ОДНЕ повідомлення на користувача (1 фото + усі його адреси)."""
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
         log_to_buffer("⚠️ Немає токена бота — DM не шлемо")
@@ -497,32 +650,31 @@ def notify_bot_users_with_images(
     sent = 0
     failed = 0
     for tid, qs_with_addr in targets.items():
-        # окреме повідомлення на кожну адресу/чергу
-        for lab, addr in qs_with_addr:
-            if personalize:
-                body = build_personal_dm_for_one(
-                    lab, addr, changes=changes, date_str=date_str
-                )
-            else:
-                body = (
-                    (message or header or "🔔 Оновлення")
-                    + f"\n\n📌 Твоя черга: <b>{lab}</b>"
-                )
+        if personalize:
+            body = build_personal_dm(
+                qs_with_addr,
+                changes=changes,
+                date_str=date_str,
+            )
+        else:
+            labs = sorted({lab for lab, _ in qs_with_addr})
+            body = (
+                (message or header or "🔔 Оновлення")
+                + f"\n\n📌 Твої черги: <b>{', '.join(labs)}</b>"
+            )
 
-            caption = body if len(body) <= 1024 else (body[:1000] + "\n…")
-            ok = send_photos_sync(tid, images, caption, bot_token=bot_token)
-            if ok:
-                sent += 1
-                if len(body) > 1024:
-                    try:
-                        send_photos_sync(
-                            tid, [], body[:4096], bot_token=bot_token
-                        )
-                    except Exception:
-                        pass
-            else:
-                failed += 1
-            time.sleep(0.05)
+        caption = body if len(body) <= 1024 else (body[:1000] + "\n…")
+        ok = send_photos_sync(tid, images, caption, bot_token=bot_token)
+        if ok:
+            sent += 1
+            if len(body) > 1024:
+                try:
+                    send_photos_sync(tid, [], body[:4096], bot_token=bot_token)
+                except Exception:
+                    pass
+        else:
+            failed += 1
+        time.sleep(0.05)
 
     log_to_buffer(
         f"📬 DM бота: sent={sent} failed={failed} users={len(targets)}"
