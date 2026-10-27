@@ -257,6 +257,8 @@ def outage_to_mongo_doc(outage: dict, queue_key: str = "") -> dict:
         "source_id": outage.get("id"),
         "source": outage.get("_source"),
         "typeOff": outage.get("typeOff"),
+        # 0 звичайне; 1 ГАВ; 2 ГПВ (не аварія!); 3 СГАВ — критично для /check
+        "switchSubReason": outage.get("switchSubReason"),
         "city_id": city.get("id"),
         "city_name": city.get("name"),
         "street_id": street.get("id"),
