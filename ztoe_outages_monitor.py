@@ -73,6 +73,15 @@ TYPE_LABELS = {
     3: ("Планове", "заплановані роботи (ремонт, обслуговування)"),
 }
 
+# switchSubReason з API ЖОЕ (як на сайті / у JS power-on):
+#   0 — звичайне (дивись typeOff)
+#   1 — ГАВ (аварійний графік)
+#   2 — ГПВ (погодинні) ← НЕ аварія, не нотифікуємо
+#   3 — СГАВ
+SUBREASON_GPV = 2
+SUBREASON_GAV = 1
+SUBREASON_SGAV = 3
+
 
 def type_family(type_off) -> str:
     try:
@@ -86,6 +95,56 @@ def type_family(type_off) -> str:
     if t == 2:
         return "oper"
     return str(t)
+
+
+def _switch_sub_reason(outage: dict) -> int:
+    try:
+        return int(outage.get("switchSubReason") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_gpv_outage(outage: dict) -> bool:
+    """
+    Графік погодинних відключень (ГПВ), не аварія.
+    На сайті: «Графік погодинних відключень», switchSubReason=2.
+    typeOff при цьому часто = 1 — через це раніше слали «🔴 Аварійне».
+    """
+    if _switch_sub_reason(outage) == SUBREASON_GPV:
+        return True
+    koment = (outage.get("koment") or "").upper()
+    if "ГПВ" in koment:
+        return True
+    return False
+
+
+def should_notify_outage(outage: dict) -> bool:
+    """
+    Сповіщати лише про реальні події поза звичайним ГПВ:
+      - ГПВ (sub=2) → ні (це графік, не сюрприз)
+      - планове / аварійне / оперативне / ГАВ / СГАВ → так
+    """
+    if is_gpv_outage(outage):
+        return False
+    return True
+
+
+def outage_notify_label(outage: dict) -> tuple:
+    """(icon, title, desc) для тексту сповіщення."""
+    sub = _switch_sub_reason(outage)
+    if is_gpv_outage(outage):
+        return ("⏰", "Погодинне (ГПВ)", "графік погодинних відключень")
+    if sub in (SUBREASON_GAV, SUBREASON_SGAV):
+        return ("🔴", "Аварійне (ГАВ)" if sub == SUBREASON_GAV else "Аварійне (СГАВ)",
+                "аварійний графік відключень")
+    type_off = outage.get("typeOff")
+    try:
+        t = int(type_off)
+    except (TypeError, ValueError):
+        t = -1
+    name, desc = TYPE_LABELS.get(t, (f"Тип {type_off}", ""))
+    icon = {0: "🟠", 1: "🔴", 2: "🟡", 3: "🟠"}.get(t, "⚪")
+    return (icon, name, desc)
 
 
 def get_user_addresses(user: dict) -> list:
@@ -183,9 +242,7 @@ def format_outage(outage: dict) -> str:
     buildings = (outage.get("buildingNames") or "").strip()
     date_event = (outage.get("dateEvent") or "")[:16].replace("T", " ")
     date_plan = (outage.get("datePlanIn") or "")[:16].replace("T", " ")
-    type_off = outage.get("typeOff")
-    type_name, type_desc = TYPE_LABELS.get(type_off, (f"Тип {type_off}", ""))
-    icon = {0: "🟠", 1: "🔴", 2: "🟡", 3: "🟠"}.get(type_off, "⚪")
+    icon, type_name, type_desc = outage_notify_label(outage)
     text = f"{icon} <b>{city}, {street}</b>\n📌 {type_name}"
     if type_desc:
         text += f" — {type_desc}"
@@ -369,6 +426,15 @@ def main() -> int:
 
             filtered = []
             for o in new_outages:
+                # ГПВ (switchSubReason=2) — це графік, не «нова аварія»
+                if not should_notify_outage(o):
+                    log.info(
+                        "skip GPV/non-notify id=%s sub=%s type=%s",
+                        o.get("id"),
+                        o.get("switchSubReason"),
+                        o.get("typeOff"),
+                    )
+                    continue
                 soft = soft_fingerprint(o)
                 if type_family(o.get("typeOff")) == "planned" and soft in prev_soft:
                     log.info("skip planned after known soft=%s", soft)
