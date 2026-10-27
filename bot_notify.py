@@ -182,8 +182,8 @@ def collect_notify_targets(
         tid = u.get("telegram_id")
         if tid is None:
             continue
-        matched: List[Tuple[str, dict]] = []
-        no_queue: List[Tuple[str, dict]] = []
+        all_addrs: List[Tuple[str, dict]] = []
+        hit_changed = False  # чи є хоч одна адреса з чергою зі змін
         user_labs: List[str] = []
         for addr in user_addresses(u):
             if not isinstance(addr, dict):
@@ -191,41 +191,35 @@ def collect_notify_targets(
             q = (addr.get("queue") or "").strip()
             sq = (addr.get("subqueue") or "").strip()
             if not q:
-                # адреса без черги — покажемо з поміткою (не пропускаємо)
-                no_queue.append(("", addr))
+                all_addrs.append(("", addr))
                 continue
-            label = queue_label(q, sq)
+            label = queue_label(q, sq)  # "" для «не вимикають…»
             if label:
                 user_labs.append(label)
+            # мітка для розкладу: номер черги, або "" (спец / без)
+            lab = label or ""
+            all_addrs.append((lab, addr))
             if keys:
                 for qk in keys:
                     if addr_matches_queue(addr, qk):
-                        ch, pid = _queue_parts(qk)
-                        lab = f"{ch}.{pid}" if pid else ch
-                        if not any(
-                            m[0] == lab
-                            and format_address(m[1]) == format_address(addr)
-                            for m in matched
-                        ):
-                            matched.append((lab, addr))
+                        hit_changed = True
                         break
             else:
-                if label and not any(
-                    m[0] == label
-                    and format_address(m[1]) == format_address(addr)
-                    for m in matched
-                ):
-                    matched.append((label, addr))
+                hit_changed = True
         if user_labs:
             all_labels.append(f"tid={tid}:[{','.join(user_labs)}]")
-        # якщо є збіг по чергах змін (або шлемо всім) — додаємо й адреси без черги
-        if matched or (not keys and no_queue):
-            combined = matched + no_queue
-            # якщо фільтр по чергах і є збіг — теж підтягуємо no_queue
-            if matched and no_queue:
-                combined = matched + no_queue
+        # шлемо, якщо збіглась черга зі змін (або без фільтра)
+        # у розклад потрапляють УСІ адреси юзера: з відключеннями, «світло», без черги
+        if hit_changed and all_addrs:
+            # унікальні за адресою
+            uniq: List[Tuple[str, dict]] = []
+            for lab, addr in all_addrs:
+                if not any(
+                    format_address(m[1]) == format_address(addr) for m in uniq
+                ):
+                    uniq.append((lab, addr))
             try:
-                targets[int(tid)] = combined
+                targets[int(tid)] = uniq
             except (TypeError, ValueError):
                 log_to_buffer(f"⚠️ bad telegram_id={tid!r}")
 
@@ -832,11 +826,14 @@ def _addr_head_line(lab: str, addr: dict) -> str:
     if lab:
         return f"{addr_str} (<b>Черга {lab_esc}</b>)"
     q = (addr.get("queue") or "").strip()
+    sq = (addr.get("subqueue") or "").strip()
     if not q:
         return (
             f"{addr_str} (<i>черга не обрана</i>)\n"
             f"<i>➡️ Передодай адресу в боті, щоб бачити графік</i>"
         )
+    if _is_no_gpv_queue(q) or _is_no_gpv_queue(sq):
+        return f"{addr_str} (<i>не вимикають, крім аварійних</i>)"
     return addr_str
 
 
