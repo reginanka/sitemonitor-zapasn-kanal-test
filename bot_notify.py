@@ -637,18 +637,26 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     else:
         summary = "<b>Світла не буде:</b> немає відключень"
 
-    detail_lines = [
-        summary,
-        "⬇️⬇️⬇️",
-        "Деталі:",
-        _format_slots_line("⏰ Погодинні", scheduled),
-        _format_slots_line("🔴 Аварійні", emerg),
-        _format_slots_line("🟠 Ремонтні", repair),
-    ]
-    if other:
-        detail_lines.append(_format_slots_line("⚪ Інші", other))
+    # Черга без адреси — лише підсумок, без «Деталі»
+    if addr.get("queue_only"):
+        return f"{head}\n{summary}"
 
-    body = "\n".join(detail_lines)
+    # Деталі лише якщо є аварійні / ремонтні / інші (не дублюємо чисті ГПВ)
+    extra_lines = []
+    if scheduled:
+        extra_lines.append(_format_slots_line("⏰ Погодинні", scheduled))
+    if emerg:
+        extra_lines.append(_format_slots_line("🔴 Аварійні", emerg))
+    if repair:
+        extra_lines.append(_format_slots_line("🟠 Ремонтні", repair))
+    if other:
+        extra_lines.append(_format_slots_line("⚪ Інші", other))
+
+    has_extra = bool(emerg or repair or other)
+    if not has_extra:
+        return f"{head}\n{summary}"
+
+    body = "\n".join([summary, "⬇️⬇️⬇️", "Деталі:", *extra_lines])
     return (
         f"{head}\n"
         f"<blockquote expandable>{body}</blockquote>"
