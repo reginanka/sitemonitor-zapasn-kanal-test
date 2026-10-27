@@ -589,7 +589,7 @@ def _format_slots_line(prefix: str, slots: List[Tuple[str, str]]) -> str:
     """Рядок деталей; час жирний+підкреслений."""
     if not slots:
         return f"{prefix}: немає"
-    parts = [f"<b><u>{a}–{b}</u></b>" for a, b in slots]
+    parts = [f"<b><u>{a}-{b}</u></b>" for a, b in slots]
     h = _total_minutes(slots)
     return f"{prefix}: {', '.join(parts)} ({_fmt_duration(h)})"
 
@@ -622,15 +622,20 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     all_merged = _merge_intervals(scheduled + emerg + repair + other)
     addr_str = _html_esc(format_address(addr))
     lab_esc = _html_esc(lab)
+    if addr.get("queue_only"):
+        head = f"<b>Черга {lab_esc}</b>"
+    else:
+        head = f"{addr_str} (<b>Черга {lab_esc}</b>)"
 
     if all_merged:
-        ranges = ", ".join(f"<b><u>{a}–{b}</u></b>" for a, b in all_merged)
+        # ASCII дефіс стабільніший для Telegram entities ніж en-dash
+        ranges = ", ".join(f"<b><u>{a}-{b}</u></b>" for a, b in all_merged)
         summary = (
-            f"Світла не буде ({_fmt_duration(_total_minutes(all_merged))}): "
+            f"<b>Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
             f"{ranges}"
         )
     else:
-        summary = "Світла не буде: немає відключень"
+        summary = "<b>Світла не буде:</b> немає відключень"
 
     detail_lines = [
         summary,
@@ -645,7 +650,7 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
 
     body = "\n".join(detail_lines)
     return (
-        f"{addr_str} (<b>Черга {lab_esc}</b>)\n"
+        f"{head}\n"
         f"<blockquote expandable>{body}</blockquote>"
     )
 
@@ -726,11 +731,12 @@ def build_schedule_text(
         return ""
 
     parts: List[str] = []
-    for d in dates:
+    for day_i, d in enumerate(dates):
+        if day_i > 0:
+            parts.append("")  # роздільник лише перед наступною датою
         parts.append(f"📅 <b>{_html_esc(_fmt_date_display(d))}</b>")
         parts.append("")
         for lab, addr in items:
-            parts.append("—")
             parts.append(_schedule_block(lab, addr, d))
             parts.append("")
     return "\n".join(parts).strip()
