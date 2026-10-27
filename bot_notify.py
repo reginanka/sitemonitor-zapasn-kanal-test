@@ -99,6 +99,17 @@ def queue_label(queue: str, subqueue: str = "") -> str:
 def format_address(addr: dict) -> str:
     if not isinstance(addr, dict):
         return "—"
+    # Підписка лише на чергу (без вулиці) — sitemonitor все одно шле ГПВ по queue
+    if addr.get("queue_only"):
+        q = (addr.get("queue") or "").strip()
+        sq = (addr.get("subqueue") or "").strip()
+        if q and ("." in q or "|" in q):
+            lab = q.replace("|", ".")
+        elif q and sq:
+            lab = f"{q}.{sq}"
+        else:
+            lab = q or "?"
+        return f"Черга {lab}"
     city = (addr.get("city_name") or addr.get("city") or "").strip()
     street = (addr.get("street_name") or addr.get("street") or "").strip()
     house = (
