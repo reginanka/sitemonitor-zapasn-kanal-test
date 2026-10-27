@@ -244,14 +244,22 @@ def fetch_queue(otg_name: str, city_name: str, street_name: str) -> dict:
 def format_queue_msg(info: dict) -> str:
     q = info.get("queue") or "—"
     sq = info.get("subqueue") or ""
-    if sq and sq != q and len(sq) < 40:
+    q_low = (q or "").lower()
+    no_gpv = any(
+        m in q_low
+        for m in ("не вимикається", "не вимикають", "не відключається", "не відключають")
+    )
+    if no_gpv:
+        # без дубля queue+subqueue і без довгого тексту двічі
+        line = "не вимикають, крім аварійних"
+    elif sq and sq != q and len(sq) < 40 and re.match(r"^[\d.]+$", sq.strip()):
         line = f"Черга: <b>{q}</b>, підчерга: <b>{sq}</b>"
     elif re.match(r"^[\d.]+$", q.strip()):
         line = f"Черга: <b>{q}</b>" + (
             f", підчерга: <b>{sq}</b>" if sq and re.match(r"^[\d.]+$", sq.strip()) else ""
         )
     else:
-        line = q
+        line = q if len(q) < 80 else "не вимикають, крім аварійних"
     parts = [line]
     if info.get("houses"):
         parts.append(f"🏘 Будинки: {info['houses']}")

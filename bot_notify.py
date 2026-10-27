@@ -86,14 +86,40 @@ def user_addresses(u: dict) -> list:
     return []
 
 
+_NO_GPV_MARKERS = (
+    "не вимикається",
+    "не вимикають",
+    "не відключається",
+    "не відключають",
+    "без відключень",
+)
+
+
+def _is_no_gpv_queue(text: str) -> bool:
+    """Черга — не номер, а пояснення «в цей час не вимикається…»."""
+    t = (text or "").strip().lower()
+    if not t or re.match(r"^[\d.]+$", t):
+        return False
+    return any(m in t for m in _NO_GPV_MARKERS)
+
+
 def queue_label(queue: str, subqueue: str = "") -> str:
+    """Коротка мітка (6.1). Для спец-текстів «не вимикають» — порожньо."""
     q = (queue or "").strip()
     sq = (subqueue or "").strip()
     if not q:
         return ""
+    if _is_no_gpv_queue(q) or _is_no_gpv_queue(sq):
+        return ""
     if "." in q or "|" in q:
+        if not re.match(r"^[\d.]+$", q.replace("|", ".")):
+            return ""
         return q.replace("|", ".")
-    return f"{q}.{sq}" if sq else q
+    if sq and sq != q and re.match(r"^[\d.]+$", sq):
+        return f"{q}.{sq}"
+    if re.match(r"^[\d.]+$", q):
+        return q
+    return ""
 
 
 def format_address(addr: dict) -> str:
@@ -103,9 +129,11 @@ def format_address(addr: dict) -> str:
     if addr.get("queue_only"):
         q = (addr.get("queue") or "").strip()
         sq = (addr.get("subqueue") or "").strip()
-        if q and ("." in q or "|" in q):
+        if _is_no_gpv_queue(q) or _is_no_gpv_queue(sq):
+            return "не вимикають, крім аварійних"
+        if q and re.match(r"^[\d.]+$", q.replace("|", ".")):
             lab = q.replace("|", ".")
-        elif q and sq:
+        elif q and sq and re.match(r"^[\d.]+$", sq):
             lab = f"{q}.{sq}"
         else:
             lab = q or "?"
@@ -624,10 +652,20 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     all_merged = _merge_intervals(scheduled + emerg + repair + other)
     addr_str = _html_esc(format_address(addr))
     lab_esc = _html_esc(lab)
-    if addr.get("queue_only"):
+    q_raw = (addr.get("queue") or "").strip()
+    sq_raw = (addr.get("subqueue") or "").strip()
+    no_gpv = _is_no_gpv_queue(q_raw) or _is_no_gpv_queue(sq_raw) or not lab
+
+    if addr.get("queue_only") and lab:
         head = f"<b>Черга {lab_esc}</b>"
-    else:
+    elif lab:
         head = f"{addr_str} (<b>Черга {lab_esc}</b>)"
+    elif no_gpv and not addr.get("queue_only"):
+        head = f"{addr_str} (<i>не вимикають, крім аварійних</i>)"
+    elif addr.get("queue_only"):
+        head = "<i>не вимикають, крім аварійних</i>"
+    else:
+        head = f"{addr_str} (<i>черга не визначена</i>)"
 
     if all_merged:
         ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
@@ -637,7 +675,7 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
             f"<u>{ranges}</u>"
         )
     else:
-        summary = "<b>Світла не буде:</b> немає відключень"
+        summary = "🟢 Світло буде увесь день"
 
     # Деталі лише якщо є аварійні / ремонтні / інші (не дублюємо чисті ГПВ)
     extra_lines = []
