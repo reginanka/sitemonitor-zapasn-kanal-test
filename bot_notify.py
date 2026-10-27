@@ -771,7 +771,7 @@ def build_changes_text(
 
 
 def _addr_head_line(lab: str, addr: dict) -> str:
-    """Рядок адреси + черга для згортаємої групи «Дані очікуємо»."""
+    """Рядок адреси + черга для згортаємої групи."""
     addr_str = _html_esc(format_address(addr))
     lab_esc = _html_esc(lab)
     if addr.get("queue_only") and lab:
@@ -781,6 +781,49 @@ def _addr_head_line(lab: str, addr: dict) -> str:
     return addr_str
 
 
+def _outage_under_header(
+    lab: str,
+    addr: dict,
+    *,
+    scheduled: List[Tuple[str, str]],
+    emerg: List[Tuple[str, str]],
+    repair: List[Tuple[str, str]],
+    other: List[Tuple[str, str]],
+    all_merged: List[Tuple[str, str]],
+) -> str:
+    """
+    Під заголовком «Світла не буде по адресах»:
+      адреса + звичайна цитата (лише ГПВ)
+      або expandable з Деталями (ремонт/аварія).
+    """
+    head = _addr_head_line(lab, addr)
+    ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
+    summary = f"<u>{ranges}</u> ({_fmt_duration(_total_minutes(all_merged))})"
+
+    extra_lines = []
+    if emerg:
+        extra_lines.append(_format_slots_line("⚠️ Аварійні", emerg))
+    if repair:
+        extra_lines.append(_format_slots_line("🛠 Ремонтні", repair))
+    if other:
+        extra_lines.append(_format_slots_line("⚪ Інші", other))
+
+    if not extra_lines:
+        return f"{head}\n<blockquote>{summary}</blockquote>"
+
+    detail = [summary, "⬇️⬇️⬇️", "Деталі:"]
+    if scheduled:
+        detail.append(_format_slots_line("⏰ Погодинні", scheduled))
+    detail.extend(extra_lines)
+    return f"{head}\n<blockquote expandable>{chr(10).join(detail)}</blockquote>"
+
+
+def _grouped_ok_blockquote(title: str, heads: List[str]) -> str:
+    """Заголовок зовні, стрілки + список — у згортаємій цитаті."""
+    body = "⬇️⬇️⬇️\n" + "\n".join(heads)
+    return f"{title}\n<blockquote expandable>{body}</blockquote>"
+
+
 def build_schedule_text(
     queue_labels_with_addr: Sequence[Tuple[str, dict]],
     *,
@@ -788,11 +831,10 @@ def build_schedule_text(
     date_str: str = "",
 ) -> str:
     """
-    Наступне повідомлення: дата → адреси «Світла не буде…»,
-    потім знову дата → знову адреси (якщо кілька днів).
-
-    Якщо на день немає ГПВ — адреси без ремонту/аварії ховаємо
-    під одну цитату «🔄 Дані очікуємо».
+    По днях:
+      🪫 Світла не буде по адресах  (заголовок)
+      адреса + цитата з інтервалами / деталями
+      🔋 / 🔄 — згортаєма група адрес без відключень
     """
     dates = _dates_from_changes(changes, date_str)
     items = list(queue_labels_with_addr)
@@ -802,13 +844,14 @@ def build_schedule_text(
     parts: List[str] = []
     for day_i, d in enumerate(dates):
         if day_i > 0:
-            parts.append("")  # роздільник лише перед наступною датою
+            parts.append("")
         parts.append(f"📅 <b>{_html_esc(_fmt_date_display(d))}</b>")
         parts.append("")
 
         day = _day_offset(d)
         has_gpv = day >= 0
         disp = _fmt_date_display(d)
+        outage_blocks: List[str] = []
         ok_or_wait: List[str] = []
         for lab, addr in items:
             scheduled = _slots_from_doc(load_queue_doc(lab), day=day)
@@ -821,18 +864,34 @@ def build_schedule_text(
             )
             all_merged = _merge_intervals(scheduled + emerg + repair + other)
             if all_merged:
-                parts.append(_schedule_block(lab, addr, d))
-                parts.append("")
+                outage_blocks.append(
+                    _outage_under_header(
+                        lab,
+                        addr,
+                        scheduled=scheduled,
+                        emerg=emerg,
+                        repair=repair,
+                        other=other,
+                        all_merged=all_merged,
+                    )
+                )
             else:
                 ok_or_wait.append(_addr_head_line(lab, addr))
+
+        if outage_blocks:
+            parts.append("🪫 <b>Світла не буде по адресах</b>")
+            parts.append("⬇️⬇️⬇️")
+            parts.append("")
+            for block in outage_blocks:
+                parts.append(block)
+                parts.append("")
         if ok_or_wait:
             title = (
-                "🔋 <b>Світло буде увесь день</b>"
+                "🔋 <b>Світло буде увесь день по адресах</b>"
                 if has_gpv
-                else "🔄 <b>Дані очікуємо</b>"
+                else "🔄 <b>Дані очікуємо по адресах</b>"
             )
-            body = title + "\n" + "\n".join(ok_or_wait)
-            parts.append(f"<blockquote expandable>{body}</blockquote>")
+            parts.append(_grouped_ok_blockquote(title, ok_or_wait))
             parts.append("")
     return "\n".join(parts).strip()
 
