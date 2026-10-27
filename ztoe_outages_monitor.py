@@ -258,6 +258,361 @@ def format_outage(outage: dict) -> str:
     return text
 
 
+# ----- блок графіка під сповіщенням (як у каналі / bot_notify) -----
+
+def _parse_hhmm(t: str) -> Optional[int]:
+    import re
+    m = re.match(r"^(\d{1,2}):(\d{2})", (t or "").strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if h == 24 and mi == 0:
+        return 24 * 60
+    return h * 60 + mi
+
+
+def _minutes_to_hhmm(m: int) -> str:
+    if m >= 24 * 60:
+        return "24:00"
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _merge_intervals(intervals: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    parsed = []
+    for fr, to in intervals:
+        a, b = _parse_hhmm(fr), _parse_hhmm(to)
+        if a is None or b is None:
+            continue
+        if b <= a:
+            b += 24 * 60
+        parsed.append((a, b))
+    if not parsed:
+        return []
+    parsed.sort()
+    merged = [list(parsed[0])]
+    for a, b in parsed[1:]:
+        if a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(_minutes_to_hhmm(a), _minutes_to_hhmm(b)) for a, b in merged]
+
+
+def _total_minutes(intervals: List[Tuple[str, str]]) -> int:
+    total = 0
+    for fr, to in _merge_intervals(intervals):
+        a, b = _parse_hhmm(fr), _parse_hhmm(to)
+        if a is None or b is None:
+            continue
+        if b <= a:
+            b += 24 * 60
+        total += b - a
+    return total
+
+
+def _fmt_duration(total_min: int) -> str:
+    if total_min < 0:
+        total_min = 0
+    h, m = divmod(int(total_min), 60)
+    if h and m:
+        return f"{h} год {m}хв"
+    if h:
+        return f"{h} год"
+    return f"{m}хв"
+
+
+def _fmt_range(a: str, b: str) -> str:
+    return f"<b><u>{a}-{b}</u></b>"
+
+
+def _interval_key(fr: str, to: str) -> Tuple[int, int]:
+    a = _parse_hhmm(fr) or -1
+    b = _parse_hhmm(to) or -1
+    if a >= 0 and b >= 0 and b <= a:
+        b += 24 * 60
+    return (a, b)
+
+
+def _subtract_intervals(
+    slots: List[Tuple[str, str]],
+    covers: List[Tuple[str, str]],
+) -> List[Tuple[str, str]]:
+    cover_m = _merge_intervals(covers)
+    if not cover_m:
+        return _merge_intervals(slots)
+    result: List[Tuple[int, int]] = []
+    for fr, to in _merge_intervals(slots):
+        a, b = _interval_key(fr, to)
+        if a < 0 or b < 0:
+            continue
+        pieces = [(a, b)]
+        for cfr, cto in cover_m:
+            ca, cb = _interval_key(cfr, cto)
+            if ca < 0:
+                continue
+            new_pieces = []
+            for pa, pb in pieces:
+                if cb <= pa or ca >= pb:
+                    new_pieces.append((pa, pb))
+                    continue
+                if pa < ca:
+                    new_pieces.append((pa, ca))
+                if pb > cb:
+                    new_pieces.append((cb, pb))
+            pieces = new_pieces
+        result.extend(pieces)
+    return [(_minutes_to_hhmm(a), _minutes_to_hhmm(b)) for a, b in result if b > a]
+
+
+def _load_queue_doc(db, label: str) -> Optional[dict]:
+    if not label:
+        return None
+    s = label.replace("|", ".")
+    parts = s.split(".")
+    ch, pid = parts[0], (parts[1] if len(parts) > 1 else "")
+    for _id in (
+        f"{ch}|{pid}" if pid else ch,
+        f"{ch}.{pid}" if pid else ch,
+        label,
+        ch,
+    ):
+        doc = db["queue_schedules"].find_one({"_id": _id})
+        if doc:
+            return doc
+    if pid:
+        doc = db["queue_schedules"].find_one({"queue": ch, "subqueue": pid})
+        if doc:
+            return doc
+    return None
+
+
+def _slots_from_sched(doc: Optional[dict], *, day: int = 0) -> List[Tuple[str, str]]:
+    if not doc:
+        return []
+    if day == 1:
+        slots = (
+            doc.get("slots_tomorrow")
+            or (doc.get("extra") or {}).get("slots_tomorrow")
+            or doc.get("events_tomorrow")
+            or []
+        )
+    else:
+        slots = doc.get("slots") or doc.get("events") or []
+    out = []
+    for s in slots or []:
+        if not isinstance(s, dict):
+            continue
+        fr = (s.get("from") or s.get("start") or "").strip()[:5]
+        to = (s.get("to") or s.get("end") or "").strip()[:5]
+        if fr and to:
+            out.append((fr, to))
+    return _merge_intervals(out)
+
+
+def _outage_day_ymd(outage: dict) -> str:
+    de = str(outage.get("dateEvent") or "")[:10]
+    if de and len(de) >= 10 and de[4] == "-":
+        return de
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _display_date_from_ymd(ymd: str) -> str:
+    try:
+        return datetime.strptime(ymd[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+    except ValueError:
+        return ymd
+
+
+def _sched_day_index(sched: Optional[dict], ymd: str) -> int:
+    """0 = slots (date), 1 = slots_tomorrow (date+1), інакше 0."""
+    if not sched:
+        return 0
+    raw = (sched.get("date") or "").strip()
+    if not raw:
+        return 0
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            anchor = datetime.strptime(raw[:10] if fmt.startswith("%Y") else raw, fmt)
+            a = anchor.strftime("%Y-%m-%d")
+            if a == ymd[:10]:
+                return 0
+            nxt = (anchor + timedelta(days=1)).strftime("%Y-%m-%d")
+            if nxt == ymd[:10]:
+                return 1
+            break
+        except ValueError:
+            continue
+    return 0
+
+
+def _classify_mongo_outage(doc: dict) -> Optional[str]:
+    koment = (doc.get("koment") or "").upper()
+    if "ГПВ" in koment:
+        return None
+    raw_sub = doc.get("switchSubReason")
+    has_sub = raw_sub is not None and raw_sub != ""
+    try:
+        sub = int(raw_sub) if has_sub else 0
+    except (TypeError, ValueError):
+        sub = 0
+        has_sub = False
+    try:
+        t = int(doc.get("typeOff")) if doc.get("typeOff") is not None else -1
+    except (TypeError, ValueError):
+        t = -1
+    if has_sub and sub == 2:
+        return None
+    if has_sub and sub in (1, 3):
+        return "emergency"
+    if has_sub and sub > 0:
+        return "other"
+    if not has_sub and t == 1:
+        return None
+    if t == 1:
+        return "emergency"
+    if t in (0, 3):
+        return "repair"
+    if t == 2:
+        return "other"
+    return None
+
+
+def _buckets_for_addr_day(db, addr: dict, ymd: str) -> Dict[str, List[Tuple[str, str]]]:
+    empty: Dict[str, List[Tuple[str, str]]] = {
+        "emergency": [],
+        "repair": [],
+        "other": [],
+    }
+    city = (addr.get("city_name") or "").strip()
+    street = (addr.get("street_name") or addr.get("street") or "").strip()
+    house = str(addr.get("house") or addr.get("building") or "").strip()
+    if not city and not street:
+        return empty
+    q: dict = {}
+    if city:
+        q["city_name"] = {"$regex": f"^{city}$", "$options": "i"}
+    buckets = {"emergency": [], "repair": [], "other": []}
+    for doc in db["outages"].find(q).limit(200):
+        de = str(doc.get("dateEvent") or doc.get("date_from") or "")
+        dp = str(doc.get("datePlanIn") or doc.get("date_to") or "")
+        if not (de.startswith(ymd) or dp.startswith(ymd)):
+            continue
+        ds = (doc.get("street_name") or "").strip().lower()
+        sn = _norm_street(street)
+        dn = _norm_street(ds)
+        if sn and dn and not (sn == dn or sn in dn or dn in sn):
+            continue
+        buildings = (doc.get("buildingNames") or doc.get("buildings") or "").strip()
+        if house and buildings:
+            tokens = {
+                p.strip().lower().lstrip("0") or "0"
+                for p in buildings.replace(";", ",").split(",")
+                if p.strip()
+            }
+            h = house.lower().lstrip("0") or "0"
+            if h not in tokens:
+                continue
+        kind = _classify_mongo_outage(doc)
+        if not kind:
+            continue
+        start = de[11:16] if len(de) >= 16 else ""
+        end = dp[11:16] if len(dp) >= 16 else ""
+        if start and end:
+            buckets[kind].append((start, end))
+    for k in buckets:
+        buckets[k] = _merge_intervals(buckets[k])
+    return buckets
+
+
+def format_schedule_block_for_notify(
+    db,
+    addr: dict,
+    outage: dict,
+) -> str:
+    """
+    Блок під подією:
+      ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ на DD.MM.YYYY
+      Світла не буде (N год): ...   ← погодинні + аварійні + ремонтні
+      Деталі: Погодинні / Аварійні / Ремонтні
+    """
+    ymd = _outage_day_ymd(outage)
+    display = _display_date_from_ymd(ymd)
+    lab = user_queue_key(addr) or outage.get("_user_queue") or ""
+    sched = _load_queue_doc(db, lab) if lab else None
+    day_idx = _sched_day_index(sched, ymd)
+    scheduled = _slots_from_sched(sched, day=day_idx)
+    buckets = _buckets_for_addr_day(db, addr, ymd)
+    emerg = _subtract_intervals(buckets.get("emergency") or [], scheduled)
+    repair = _subtract_intervals(
+        buckets.get("repair") or [], scheduled + emerg
+    )
+    other = _subtract_intervals(
+        buckets.get("other") or [], scheduled + emerg + repair
+    )
+    all_merged = _merge_intervals(scheduled + emerg + repair + other)
+
+    if all_merged:
+        ranges = ", ".join(_fmt_range(a, b) for a, b in all_merged)
+        summary = (
+            f"Світла не буде ({_fmt_duration(_total_minutes(all_merged))}): {ranges}"
+        )
+    else:
+        summary = "Світла не буде: немає відключень"
+
+    def line(prefix: str, slots: List[Tuple[str, str]]) -> str:
+        if not slots:
+            return f"{prefix}: немає"
+        parts = [_fmt_range(a, b) for a, b in slots]
+        return f"{prefix}: {', '.join(parts)} ({_fmt_duration(_total_minutes(slots))})"
+
+    detail = [
+        summary,
+        "⬇️⬇️⬇️",
+        "Деталі:",
+        line("⏰ Погодинні", scheduled),
+        line("🔴 Аварійні", emerg),
+        line("🟠 Ремонтні", repair),
+    ]
+    if other:
+        detail.append(line("⚪ Інші", other))
+    # Усе в expandable: згорнуто за замовчуванням (як у каналі).
+    body = "\n".join(
+        [
+            f"<b>ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ на {display}</b>",
+            "",
+            *detail,
+        ]
+    )
+    return f"<blockquote expandable>{body}</blockquote>"
+
+
+def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
+    """
+    items: [(outage, addr), ...]
+    Верх: список подій з датами.
+    Низ: графік на день події (сума погодинних+аварійних+ремонтних).
+    """
+    lines = ["⚠️ <b>Нові відключення по твоїх адресах:</b>", ""]
+    seen_sched: set = set()
+    for outage, addr in items[:10]:
+        lines.append(format_outage(outage))
+        lines.append("")
+        ymd = _outage_day_ymd(outage)
+        lab = user_queue_key(addr) or ""
+        key = f"{lab}|{ymd}|{(addr.get('city_name') or '')}|{(addr.get('street_name') or '')}"
+        if key in seen_sched:
+            continue
+        seen_sched.add(key)
+        try:
+            block = format_schedule_block_for_notify(db, addr, outage)
+            if block:
+                lines.append(block)
+                lines.append("")
+        except Exception as e:
+            log.warning("schedule block: %s", e)
+    return "\n".join(lines).strip()
+
+
 def _norm_street(name: str) -> str:
     s = (name or "").strip().lower()
     for pfx in ("вул.", "вул ", "пров.", "провулок ", "проспект ", "пр.", "бульвар ", "пл.", "площа "):
@@ -508,9 +863,12 @@ def main() -> int:
                             outage["_user_queue"] = uqk
                         notified.setdefault(tid, [])
                         fp = content_fingerprint(outage)
-                        if any(content_fingerprint(x) == fp for x in notified[tid]):
+                        if any(
+                            content_fingerprint(x[0] if isinstance(x, tuple) else x) == fp
+                            for x in notified[tid]
+                        ):
                             continue
-                        notified[tid].append(outage)
+                        notified[tid].append((outage, addr))
                         matched_fps.add(fp)
 
                 log.info(
@@ -601,9 +959,9 @@ def main() -> int:
 
 
     sent = 0
-    for tid, outage_list in notified.items():
-        text = "⚠️ <b>Нові відключення по твоїх адресах:</b>\n\n"
-        text += "\n\n".join(format_outage(o) for o in outage_list[:10])
+    for tid, item_list in notified.items():
+        # [(outage, addr), ...]
+        text = build_notify_message(db, item_list)
 
         async def _send(chat_id=tid, body=text):
             await bot.send_message(
@@ -616,7 +974,7 @@ def main() -> int:
         try:
             asyncio.run(_send())
             sent += 1
-            log.info("Надіслано %s (outages=%s)", tid, len(outage_list))
+            log.info("Надіслано %s (outages=%s)", tid, len(item_list))
             time.sleep(0.4)
         except Exception as e:
             log.error("Send fail %s: %s", tid, e)
