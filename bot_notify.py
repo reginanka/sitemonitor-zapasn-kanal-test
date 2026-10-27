@@ -183,6 +183,7 @@ def collect_notify_targets(
         if tid is None:
             continue
         matched: List[Tuple[str, dict]] = []
+        no_queue: List[Tuple[str, dict]] = []
         user_labs: List[str] = []
         for addr in user_addresses(u):
             if not isinstance(addr, dict):
@@ -190,6 +191,8 @@ def collect_notify_targets(
             q = (addr.get("queue") or "").strip()
             sq = (addr.get("subqueue") or "").strip()
             if not q:
+                # адреса без черги — покажемо з поміткою (не пропускаємо)
+                no_queue.append(("", addr))
                 continue
             label = queue_label(q, sq)
             if label:
@@ -215,9 +218,14 @@ def collect_notify_targets(
                     matched.append((label, addr))
         if user_labs:
             all_labels.append(f"tid={tid}:[{','.join(user_labs)}]")
-        if matched:
+        # якщо є збіг по чергах змін (або шлемо всім) — додаємо й адреси без черги
+        if matched or (not keys and no_queue):
+            combined = matched + no_queue
+            # якщо фільтр по чергах і є збіг — теж підтягуємо no_queue
+            if matched and no_queue:
+                combined = matched + no_queue
             try:
-                targets[int(tid)] = matched
+                targets[int(tid)] = combined
             except (TypeError, ValueError):
                 log_to_buffer(f"⚠️ bad telegram_id={tid!r}")
 
@@ -415,16 +423,17 @@ def _dates_from_changes(
     changes: Optional[Dict[str, List[dict]]],
     fallback: str,
 ) -> List[str]:
-    """Унікальні дати з diff (порядок збереження), у форматі YYYY-MM-DD."""
-    seen = []
+    """Унікальні дати з diff, у форматі YYYY-MM-DD, за зростанням (спочатку раніша)."""
+    seen = set()
     for items in (changes or {}).values():
         for c in items or []:
             d = _ymd(c.get("date") or "")
-            if d and d not in seen:
-                seen.append(d)
+            if d:
+                seen.add(d)
     if not seen:
-        seen.append(_ymd(fallback) or datetime.now().strftime("%Y-%m-%d"))
-    return seen
+        fb = _ymd(fallback) or datetime.now().strftime("%Y-%m-%d")
+        return [fb]
+    return sorted(seen)  # 27.10 перед 28.10
 
 
 def _norm_street(name: str) -> str:
@@ -722,6 +731,39 @@ def _change_line(c: dict) -> str:
     return "🔋 скасували відключення"
 
 
+def _items_for_lab_day(
+    changes: Dict[str, List[dict]],
+    lab: str,
+    d: str,
+    dates: List[str],
+) -> List[dict]:
+    items = [
+        c
+        for c in (changes.get(lab) or [])
+        if not c.get("date") or _ymd(c.get("date") or "") == d
+    ]
+    if not items and dates and d == dates[0]:
+        items = [
+            c
+            for c in (changes.get(lab) or [])
+            if not c.get("date")
+        ]
+    return items
+
+
+def _is_new_schedule_only(items: List[dict]) -> bool:
+    """Лише «новий графік» без конкретних інтервалів."""
+    if not items:
+        return False
+    for c in items:
+        ch = (c.get("change") or "").strip()
+        if ch not in ("new", "added"):
+            return False
+        if (c.get("start") or "").strip() or (c.get("end") or "").strip():
+            return False
+    return True
+
+
 def build_changes_text(
     queue_labels_with_addr: Sequence[Tuple[str, dict]],
     changes: Optional[Dict[str, List[dict]]] = None,
@@ -729,37 +771,47 @@ def build_changes_text(
 ) -> str:
     """
     Блок «що змінилось» — під скрін.
-    Групує по датах з diff (не лише «сьогодні»).
+    Групує по датах; «новий графік» на день — одним рядком на кілька черг.
     """
     changes = changes or {}
     labs_order: List[str] = []
     for lab, _ in queue_labels_with_addr:
-        if lab not in labs_order:
+        if lab and lab not in labs_order:
             labs_order.append(lab)
 
     dates = _dates_from_changes(changes, date_str)
+    labs_str = ", ".join(_html_esc(x) for x in labs_order) if labs_order else "—"
     lines = [
-        f"Для черг {', '.join(_html_esc(x) for x in labs_order)} "
-        f"🔔 ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!",
+        f"Для черг {labs_str} 🔔 <b>ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!</b>",
         "",
     ]
 
     for d in dates:
         lines.append(f"📅 {_html_esc(_fmt_date_display(d))}")
         lines.append("")
+
+        # черги, для яких на цей день лише «новий графік» без інтервалів
+        new_sched_labs: List[str] = []
+        detail_labs: List[Tuple[str, List[dict]]] = []
         for lab in labs_order:
-            items = [
-                c
-                for c in (changes.get(lab) or [])
-                if not c.get("date") or _ymd(c.get("date") or "") == d
-            ]
-            # якщо в diff дата порожня — показуємо всі items лише на першій даті
-            if not items and d == dates[0]:
-                items = [
-                    c
-                    for c in (changes.get(lab) or [])
-                    if not c.get("date")
-                ]
+            items = _items_for_lab_day(changes, lab, d, dates)
+            if _is_new_schedule_only(items):
+                new_sched_labs.append(lab)
+            elif items:
+                detail_labs.append((lab, items))
+            else:
+                detail_labs.append((lab, []))
+
+        if new_sched_labs:
+            labs_txt = ", ".join(_html_esc(x) for x in new_sched_labs)
+            lines.append(
+                f"🆕 Для черг <b>{labs_txt}</b> додали новий графік на цей день"
+            )
+            lines.append("")
+
+        for lab, items in detail_labs:
+            if lab in new_sched_labs:
+                continue
             lines.append(f"▶️ Черга <b>{_html_esc(lab)}</b>:")
             if not items:
                 lines.append("оновлення графіка")
@@ -767,17 +819,24 @@ def build_changes_text(
                 for c in items:
                     lines.append(_change_line(c))
             lines.append("")
+
     return "\n".join(lines).strip()
 
 
 def _addr_head_line(lab: str, addr: dict) -> str:
-    """Рядок адреси + черга для згортаємої групи."""
+    """Рядок адреси + черга для списків / груп."""
     addr_str = _html_esc(format_address(addr))
     lab_esc = _html_esc(lab)
     if addr.get("queue_only") and lab:
         return f"<b>Черга {lab_esc}</b>"
     if lab:
         return f"{addr_str} (<b>Черга {lab_esc}</b>)"
+    q = (addr.get("queue") or "").strip()
+    if not q:
+        return (
+            f"{addr_str} (<i>черга не обрана</i>)\n"
+            f"<i>➡️ Передодай адресу в боті, щоб бачити графік</i>"
+        )
     return addr_str
 
 
@@ -841,6 +900,18 @@ def build_schedule_text(
     if not items:
         return ""
 
+    # адреси без черги — один блок на все повідомлення (не на кожен день)
+    queued_items = [
+        (lab, addr)
+        for lab, addr in items
+        if (lab or "").strip() or (addr.get("queue") or "").strip()
+    ]
+    no_queue_heads = [
+        _addr_head_line(lab, addr)
+        for lab, addr in items
+        if not (lab or "").strip() and not (addr.get("queue") or "").strip()
+    ]
+
     parts: List[str] = []
     for day_i, d in enumerate(dates):
         if day_i > 0:
@@ -853,7 +924,7 @@ def build_schedule_text(
         disp = _fmt_date_display(d)
         outage_blocks: List[str] = []
         ok_or_wait: List[str] = []
-        for lab, addr in items:
+        for lab, addr in queued_items:
             scheduled = _slots_from_doc(load_queue_doc(lab), day=day)
             buckets = _outages_bucketed(addr, disp)
             scheduled, emerg, repair, other = _dedupe_by_priority(
@@ -893,6 +964,15 @@ def build_schedule_text(
             )
             parts.append(_grouped_ok_blockquote(title, ok_or_wait))
             parts.append("")
+
+    if no_queue_heads:
+        parts.append("")
+        parts.append(
+            _grouped_ok_blockquote(
+                "⚠️ <b>Адреси без черги</b>", no_queue_heads
+            )
+        )
+
     return "\n".join(parts).strip()
 
 
