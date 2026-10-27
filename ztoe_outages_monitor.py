@@ -561,7 +561,7 @@ def main() -> int:
     finally:
         http.close()
 
-    # --- cleanup: тільки outages + застарілий outages_cache; ГПВ/users не чіпаємо ---
+    # --- cleanup: тільки outages + outages_cache; ГПВ/users не чіпаємо ---
     try:
         if OUTAGES_RETENTION_HOURS > 0:
             cutoff = datetime.now(timezone.utc) - timedelta(hours=OUTAGES_RETENTION_HOURS)
@@ -570,6 +570,21 @@ def main() -> int:
                 "outages cleanup: deleted=%s older_than=%sh",
                 del_out.deleted_count,
                 OUTAGES_RETENTION_HOURS,
+            )
+            # Сироти: typeOff=1 без switchSubReason (старий спам «аварій» 21–24 тощо).
+            # Після upsert цього прогону актуальні вже мають switchSubReason.
+            del_legacy = outages_full.delete_many(
+                {
+                    "typeOff": 1,
+                    "$or": [
+                        {"switchSubReason": {"$exists": False}},
+                        {"switchSubReason": None},
+                    ],
+                }
+            )
+            log.info(
+                "outages cleanup legacy typeOff=1 without switchSubReason: deleted=%s",
+                del_legacy.deleted_count,
             )
         if OUTAGES_CACHE_RETENTION_DAYS > 0:
             cache_cutoff = datetime.now(timezone.utc) - timedelta(
@@ -583,6 +598,7 @@ def main() -> int:
             )
     except Exception as e:
         log.warning("cleanup failed (non-fatal): %s", e)
+
 
     sent = 0
     for tid, outage_list in notified.items():
