@@ -1,7 +1,7 @@
 """
 Спільна розсилка підписникам бота ztoe:
   - 1 адреса → короткий формат
-  - кілька адрес/черг → одне зведене повідомлення + 1 скрін
+  - кілька адрес/черг → скрін + текст одним повідомленням (стиль /check)
 
 Погодинні = queue_schedules (ГПВ API).
 Power-on (outages), пріоритет для ОДНОГО інтервалу часу:
@@ -586,9 +586,11 @@ def _dedupe_by_priority(
 
 
 def _format_slots_line(prefix: str, slots: List[Tuple[str, str]]) -> str:
-    """Рядок деталей; час підкреслений одним тегом (менше Telegram entities)."""
+    """Рядок деталей; час підкреслений одним тегом (менше Telegram entities).
+    Порожні слоти не показуємо (без спаму «…: немає»).
+    """
     if not slots:
-        return f"{prefix}: немає"
+        return ""
     parts = [f"{a}-{b}" for a, b in slots]
     h = _total_minutes(slots)
     return f"{prefix}: <u>{', '.join(parts)}</u> ({_fmt_duration(h)})"
@@ -764,6 +766,109 @@ def build_personal_dm(
     return a or b or "🔔 Оновлення графіка"
 
 
+
+CAPTION_LIMIT = 1024
+TEXT_LIMIT = 4096
+
+
+def _split_header_and_days(text: str) -> tuple[str, list[str]]:
+    """Шапка (зміни / статус) і блоки, що починаються з рядка 📅 — як у /check."""
+    lines = (text or "").splitlines()
+    first = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("📅"):
+            first = i
+            break
+    if first is None:
+        return (text or "").strip(), []
+    header = "\n".join(lines[:first]).strip()
+    days: list[str] = []
+    buf: list[str] = []
+    for line in lines[first:]:
+        if line.strip().startswith("📅") and buf:
+            days.append("\n".join(buf).strip())
+            buf = [line]
+        else:
+            buf.append(line)
+    if buf and "\n".join(buf).strip():
+        days.append("\n".join(buf).strip())
+    return header, days
+
+
+def _text_chunks(text: str, limit: int) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    out: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            out.append(rest)
+            break
+        cut = rest.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        piece = rest[:cut].strip()
+        if piece:
+            out.append(piece)
+        rest = rest[cut:].strip()
+    return out
+
+
+def plan_dm_messages(text: str) -> tuple[str, list[str]]:
+    """
+    caption — підпис до фото (≤1024), follow — наступні повідомлення.
+
+    Як у /check (handlers.plan_check_messages), з пріоритетом по днях:
+      • є кілька 📅 днів → під фото шапка + ПЕРШИЙ день; решта днів окремо
+        (навіть якщо все б вмістилось у 1024 — другий день не в caption)
+      • один день і все ≤1024 → лише caption
+      • шапка+перший день >1024 → під фото лише шапка; дні окремо
+    """
+    full = (text or "").strip()
+    if not full:
+        return "", []
+
+    header, days = _split_header_and_days(full)
+
+    # немає розбиття по 📅 — як раніше: все в caption, якщо влазить
+    if not days:
+        if len(full) <= CAPTION_LIMIT:
+            return full, []
+        parts = _text_chunks(full, TEXT_LIMIT)
+        caption = parts[0] if len(parts[0]) <= CAPTION_LIMIT else parts[0][:CAPTION_LIMIT]
+        return caption, parts[1:]
+
+    # один день: можна все під фото, якщо ≤1024
+    if len(days) == 1:
+        first = f"{header}\n\n{days[0]}".strip() if header else days[0]
+        if len(first) <= CAPTION_LIMIT:
+            return first, []
+        # не влазить — лише шапка під фото
+        caption = header or "🔔 Оновлення графіка"
+        if len(caption) > CAPTION_LIMIT:
+            caption = caption[: CAPTION_LIMIT - 1] + "…"
+        return caption, _text_chunks(days[0], TEXT_LIMIT)
+
+    # кілька днів: під фото ТІЛЬКИ шапка + перший день; решта — окремо
+    first = f"{header}\n\n{days[0]}".strip() if header else days[0]
+    if len(first) <= CAPTION_LIMIT:
+        caption = first
+        rest_days = days[1:]
+    else:
+        caption = header or "🔔 Оновлення графіка"
+        if len(caption) > CAPTION_LIMIT:
+            caption = caption[: CAPTION_LIMIT - 1] + "…"
+        rest_days = days  # перший день теж окремо
+
+    follow: list[str] = []
+    for day in rest_days:
+        follow.extend(_text_chunks(day, TEXT_LIMIT))
+    return caption, follow
+
+
 def notify_bot_users_with_images(
     message: str = "",
     *,
@@ -775,11 +880,11 @@ def notify_bot_users_with_images(
     changes: Optional[Dict[str, List[dict]]] = None,
 ) -> None:
     """
-    Формат DM:
-      1) скрін + caption = блок змін (як у каналі під фото)
-         якщо caption > 1024 → фото з 📸, далі окремо текст змін
-      2) наступне повідомлення: 📅 дата + «Світла не буде» по адресах
-         (якщо кілька дат — дата, блоки, знов дата, блоки)
+    Формат DM як /check:
+      фото + caption РАЗОМ (не окремий скрін).
+      caption: зміни/шапка + перший день (якщо ≤1024);
+      якщо не вміщається — під фото лише шапка, дні окремими повідомленнями.
+      другий день — завжди окремо, якщо не вліз у caption.
     """
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
@@ -819,50 +924,53 @@ def notify_bot_users_with_images(
             schedule_text = build_schedule_text(
                 qs_with_addr, changes=changes, date_str=date_str
             )
+            if changes_text and schedule_text:
+                full_text = f"{changes_text}\n\n{schedule_text}"
+            else:
+                full_text = changes_text or schedule_text or (
+                    message or header or "🔔 Оновлення графіка"
+                )
         else:
-            changes_text = (
+            full_text = (
                 (message or header or "🔔 Оновлення")
                 + f"\n\n📌 Твої черги: <b>{', '.join(_html_esc(x) for x in labs)}</b>"
             )
-            schedule_text = ""
+
+        caption, follow = plan_dm_messages(full_text)
 
         ok = False
         photo_ok = False
 
-        # --- 1) скрін + блок змін ---
         if images:
-            if len(changes_text) <= 1024:
-                photo_ok = send_photos_sync(
-                    tid, images, changes_text, bot_token=bot_token
-                )
-                ok = photo_ok
-            else:
-                # як у каналі: фото з 📸, потім текст змін
-                photo_ok = send_photos_sync(tid, images, "📸", bot_token=bot_token)
-                text_ok = send_photos_sync(
-                    tid, [], changes_text[:4096], bot_token=bot_token
-                )
-                ok = photo_ok or text_ok
-            if not ok:
-                log_to_buffer(f"⚠️ DM photo/changes fail tid={tid}, шлю текст змін")
-                ok = send_photos_sync(
-                    tid, [], changes_text[:4096], bot_token=bot_token
-                )
-        else:
-            ok = send_photos_sync(tid, [], changes_text[:4096], bot_token=bot_token)
-
-        # --- 2) розклад по датах/адресах ---
-        if schedule_text:
-            sched_ok = send_photos_sync(
-                tid, [], schedule_text[:4096], bot_token=bot_token
+            photo_ok = send_photos_sync(
+                tid, images, caption or "🔔 Оновлення графіка", bot_token=bot_token
             )
-            ok = ok or sched_ok
+            ok = photo_ok
+            for part in follow:
+                text_ok = send_photos_sync(tid, [], part[:TEXT_LIMIT], bot_token=bot_token)
+                ok = ok or text_ok
+            if not ok:
+                log_to_buffer(f"⚠️ DM photo fail tid={tid}, шлю лише текст")
+                for part in ([caption] + follow) if caption else follow:
+                    if not part:
+                        continue
+                    ok = send_photos_sync(
+                        tid, [], part[:TEXT_LIMIT], bot_token=bot_token
+                    ) or ok
+        else:
+            pieces = [p for p in [caption, *follow] if p] or [full_text]
+            for part in pieces:
+                part_ok = send_photos_sync(
+                    tid, [], part[:TEXT_LIMIT], bot_token=bot_token
+                )
+                ok = ok or part_ok
 
         if ok:
             sent += 1
             log_to_buffer(
                 f"✓ DM tid={tid} queues={labs} photo={photo_ok} "
-                f"changes_len={len(changes_text)} sched_len={len(schedule_text)}"
+                f"caption_len={len(caption)} follow={len(follow)} "
+                f"(фото+текст як /check)"
             )
         else:
             failed += 1

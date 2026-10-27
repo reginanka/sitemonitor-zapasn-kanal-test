@@ -530,10 +530,10 @@ def format_schedule_block_for_notify(
     outage: dict,
 ) -> str:
     """
-    Блок під подією:
-      ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ на DD.MM.YYYY
-      Світла не буде (N год): ...   ← погодинні + аварійні + ремонтні
-      Деталі: Погодинні / Аварійні / Ремонтні
+    Блок під подією — стиль /check:
+      Світла не буде (N год): <u>…</u>
+      Деталі лише якщо є аварійні / ремонтні / інші
+      (без спаму «🟠 Ремонтні: немає»).
     """
     ymd = _outage_day_ymd(outage)
     display = _display_date_from_ymd(ymd)
@@ -553,29 +553,45 @@ def format_schedule_block_for_notify(
 
     if all_merged:
         ranges = ", ".join(_fmt_range(a, b) for a, b in all_merged)
+        # один <u> на всі інтервали — як у /check
         summary = (
-            f"Світла не буде ({_fmt_duration(_total_minutes(all_merged))}): {ranges}"
+            f"<b>Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
+            f"<u>{ranges}</u>"
         )
     else:
-        summary = "Світла не буде: немає відключень"
+        summary = "<b>Світла не буде:</b> немає відключень"
 
     def line(prefix: str, slots: List[Tuple[str, str]]) -> str:
-        if not slots:
-            return f"{prefix}: немає"
         parts = [_fmt_range(a, b) for a, b in slots]
-        return f"{prefix}: {', '.join(parts)} ({_fmt_duration(_total_minutes(slots))})"
+        return (
+            f"{prefix}: <u>{', '.join(parts)}</u> "
+            f"({_fmt_duration(_total_minutes(slots))})"
+        )
 
-    detail = [
-        summary,
-        "⬇️⬇️⬇️",
-        "Деталі:",
-        line("⏰ Погодинні", scheduled),
-        line("🔴 Аварійні", emerg),
-        line("🟠 Ремонтні", repair),
-    ]
+    # Деталі лише якщо є аварійні / ремонтні / інші (не дублюємо чисті ГПВ)
+    extra_lines = []
+    if emerg:
+        extra_lines.append(line("🔴 Аварійні", emerg))
+    if repair:
+        extra_lines.append(line("🟠 Ремонтні", repair))
     if other:
-        detail.append(line("⚪ Інші", other))
-    # Усе в expandable: згорнуто за замовчуванням (як у каналі).
+        extra_lines.append(line("⚪ Інші", other))
+
+    if not extra_lines:
+        # лише підсумок — без «Деталі» і без порожніх рядків
+        body = "\n".join(
+            [
+                f"<b>ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ на {display}</b>",
+                "",
+                summary,
+            ]
+        )
+        return f"<blockquote>{body}</blockquote>"
+
+    detail = [summary, "⬇️⬇️⬇️", "Деталі:"]
+    if scheduled:
+        detail.append(line("⏰ Погодинні", scheduled))
+    detail.extend(extra_lines)
     body = "\n".join(
         [
             f"<b>ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ на {display}</b>",
