@@ -550,7 +550,7 @@ def main() -> None:
         save_state(current)
         log_to_buffer("✅ Сповіщення надіслано, стан збережено в Mongo")
 
-        # DM підписникам: той самий текст статусу (без картинок черг)
+        # DM підписникам: той самий текст + картинка статусу, як у канал
         try:
             from bot_notify import collect_notify_targets
             from telegram_handler import send_photos_sync
@@ -563,12 +563,20 @@ def main() -> None:
             elif not bot_token:
                 log_to_buffer("⚠️ Немає ZTOE_BOT_TOKEN — DM статусу не шлю")
             else:
+                images: list = []
+                if image_path and image_path.exists():
+                    images = [image_path.read_bytes()]
                 sent = 0
                 for tid in targets.keys():
-                    ok = send_photos_sync(tid, [], message, bot_token=bot_token)
+                    ok = send_photos_sync(
+                        tid, images, message, bot_token=bot_token
+                    )
                     if ok:
                         sent += 1
-                log_to_buffer(f"📬 DM статусу Укренерго: sent={sent}/{len(targets)}")
+                log_to_buffer(
+                    f"📬 DM статусу Укренерго: sent={sent}/{len(targets)}"
+                    f"{' +img' if images else ''}"
+                )
         except Exception as e:
             log_to_buffer(f"⚠️ DM статусу після зміни: {e}")
     except Exception as e:
