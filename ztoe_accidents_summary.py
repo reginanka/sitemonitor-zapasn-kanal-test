@@ -465,7 +465,7 @@ def format_message(
     _level_code, level_emoji, level_label = level_meta
 
     lines: List[str] = [
-        f"{level_emoji}<b>{level_label}</b> Стан електромереж у Житомирській області",
+        f"{level_emoji}<b>{level_label}</b> стан електромереж у Житомирській області",
         "",
         (
             f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
@@ -634,7 +634,7 @@ def main() -> int:
         }
         level, level_emoji, level_label = level_from_cities(0)
         msg = (
-            f"{level_emoji}<b>{level_label}</b> Стан електромереж у Житомирській області\n\n"
+            f"{level_emoji}<b>{level_label}</b> стан електромереж у Житомирській області\n\n"
             "Зараз аварійних відключень за даними API немає."
         )
         if AVARII_ZHOE or SUBSCRIBE:
