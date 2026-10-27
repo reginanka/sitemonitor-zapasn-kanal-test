@@ -586,12 +586,12 @@ def _dedupe_by_priority(
 
 
 def _format_slots_line(prefix: str, slots: List[Tuple[str, str]]) -> str:
-    """Рядок деталей; час жирний+підкреслений."""
+    """Рядок деталей; час підкреслений одним тегом (менше Telegram entities)."""
     if not slots:
         return f"{prefix}: немає"
-    parts = [f"<b><u>{a}-{b}</u></b>" for a, b in slots]
+    parts = [f"{a}-{b}" for a, b in slots]
     h = _total_minutes(slots)
-    return f"{prefix}: {', '.join(parts)} ({_fmt_duration(h)})"
+    return f"{prefix}: <u>{', '.join(parts)}</u> ({_fmt_duration(h)})"
 
 
 def _short_time(t: str) -> str:
@@ -628,11 +628,11 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
         head = f"{addr_str} (<b>Черга {lab_esc}</b>)"
 
     if all_merged:
-        # ASCII дефіс стабільніший для Telegram entities ніж en-dash
-        ranges = ", ".join(f"<b><u>{a}-{b}</u></b>" for a, b in all_merged)
+        ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
+        # один <u> на всі інтервали — інакше Telegram ріже entities з кінця повідомлення
         summary = (
             f"<b>Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
-            f"{ranges}"
+            f"<u>{ranges}</u>"
         )
     else:
         summary = "<b>Світла не буде:</b> немає відключень"
