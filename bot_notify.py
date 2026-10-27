@@ -670,22 +670,28 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     else:
         head = f"{addr_str} (<i>черга не визначена</i>)"
 
+    # ГПВ є лише для day 0/1; day=-1 = далека дата без графіка
+    has_gpv_data = day >= 0
+
     if all_merged:
         ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
         # один <u> на всі інтервали — інакше Telegram ріже entities з кінця повідомлення
         summary = (
-            f"<b>Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
+            f"<b>🪫 Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
             f"<u>{ranges}</u>"
         )
+    elif has_gpv_data:
+        summary = "🔋 Світло буде увесь день"
     else:
-        summary = "🟢 Світло буде увесь день"
+        # ЖОЕ ще не передав ГПВ на цей день — не стверджуємо «світло весь день»
+        summary = "🔄 Дані очікуємо"
 
     # Деталі лише якщо є аварійні / ремонтні / інші (не дублюємо чисті ГПВ)
     extra_lines = []
     if emerg:
-        extra_lines.append(_format_slots_line("🔴 Аварійні", emerg))
+        extra_lines.append(_format_slots_line("⚠️ Аварійні", emerg))
     if repair:
-        extra_lines.append(_format_slots_line("🟠 Ремонтні", repair))
+        extra_lines.append(_format_slots_line("🛠 Ремонтні", repair))
     if other:
         extra_lines.append(_format_slots_line("⚪ Інші", other))
 
@@ -764,6 +770,17 @@ def build_changes_text(
     return "\n".join(lines).strip()
 
 
+def _addr_head_line(lab: str, addr: dict) -> str:
+    """Рядок адреси + черга для згортаємої групи «Дані очікуємо»."""
+    addr_str = _html_esc(format_address(addr))
+    lab_esc = _html_esc(lab)
+    if addr.get("queue_only") and lab:
+        return f"<b>Черга {lab_esc}</b>"
+    if lab:
+        return f"{addr_str} (<b>Черга {lab_esc}</b>)"
+    return addr_str
+
+
 def build_schedule_text(
     queue_labels_with_addr: Sequence[Tuple[str, dict]],
     *,
@@ -773,6 +790,9 @@ def build_schedule_text(
     """
     Наступне повідомлення: дата → адреси «Світла не буде…»,
     потім знову дата → знову адреси (якщо кілька днів).
+
+    Якщо на день немає ГПВ — адреси без ремонту/аварії ховаємо
+    під одну цитату «🔄 Дані очікуємо».
     """
     dates = _dates_from_changes(changes, date_str)
     items = list(queue_labels_with_addr)
@@ -785,8 +805,34 @@ def build_schedule_text(
             parts.append("")  # роздільник лише перед наступною датою
         parts.append(f"📅 <b>{_html_esc(_fmt_date_display(d))}</b>")
         parts.append("")
+
+        day = _day_offset(d)
+        has_gpv = day >= 0
+        disp = _fmt_date_display(d)
+        ok_or_wait: List[str] = []
         for lab, addr in items:
-            parts.append(_schedule_block(lab, addr, d))
+            scheduled = _slots_from_doc(load_queue_doc(lab), day=day)
+            buckets = _outages_bucketed(addr, disp)
+            scheduled, emerg, repair, other = _dedupe_by_priority(
+                scheduled,
+                buckets.get("emergency") or [],
+                buckets.get("repair") or [],
+                buckets.get("other") or [],
+            )
+            all_merged = _merge_intervals(scheduled + emerg + repair + other)
+            if all_merged:
+                parts.append(_schedule_block(lab, addr, d))
+                parts.append("")
+            else:
+                ok_or_wait.append(_addr_head_line(lab, addr))
+        if ok_or_wait:
+            title = (
+                "🔋 <b>Світло буде увесь день</b>"
+                if has_gpv
+                else "🔄 <b>Дані очікуємо</b>"
+            )
+            body = title + "\n" + "\n".join(ok_or_wait)
+            parts.append(f"<blockquote expandable>{body}</blockquote>")
             parts.append("")
     return "\n".join(parts).strip()
 

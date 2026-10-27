@@ -555,15 +555,20 @@ def format_schedule_block_for_notify(
     )
     all_merged = _merge_intervals(scheduled + emerg + repair + other)
 
+    # day_idx < 0 → дата поза ГПВ (далекий ремонт); не казати «світло весь день»
+    has_gpv_data = day_idx >= 0
+
     if all_merged:
         ranges = ", ".join(_fmt_range(a, b) for a, b in all_merged)
         # один <u> на всі інтервали — як у /check
         summary = (
-            f"<b>Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
+            f"<b>🪫 Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
             f"<u>{ranges}</u>"
         )
+    elif has_gpv_data:
+        summary = "🔋 Світло буде увесь день"
     else:
-        summary = "🟢 Світло буде увесь день"
+        summary = "🔄 Дані очікуємо"
 
     def line(prefix: str, slots: List[Tuple[str, str]]) -> str:
         parts = [_fmt_range(a, b) for a, b in slots]
@@ -575,9 +580,9 @@ def format_schedule_block_for_notify(
     # Деталі лише якщо є аварійні / ремонтні / інші (не дублюємо чисті ГПВ)
     extra_lines = []
     if emerg:
-        extra_lines.append(line("🔴 Аварійні", emerg))
+        extra_lines.append(line("⚠️ Аварійні", emerg))
     if repair:
-        extra_lines.append(line("🟠 Ремонтні", repair))
+        extra_lines.append(line("🛠 Ремонтні", repair))
     if other:
         extra_lines.append(line("⚪ Інші", other))
 
