@@ -387,7 +387,8 @@ def _load_queue_doc(db, label: str) -> Optional[dict]:
 
 
 def _slots_from_sched(doc: Optional[dict], *, day: int = 0) -> List[Tuple[str, str]]:
-    if not doc:
+    """day=0/1 — слоти з queue_schedules; day<0 або >1 — ГПВ ще немає (далека дата)."""
+    if not doc or day < 0 or day > 1:
         return []
     if day == 1:
         slots = (
@@ -424,12 +425,15 @@ def _display_date_from_ymd(ymd: str) -> str:
 
 
 def _sched_day_index(sched: Optional[dict], ymd: str) -> int:
-    """0 = slots (date), 1 = slots_tomorrow (date+1), інакше 0."""
-    if not sched:
-        return 0
+    """
+    0 = slots (date з графіка), 1 = slots_tomorrow (date+1).
+    -1 = дата поза відомим ГПВ (далекий ремонт/аварія) — погодинних не підставляти.
+    """
+    if not sched or not ymd:
+        return -1
     raw = (sched.get("date") or "").strip()
     if not raw:
-        return 0
+        return -1
     for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
         try:
             anchor = datetime.strptime(raw[:10] if fmt.startswith("%Y") else raw, fmt)
@@ -439,10 +443,10 @@ def _sched_day_index(sched: Optional[dict], ymd: str) -> int:
             nxt = (anchor + timedelta(days=1)).strftime("%Y-%m-%d")
             if nxt == ymd[:10]:
                 return 1
-            break
+            return -1
         except ValueError:
             continue
-    return 0
+    return -1
 
 
 def _classify_mongo_outage(doc: dict) -> Optional[str]:
@@ -559,7 +563,7 @@ def format_schedule_block_for_notify(
             f"<u>{ranges}</u>"
         )
     else:
-        summary = "<b>Світла не буде:</b> немає відключень"
+        summary = "🟢 Світло буде увесь день"
 
     def line(prefix: str, slots: List[Tuple[str, str]]) -> str:
         parts = [_fmt_range(a, b) for a, b in slots]
@@ -577,8 +581,8 @@ def format_schedule_block_for_notify(
     if other:
         extra_lines.append(line("⚪ Інші", other))
 
+    # далека дата без ГПВ: лише ремонт/аварія — короткий блок без фейкових «Погодинні»
     if not extra_lines:
-        # лише підсумок — без «Деталі» і без порожніх рядків
         body = "\n".join(
             [
                 f"<b>ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ на {display}</b>",

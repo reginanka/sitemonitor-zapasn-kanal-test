@@ -350,8 +350,8 @@ def load_queue_doc(label: str) -> dict | None:
 
 
 def _slots_from_doc(doc: dict | None, *, day: int = 0) -> List[Tuple[str, str]]:
-    """day=0 → slots (сьогодні), day=1 → slots_tomorrow."""
-    if not doc:
+    """day=0 → slots, day=1 → slots_tomorrow; day<0/>1 → немає ГПВ (далека дата)."""
+    if not doc or day < 0 or day > 1:
         return []
     if day == 1:
         slots = doc.get("slots_tomorrow") or []
@@ -392,20 +392,23 @@ def _ymd(date_str: str) -> str:
 
 
 def _day_offset(date_str: str) -> int:
-    """0 = сьогодні, 1 = завтра, інакше 0 (fallback на сьогоднішні слоти)."""
+    """
+    0 = сьогодні, 1 = завтра.
+    -1 = дата поза відомим ГПВ (далекий ремонт) — погодинних не підставляти.
+    """
     ymd = _ymd(date_str)
     if not ymd:
-        return 0
+        return -1
     try:
         d = datetime.strptime(ymd, "%Y-%m-%d").date()
     except ValueError:
-        return 0
+        return -1
     today = datetime.now().date()
     if d == today:
         return 0
     if d == today + timedelta(days=1):
         return 1
-    return 0
+    return -1
 
 
 def _dates_from_changes(
