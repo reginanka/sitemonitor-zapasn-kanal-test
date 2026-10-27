@@ -8,7 +8,16 @@
 - bulk_write у Mongo замість поштучних update_one
 - без подвійного retry empty+city
 
-Логіка сповіщень / дедупу / soft_fingerprint без змін.
+Cleanup (щоб база не роздувалась):
+- outages: delete документи з updated_at старші за OUTAGES_RETENTION_HOURS (default 48)
+- outages_cache: soft_fps обрізається до SOFT_FPS_MAX (default 3000);
+  документи cache, які давно не оновлювались (OUTAGES_CACHE_RETENTION_DAYS, default 30),
+  видаляються (застарілі групи адрес)
+
+Env:
+  OUTAGES_RETENTION_HOURS      — TTL повних записів у outages (default 48)
+  SOFT_FPS_MAX                 — макс. розмір soft_fps у cache (default 3000)
+  OUTAGES_CACHE_RETENTION_DAYS — TTL неактивних ключів cache (default 30)
 """
 
 from __future__ import annotations
@@ -18,8 +27,8 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 from pymongo import MongoClient, UpdateOne
@@ -36,6 +45,26 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 API_BASE = (os.getenv("ZTOE_API_BASE") or os.getenv("API_BASE") or "").rstrip("/")
 if not API_BASE:
     raise SystemExit("Немає ZTOE_API_BASE")
+
+# --- retention / caps (не чіпають queue_schedules, users, ГПВ) ---
+OUTAGES_RETENTION_HOURS = int(os.getenv("OUTAGES_RETENTION_HOURS", "48"))
+SOFT_FPS_MAX = int(os.getenv("SOFT_FPS_MAX", "3000"))
+OUTAGES_CACHE_RETENTION_DAYS = int(os.getenv("OUTAGES_CACHE_RETENTION_DAYS", "30"))
+
+
+def merge_soft_fps(current_soft: Set[str], prev_soft: Set[str], limit: int = SOFT_FPS_MAX) -> List[str]:
+    """
+    Об'єднує soft_fps, але не дає масиву рости безмежно.
+    Поточні fingerprint'и з API завжди зберігаються;
+    зі старих добираємо до limit.
+    """
+    if limit <= 0:
+        return list(current_soft)
+    if len(current_soft) >= limit:
+        return list(current_soft)[:limit]
+    extra = list(prev_soft - current_soft)
+    need = limit - len(current_soft)
+    return list(current_soft) + extra[:need]
 
 TYPE_LABELS = {
     0: ("Планове", "заплановані роботи (ремонт, обслуговування)"),
@@ -438,15 +467,16 @@ def main() -> int:
                             addr.get("house"),
                         )
 
-            # Кеш fps
+            # Кеш fps (soft_fps з капом, щоб документ не товстішав роками)
             if prev_fps or matched_fps or not new_outages:
+                soft_stored = merge_soft_fps(current_soft, prev_soft, SOFT_FPS_MAX)
                 outages_col.update_one(
                     {"_id": cache_key},
                     {
                         "$set": {
                             "ids": list(current_ids),
                             "fps": list(current_fps),
-                            "soft_fps": list(current_soft | prev_soft),
+                            "soft_fps": soft_stored,
                             "updated_at": datetime.now(timezone.utc),
                             "count": len(current_ids),
                         }
@@ -462,6 +492,29 @@ def main() -> int:
                 )
     finally:
         http.close()
+
+    # --- cleanup: тільки outages + застарілий outages_cache; ГПВ/users не чіпаємо ---
+    try:
+        if OUTAGES_RETENTION_HOURS > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=OUTAGES_RETENTION_HOURS)
+            del_out = outages_full.delete_many({"updated_at": {"$lt": cutoff}})
+            log.info(
+                "outages cleanup: deleted=%s older_than=%sh",
+                del_out.deleted_count,
+                OUTAGES_RETENTION_HOURS,
+            )
+        if OUTAGES_CACHE_RETENTION_DAYS > 0:
+            cache_cutoff = datetime.now(timezone.utc) - timedelta(
+                days=OUTAGES_CACHE_RETENTION_DAYS
+            )
+            del_cache = outages_col.delete_many({"updated_at": {"$lt": cache_cutoff}})
+            log.info(
+                "outages_cache cleanup: deleted=%s older_than=%sd",
+                del_cache.deleted_count,
+                OUTAGES_CACHE_RETENTION_DAYS,
+            )
+    except Exception as e:
+        log.warning("cleanup failed (non-fatal): %s", e)
 
     sent = 0
     for tid, outage_list in notified.items():
