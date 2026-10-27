@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 """
-Примусово очищає outages_cache (+ опційно старі outages),
-щоб наступний ztoe_outages_monitor побачив події як нові.
+Резервний повний скид даних power-on API (ЖОЕ accidents/planeds).
 
-НЕ чистить queue_schedules і users.
+Чистить:
+  - outages_cache  — дедуп нотифікацій (повністю)
+  - outages        — зліпок для /check (повністю)
 
-Використання:
+НЕ чіпає:
+  - queue_schedules (ГПВ з monitor/сайту)
+  - users
+  - ukrenergo2_states / regionstatuses
+  - accidents_summary
+  - site_meta / GridFS
+
+Після цього обов'язково запусти ztoe_outages_monitor
+(workflow «ZTOE outages»), щоб знову наповнити outages + cache з API.
+
   python ztoe_outages_force_diff.py
-  # потім:
   python ztoe_outages_monitor.py
-  (або workflow ztoe-outages.yml)
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from pymongo import MongoClient
 
@@ -35,34 +43,35 @@ def main() -> int:
 
     client = MongoClient(uri, serverSelectionTimeoutMS=8000)
     db = client[db_name]
-    now = datetime.now(timezone.utc)
-    now_s = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_s = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # 1) cache — завжди
+    # 1) outages_cache — повний wipe
     cache = db["outages_cache"]
     before_cache = cache.count_documents({})
     r1 = cache.delete_many({})
-    print(f"[{now_s}] outages_cache: видалено {r1.deleted_count} (було {before_cache})")
+    print(
+        f"[{now_s}] outages_cache: видалено {r1.deleted_count} "
+        f"(було {before_cache})"
+    )
 
-    # 2) старі outages (старіше 3 днів) — щоб DM не тягнув сміття
+    # 2) outages — повний wipe (усе з power-on API)
     outages = db["outages"]
-    cutoff = now - timedelta(days=3)
     before_out = outages.count_documents({})
-    # updated_at або dateEvent
-    r2 = outages.delete_many({
-        "$or": [
-            {"updated_at": {"$lt": cutoff}},
-            {"dateEvent": {"$lt": (cutoff).strftime("%Y-%m-%d")}},
-            {"date_from": {"$lt": (cutoff).strftime("%Y-%m-%d")}},
-        ]
-    })
+    r2 = outages.delete_many({})
     after_out = outages.count_documents({})
     print(
-        f"[{now_s}] outages: видалено старих {r2.deleted_count} "
+        f"[{now_s}] outages: видалено {r2.deleted_count} "
         f"(було {before_out}, лишилось {after_out})"
     )
 
-    print("Тепер запусти ztoe_outages_monitor — він заново заповнить outages і cache.")
+    print(
+        "Готово. Не чіпали: queue_schedules, users, ukrenergo*, "
+        "accidents_summary, site_meta."
+    )
+    print(
+        "Далі запусти workflow «ZTOE outages» (ztoe_outages_monitor.py), "
+        "щоб заново заповнити outages і cache з API."
+    )
     return 0
 
 
