@@ -600,13 +600,30 @@ def addr_matches_queue(addr: dict, queue_key: str) -> bool:
     return False
 
 
+def _dates_in_records(records: List[Dict]) -> List[str]:
+    """Унікальні дати з records → YYYY-MM-DD, відсортовані."""
+    found = set()
+    for r in records or []:
+        nk = normalize_date_key(r.get("date") or "")
+        if nk:
+            found.add(nk)
+    return sorted(found)
+
+
 def sync_schedules_to_mongo(
     norm_by_queue: Dict[str, List[Dict]],
     queue_keys: Optional[List[str]] = None,
 ) -> None:
     """
-    Пише слоти у Mongo (queue_schedules) лише для вказаних черг.
-    Викликати ТІЛЬКИ коли є зміни в графіку.
+    Пише слоти у Mongo (queue_schedules).
+
+    Важливо: при будь-якому diff / зміні набору дат треба оновлювати
+    УСІ черги з current.json, інакше в Mongo лишається старий date
+    (напр. 27.10) і /check показує «світло весь день» за вчорашній день,
+    хоча скрін і API вже на 28.10.
+
+    date / slots беруться з реальних дат у records (current.json),
+    а не лише з «сьогодні по годиннику раннера».
     """
     mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
     if not mongo_uri:
@@ -619,17 +636,22 @@ def sync_schedules_to_mongo(
         log_to_buffer(f"⚠️ Не вдалося імпортувати mongo_store: {e}")
         return
 
-    keys = list(queue_keys) if queue_keys is not None else list(norm_by_queue.keys())
+    # None або порожній список → усі черги з поточного зрізу
+    if queue_keys is None:
+        keys = list(norm_by_queue.keys())
+    else:
+        keys = list(queue_keys) if queue_keys else list(norm_by_queue.keys())
     if not keys:
         log_to_buffer("ℹ️ Немає черг для запису в Mongo")
         return
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
+    # Fallback, якщо в records раптом немає дат
+    clock_today = datetime.now().strftime("%Y-%m-%d")
+    clock_tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
     saved = 0
     errors = 0
+    sample_dates = None
 
     for queue_key in sorted(keys):
         records = norm_by_queue.get(queue_key) or []
@@ -638,26 +660,40 @@ def sync_schedules_to_mongo(
             if not cherga:
                 continue
 
-            slots_today = records_to_slots_for_date(records, today)
-            slots_tomorrow = records_to_slots_for_date(records, tomorrow)
+            dates = _dates_in_records(records)
+            if dates:
+                day0 = dates[0]
+                day1 = dates[1] if len(dates) > 1 else None
+            else:
+                day0 = clock_today
+                day1 = clock_tomorrow
+
+            if sample_dates is None:
+                sample_dates = dates or [day0]
+
+            slots_today = records_to_slots_for_date(records, day0)
+            slots_tomorrow = (
+                records_to_slots_for_date(records, day1) if day1 else []
+            )
             text_parts = [f"{s['from']}–{s['to']}" for s in slots_today]
             text = ", ".join(text_parts) if text_parts else "немає відключень"
             extra = {
                 "slots_tomorrow": slots_tomorrow,
                 "queue_key": queue_key,
                 "source": "monitor.py",
+                "dates_in_source": dates,
             }
 
             # Ключ 4|2 і alias 4.2 — бот шукає обидва
             upsert_queue_schedule(
                 cherga, pidcherga,
                 slots=slots_today, events=slots_today,
-                text=text, date=today, known=True, extra=extra,
+                text=text, date=day0, known=True, extra=extra,
             )
             upsert_queue_schedule(
                 queue_key, "",
                 slots=slots_today, events=slots_today,
-                text=text, date=today, known=True, extra=extra,
+                text=text, date=day0, known=True, extra=extra,
             )
             saved += 1
         except Exception as e:
@@ -665,7 +701,7 @@ def sync_schedules_to_mongo(
             log_to_buffer(f"⚠️ Mongo queue {queue_key}: {e}")
 
     log_to_buffer(
-        f"🗄 Mongo: збережено {saved} черг (зі змінами), помилок={errors}"
+        f"🗄 Mongo: збережено {saved} черг (dates={sample_dates}), помилок={errors}"
     )
 
 
@@ -874,10 +910,16 @@ def main():
                 else:
                     log_to_buffer("❌ Помилка надсилання повідомлення про новий графік")
 
-        # 9b. Тільки при змінах: Mongo (слоти) і DM підписникам бота
+        # 9b. При будь-якому diff — повний sync УСІХ черг у Mongo.
+        # Інакше черги без зміни слотів лишаються з вчорашнім date
+        # і /check показує «світло весь день» за старий день.
         changed_queues = list(diff.get("queues") or [])
         try:
-            sync_schedules_to_mongo(norm_by_queue, queue_keys=changed_queues)
+            log_to_buffer(
+                f"🗄 Повний sync queue_schedules для {len(norm_by_queue)} черг "
+                f"(changed={len(changed_queues)}, new_dates={diff.get('new_dates')})"
+            )
+            sync_schedules_to_mongo(norm_by_queue, queue_keys=None)
         except Exception as e:
             log_to_buffer(f"❌ sync_schedules_to_mongo: {e}")
 

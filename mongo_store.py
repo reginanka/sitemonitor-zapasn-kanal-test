@@ -19,6 +19,8 @@ from typing import Any, Optional
 from pymongo import MongoClient
 from gridfs import GridFS
 
+# Єдиний ланцюг імені БД для monitor / ukrenergo2 / бота ztoe.
+# У GitHub Secrets виставте ZTOE_MONGO_DB (або MONGO_DB) однаково для всіх workflow.
 DB_NAME = (
     os.getenv("ZTOE_MONGO_DB")
     or os.getenv("MONGO_DB")

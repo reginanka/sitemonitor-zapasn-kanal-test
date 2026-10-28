@@ -36,10 +36,14 @@ MONGO_URI = (
     or os.getenv("MONGO_URI")
     or ""
 ).strip()
+# Той самий ланцюг, що mongo_store.py / бот ztoe (не powerbot!).
+# Інакше статус пишеться в одну БД, а /check читає з іншої.
 MONGO_DB = (
-    os.getenv("MAYACHOK_MONGO_DB")
+    os.getenv("ZTOE_MONGO_DB")
+    or os.getenv("MONGO_DB")
+    or os.getenv("MAYACHOK_MONGO_DB")
     or os.getenv("MONGO_DB_NAME")
-    or "powerbot"
+    or "vidkluchennya"
 ).strip()
 # Колекція стану Укренерго 2
 COLLECTION = "ukrenergo2_states"
@@ -156,7 +160,8 @@ def save_state(snapshot: Dict) -> None:
     )
     log_to_buffer(
         f"💾 Mongo: стан збережено в {COLLECTION} "
-        f"(slug={REGION_SLUG}, status={doc.get('status')})"
+        f"(db={MONGO_DB}, slug={REGION_SLUG}, status={doc.get('status')}, "
+        f"period={doc.get('period')})"
     )
 
     if SYNC_REGIONSTATUS:
@@ -521,16 +526,17 @@ def main() -> None:
             return
 
         if comparable(previous) == comparable(current):
-            # Оновлюємо лише checked_at, без сповіщення
+            # Статус той самий — сповіщення не шлемо, АЛЕ повністю
+            # перезаписуємо знімок (period/generated_at/emoji…), щоб /check
+            # не тримав застарілий «Прогнозований період».
             try:
-                db = _get_db()
-                db[COLLECTION].update_one(
-                    {"slug": REGION_SLUG},
-                    {"$set": {"checked_at": current.get("checked_at")}},
+                save_state(current)
+                log_to_buffer(
+                    "✅ Статус регіону не змінився — знімок у Mongo оновлено "
+                    f"(period/checked_at), db={MONGO_DB}"
                 )
-            except Exception:
-                pass
-            log_to_buffer("✅ Статус регіону не змінився")
+            except Exception as e:
+                log_to_buffer(f"⚠️ Не вдалось оновити знімок без зміни статусу: {e}")
             return
 
         log_to_buffer(
