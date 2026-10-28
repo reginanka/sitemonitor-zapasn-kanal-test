@@ -6,7 +6,7 @@
 - Рахує унікальні вулиці / нас. пункти по РЕМ
 - Під кожним РЕМ — топ населених пунктів (географія)
 - Завжди зберігає знімок у Mongo (accidents_summary: latest + історія по годині)
-- У Telegram-канал шле лише при ескалації рівня або першому WARN+ за день
+- У Telegram-канал шле ЛИШЕ при рівні CRITICAL
   (антиспам: last_notified_date / last_notified_level у Mongo)
 - FORCE_NOTIFY=1 — примусово в канал
 - Лог у TELEGRAM_LOG_CHANNEL_ID
@@ -215,10 +215,8 @@ def should_notify_channel(
     Mongo — завжди. Канал — без щогодинного спаму.
 
     1) FORCE_NOTIFY=1/true/yes — завжди слати
-    2) Ескалація відносно last_notified_level (WARN+) — слати
-    3) Сьогодні ще не слали і рівень WARN+ — слати
-    4) Сьогодні вже слали і рівень не виріс — НЕ слати
-    5) NORM — у канал не слати
+    2) Рівень CRITICAL і ескалація (або перше за день) — слати
+    3) Всі інші рівні (NORM / WARN / HIGH) — у канал не слати
     """
     force = (os.getenv("FORCE_NOTIFY") or "").strip().lower() in ("1", "true", "yes")
     if force:
@@ -234,19 +232,20 @@ def should_notify_channel(
         LEVEL_ORDER.get(last_notified_level, -1) if last_notified_level else -1
     )
 
-    # Ескалація (навіть якщо вже писали сьогодні)
-    if rank > last_rank and rank >= LEVEL_ORDER["WARN"]:
+    # Тільки CRITICAL
+    if rank < LEVEL_ORDER["CRITICAL"]:
+        return False, f"рівень {level}, у канал не шлемо (тільки CRITICAL)"
+
+    # Ескалація до CRITICAL (навіть якщо вже писали сьогодні)
+    if rank > last_rank:
         return True, f"ескалація {last_notified_level or '—'} → {level}"
 
     # Сьогодні вже є сповіщення — не спамимо
     if last_date == today and last_rank >= 0:
         return False, f"вже сповіщали сьогодні ({last_notified_level}, {last_date})"
 
-    # Перше за день при WARN+
-    if rank >= LEVEL_ORDER["WARN"]:
-        return True, f"перше сповіщення за день, рівень {level}"
-
-    return False, f"рівень {level}, у канал не шлемо"
+    # Перше за день при CRITICAL
+    return True, f"перше сповіщення за день, рівень {level}"
 
 
 def severity_emoji(streets: int) -> str:
