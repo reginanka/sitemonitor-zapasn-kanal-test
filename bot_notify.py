@@ -115,7 +115,8 @@ def queue_label(queue: str, subqueue: str = "") -> str:
         if not re.match(r"^[\d.]+$", q.replace("|", ".")):
             return ""
         return q.replace("|", ".")
-    if sq and sq != q and re.match(r"^[\d.]+$", sq):
+    # підчерга може збігатися з чергою (1.1, 2.2) — не вимагати sq != q
+    if sq and re.match(r"^[\d.]+$", sq):
         return f"{q}.{sq}"
     if re.match(r"^[\d.]+$", q):
         return q
@@ -131,10 +132,11 @@ def format_address(addr: dict) -> str:
         sq = (addr.get("subqueue") or "").strip()
         if _is_no_gpv_queue(q) or _is_no_gpv_queue(sq):
             return "не вимикають, крім аварійних"
-        if q and re.match(r"^[\d.]+$", q.replace("|", ".")):
-            lab = q.replace("|", ".")
-        elif q and sq and re.match(r"^[\d.]+$", sq):
+        # спочатку збираємо q.sq (інакше «1»+«1» стає просто «1»)
+        if q and sq and re.match(r"^[\d.]+$", q) and re.match(r"^[\d.]+$", sq) and "." not in q:
             lab = f"{q}.{sq}"
+        elif q and re.match(r"^[\d.]+$", q.replace("|", ".")):
+            lab = q.replace("|", ".")
         else:
             lab = q or "?"
         return f"Черга {lab}"
