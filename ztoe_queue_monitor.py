@@ -389,6 +389,28 @@ def fetch_queue(otg_name: str, city_name: str, street_name: str) -> dict:
         return info
 
 
+
+def _short_queue_label(queue: str = "", subqueue: str = "", note: str = "") -> str:
+    """Короткий рядок черги для «було / стало»."""
+    q = (queue or "").strip()
+    sq = (subqueue or "").strip()
+    q_low = q.lower()
+    if any(m in q_low for m in ("не вимикається", "не вимикають", "не відключається", "не відключають")):
+        base = "не вимикають, крім аварійних"
+    elif sq and sq != q and len(sq) < 40 and re.match(r"^[\d.]+$", sq):
+        base = f"черга {q}, підчерга {sq}"
+    elif re.match(r"^[\d.]+$", q):
+        base = f"черга {q}" + (f", підчерга {sq}" if sq and re.match(r"^[\d.]+$", sq) else "")
+    elif q:
+        base = q if len(q) < 80 else "не вимикають, крім аварійних"
+    else:
+        base = "—"
+    n = (note or "").strip()
+    if n and n not in base:
+        base = f"{base} ({n})" if len(n) < 60 else base
+    return base
+
+
 def format_queue_msg(info: dict) -> str:
     q = info.get("queue") or "—"
     sq = info.get("subqueue") or ""
@@ -573,6 +595,7 @@ def main() -> int:
             touched = False
             notify_info = None
             notify_label_house = ""
+            notify_old = {}
 
             for a in addrs:
                 if not addr_matches_doc(a, doc):
@@ -610,6 +633,11 @@ def main() -> int:
                     changed += 1
                     notify_info = info
                     notify_label_house = house
+                    notify_old = {
+                        "queue": a.get("queue") or "",
+                        "subqueue": a.get("subqueue") or "",
+                        "note": a.get("queue_note") or "",
+                    }
                     log.info(
                         "Зміна черги: %s house=%s old_fp=%s new_fp=%s matched=%s",
                         label, house or "—", old_fp[:40], new_fp[:40],
@@ -632,10 +660,21 @@ def main() -> int:
             city_s = city
             street_s = street
             house_bit = f", буд. {notify_label_house}" if notify_label_house else ""
+            was = _short_queue_label(
+                notify_old.get("queue", ""),
+                notify_old.get("subqueue", ""),
+                notify_old.get("note", ""),
+            )
+            now = _short_queue_label(
+                notify_info.get("queue", ""),
+                notify_info.get("subqueue", ""),
+                notify_info.get("note", ""),
+            )
             text_msg = (
                 "🔔 <b>Змінилася черга відключень:</b>\n\n"
-                f"<b>{city_s}, {street_s}{house_bit}</b>\n"
-                f"{format_queue_msg(notify_info)}"
+                f"<b>{city_s}, {street_s}{house_bit}</b>\n\n"
+                f"Було: <b>{was}</b>\n"
+                f"Стало: <b>{now}</b>"
             )
             try:
                 async def _send(tid=user["telegram_id"], body=text_msg):
