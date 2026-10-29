@@ -362,8 +362,8 @@ def main() -> None:
     except Exception as e:
         log_to_buffer(f"❌ Критична помилка Укренерго: {e}")
     finally:
-        # 154 — гілка «Ситуація крон»
-        send_log_to_channel("📊 ЛОГ ВИКОНАННЯ СКРИПТА · УКРЕНЕРГО", message_thread_id=154)
+        # 152 — гілка «Укренерго2 крон» (обидва Укренерго)
+        send_log_to_channel("📊 ЛОГ ВИКОНАННЯ СКРИПТА · УКРЕНЕРГО", message_thread_id=152)
 
 
 if __name__ == "__main__":

@@ -72,7 +72,7 @@ except Exception:
     def _lu_log(msg: str) -> None:
         pass
 
-    def _lu_send(title: str = "") -> None:
+    def _lu_send(title: str = "", message_thread_id=None) -> None:
         pass
 
 
@@ -86,7 +86,7 @@ def log_to_buffer(msg: str) -> None:
         pass
 
 
-def send_log_to_channel(title: str = "📊 ЛОГ · АВАРІЇ ЖОЕ") -> None:
+def send_log_to_channel(title: str = "📊 ЛОГ · АВАРІЇ ЖОЕ", message_thread_id: int | None = 154) -> None:
     """
     Шле лог у TELEGRAM_LOG_CHANNEL_ID.
     1) пробує log_utils
@@ -94,7 +94,7 @@ def send_log_to_channel(title: str = "📊 ЛОГ · АВАРІЇ ЖОЕ") -> No
     """
     try:
         if _HAS_LOG_UTILS:
-            _lu_send(title)
+            _lu_send(title, message_thread_id=message_thread_id)
     except Exception as e:
         print(f"log_utils send failed: {e}")
 
@@ -111,14 +111,17 @@ def send_log_to_channel(title: str = "📊 ЛОГ · АВАРІЇ ЖОЕ") -> No
         if len(text_msg) > 4000:
             text_msg = text_msg[:3900] + "\n…</pre>"
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        r = httpx.post(
-            url,
-            data={
+        data = {
                 "chat_id": chat_id,
                 "text": text_msg,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": "true",
-            },
+            }
+        if message_thread_id is not None:
+            data["message_thread_id"] = message_thread_id
+        r = httpx.post(
+            url,
+            data=data,
             timeout=15,
         )
         if r.status_code == 200:
@@ -616,7 +619,7 @@ def main() -> int:
         accidents = fetch_all_accidents()
     except Exception as e:
         log_to_buffer(f"❌ Fetch failed: {e}")
-        send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ (помилка)")
+        send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ (помилка)", message_thread_id=154)
         return 1
 
     as_of = datetime.now(KYIV)
@@ -654,7 +657,7 @@ def main() -> int:
             prev=prev,
         )
         # при порожньому API в канал не шлемо (база оновлена)
-        send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ")
+        send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ", message_thread_id=154)
         return 0
 
     stats = aggregate(accidents)
@@ -702,7 +705,7 @@ def main() -> int:
         prev=prev,
     )
 
-    send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ")
+    send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ", message_thread_id=154)
     if do_notify and not notified_ok:
         return 1
     return 0

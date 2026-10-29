@@ -125,54 +125,208 @@ def _best_match(options: list[tuple[str, str]], query: str) -> Optional[tuple[st
 
 
 def _parse_result_table(soup: BeautifulSoup) -> list[dict]:
-    results = []
+    """Усі рядки таблиці результату (не лише перший)."""
+    results: list[dict] = []
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
         for i, row in enumerate(rows):
-            cols_raw = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-            if not cols_raw or cols_raw[0] != "РЕМ":
+            headers = [c.get_text(strip=True).lower() for c in row.find_all(["th", "td"])]
+            if not any("черг" in h for h in headers):
                 continue
-            if not any(c == "Черга" for c in cols_raw):
-                continue
-            headers = [c.lower() for c in cols_raw]
 
-            def idx(*names):
+            def idx(*needles: str) -> int | None:
                 for j, h in enumerate(headers):
-                    for n in names:
-                        if n in h:
-                            return j
+                    if any(n in h for n in needles):
+                        return j
                 return None
 
-            i_queue = idx("черга")
-            i_sub = idx("підчерг")
+            i_queue = idx("черг")
+            i_sub = idx("підчерг", "подчерг")
             i_houses = idx("будинк")
             i_note = idx("приміт")
             i_rem = idx("рем")
             i_city = idx("населен")
             i_street = idx("назв", "вулиц")
 
-            if i + 1 >= len(rows):
-                continue
-            cols = [c.get_text(strip=True) for c in rows[i + 1].find_all(["td", "th"])]
-            if len(cols) < 5 or cols[0] == "РЕМ":
-                continue
+            for r in rows[i + 1 :]:
+                cols = [c.get_text(strip=True) for c in r.find_all(["td", "th"])]
+                if len(cols) < 3:
+                    continue
+                if cols and cols[0] == "РЕМ":
+                    continue
+                if not any(cols):
+                    continue
 
-            results.append({
-                "rem": cols[i_rem] if i_rem is not None and i_rem < len(cols) else "",
-                "city": cols[i_city] if i_city is not None and i_city < len(cols) else "",
-                "street": cols[i_street] if i_street is not None and i_street < len(cols) else "",
-                "houses": cols[i_houses] if i_houses is not None and i_houses < len(cols) else "",
-                "queue": cols[i_queue] if i_queue is not None and i_queue < len(cols) else "",
-                "subqueue": cols[i_sub] if i_sub is not None and i_sub < len(cols) else "",
-                "note": cols[i_note] if i_note is not None and i_note < len(cols) else "",
-            })
+                rem = cols[i_rem] if i_rem is not None and i_rem < len(cols) else ""
+                city = cols[i_city] if i_city is not None and i_city < len(cols) else ""
+                street = cols[i_street] if i_street is not None and i_street < len(cols) else ""
+                houses = cols[i_houses] if i_houses is not None and i_houses < len(cols) else ""
+                queue = cols[i_queue] if i_queue is not None and i_queue < len(cols) else ""
+                subqueue = cols[i_sub] if i_sub is not None and i_sub < len(cols) else ""
+                note = cols[i_note] if i_note is not None and i_note < len(cols) else ""
+
+                if _is_time_token(houses) or _is_time_token(city) or _is_time_token(street):
+                    continue
+                if not rem and not city and not street:
+                    continue
+                if _is_time_token(queue) or _is_time_token(subqueue):
+                    continue
+                # рядок сітки черг без адреси
+                if not street and not houses and re.match(r"^[\d.]+$", (rem or "").strip()):
+                    continue
+
+                results.append({
+                    "rem": rem,
+                    "city": city,
+                    "street": street,
+                    "houses": houses,
+                    "queue": queue,
+                    "subqueue": subqueue,
+                    "note": note,
+                })
             if results:
                 return results
     return results
 
 
+_TIME_TOKEN_RE = re.compile(
+    r"^\d{1,2}:\d{2}(\s*[-–—]\s*\d{1,2}:\d{2})?$"
+)
+
+
+def _is_time_token(s: str) -> bool:
+    return bool(_TIME_TOKEN_RE.match((s or "").strip()))
+
+
+def _split_house_tokens(houses_str: str) -> list[str]:
+    if not houses_str:
+        return []
+    parts = []
+    for p in houses_str.replace(";", ",").split(","):
+        p = p.strip()
+        if not p or _is_time_token(p):
+            continue
+        parts.append(p)
+    return parts
+
+
+def _house_in_list(house: str, houses_str: str) -> bool:
+    h = (house or "").strip().lower().replace(" ", "")
+    if not h:
+        return False
+    for tok in _split_house_tokens(houses_str):
+        t = tok.strip().lower().replace(" ", "")
+        if t == h or t.rstrip(".") == h.rstrip("."):
+            return True
+        # діапазони типу 1-5 / 10–20
+        m = re.match(r"^(\d+)\s*[-–—]\s*(\d+)$", t)
+        if m and h.isdigit():
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo <= int(h) <= hi:
+                return True
+    return False
+
+
+def _aggregate_street_rows(rows: list[dict]) -> dict:
+    """Збирає всі будинки вулиці + house → row."""
+    if not rows:
+        return {"error": "no_rows", "message": "Немає запису черги для адреси"}
+
+    all_houses: list[str] = []
+    seen_h: set[str] = set()
+    house_to_row: dict[str, dict] = {}
+    for row in rows:
+        tokens = _split_house_tokens(row.get("houses") or "")
+        if not tokens:
+            continue
+        for tok in tokens:
+            key = tok.strip().lower().replace(" ", "")
+            if key not in seen_h:
+                seen_h.add(key)
+                all_houses.append(tok.strip())
+            if key not in house_to_row:
+                house_to_row[key] = row
+
+    base = rows[0]
+    if not all_houses:
+        # вся вулиця одним рядком / без номерів
+        return {
+            "ok": True,
+            "queue": base.get("queue") or "",
+            "subqueue": base.get("subqueue") or "",
+            "houses": base.get("houses") or "",
+            "note": base.get("note") or "",
+            "matched_rem": base.get("rem") or "",
+            "matched_city": base.get("city") or "",
+            "matched_street": base.get("street") or "",
+            "rows": rows,
+            "house_map": {},
+            "all_houses": [],
+        }
+
+    return {
+        "ok": True,
+        "queue": base.get("queue") or "",
+        "subqueue": base.get("subqueue") or "",
+        "houses": ", ".join(all_houses),
+        "note": base.get("note") or "",
+        "matched_rem": base.get("rem") or "",
+        "matched_city": base.get("city") or "",
+        "matched_street": base.get("street") or "",
+        "rows": rows,
+        "all_houses": all_houses,
+        "house_map": house_to_row,
+        "multi_queue": len({
+            ((r.get("queue") or "").strip(), (r.get("subqueue") or "").strip())
+            for r in rows
+        }) > 1,
+    }
+
+
+def apply_house_to_info(info: dict, house: str | None) -> dict:
+    """
+    Якщо в користувача є номер будинку — беремо чергу саме для нього.
+    Якщо будинок не входить у жоден список довідника — це «немає черги / не вимикають»
+    (не беремо чужий рядок на кшталт «120 · непобутові»).
+    """
+    if not info.get("ok"):
+        return info
+    house = (house or "").strip()
+    if not house:
+        return info
+
+    # 1) точний ключ у house_map
+    hmap = info.get("house_map") or {}
+    key = house.lower().replace(" ", "")
+    row = hmap.get(key)
+    if row is None:
+        # 2) пошук через _house_in_list (діапазони тощо)
+        for r in info.get("rows") or []:
+            if _house_in_list(house, r.get("houses") or ""):
+                row = r
+                break
+
+    out = dict(info)
+    out["house"] = house
+    if row is not None:
+        out["queue"] = row.get("queue") or ""
+        out["subqueue"] = row.get("subqueue") or ""
+        out["houses"] = row.get("houses") or house
+        out["note"] = row.get("note") or ""
+        out["house_matched"] = True
+        return out
+
+    # будинок не знайдено в довіднику → не присвоюємо чужу чергу
+    out["queue"] = "не вимикають, крім аварійних"
+    out["subqueue"] = ""
+    out["houses"] = house
+    out["note"] = "номер не в списках черг довідника"
+    out["house_matched"] = False
+    return out
+
+
 def fetch_queue(otg_name: str, city_name: str, street_name: str) -> dict:
-    """Повертає dict з queue/subqueue/... або error + temporary."""
+    """Повертає dict з queue/subqueue/house_map/... або error + temporary."""
     with httpx.Client(timeout=25, follow_redirects=True, headers=HEADERS) as client:
         r = client.post(BASE, data={})
         r.raise_for_status()
@@ -228,17 +382,11 @@ def fetch_queue(otg_name: str, city_name: str, street_name: str) -> dict:
         if not rows:
             return {"error": "no_rows", "message": "Немає запису черги для адреси"}
 
-        row = rows[0]
-        return {
-            "ok": True,
-            "queue": row.get("queue") or "",
-            "subqueue": row.get("subqueue") or "",
-            "houses": row.get("houses") or "",
-            "note": row.get("note") or "",
-            "matched_rem": rem[1],
-            "matched_city": city[1],
-            "matched_street": street[1],
-        }
+        info = _aggregate_street_rows(rows)
+        info["matched_rem"] = rem[1]
+        info["matched_city"] = city[1]
+        info["matched_street"] = street[1]
+        return info
 
 
 def format_queue_msg(info: dict) -> str:
@@ -250,7 +398,6 @@ def format_queue_msg(info: dict) -> str:
         for m in ("не вимикається", "не вимикають", "не відключається", "не відключають")
     )
     if no_gpv:
-        # без дубля queue+subqueue і без довгого тексту двічі
         line = "не вимикають, крім аварійних"
     elif sq and sq != q and len(sq) < 40 and re.match(r"^[\d.]+$", sq.strip()):
         line = f"Черга: <b>{q}</b>, підчерга: <b>{sq}</b>"
@@ -261,7 +408,10 @@ def format_queue_msg(info: dict) -> str:
     else:
         line = q if len(q) < 80 else "не вимикають, крім аварійних"
     parts = [line]
-    if info.get("houses"):
+    house = (info.get("house") or "").strip()
+    if house:
+        parts.append(f"🏠 Буд. <b>{house}</b>")
+    elif info.get("houses"):
         parts.append(f"🏘 Будинки: {info['houses']}")
     if info.get("note"):
         parts.append(f"📝 {info['note']}")
@@ -351,7 +501,7 @@ def main() -> int:
         checked += 1
 
         try:
-            info = fetch_queue(otg, city, street)
+            street_info = fetch_queue(otg, city, street)
         except Exception as e:
             log.exception("Помилка запиту для %s: %s", label, e)
             directory.update_one(
@@ -364,114 +514,143 @@ def main() -> int:
             errors += 1
             continue
 
-        if info.get("temporary"):
-            log.warning("Тимчасово недоступно: %s — %s", label, info.get("message"))
+        if street_info.get("temporary"):
+            log.warning("Тимчасово недоступно: %s — %s", label, street_info.get("message"))
             directory.update_one(
                 {"_id": doc["_id"]},
                 {"$set": {
-                    "last_error": info.get("message") or "temporary",
+                    "last_error": street_info.get("message") or "temporary",
                     "last_check_at": datetime.now(timezone.utc),
                 }},
             )
             skipped_temp += 1
-            # не затираємо стару чергу
             continue
 
-        if info.get("error"):
-            log.warning("Не знайдено: %s — %s", label, info.get("message"))
+        if street_info.get("error"):
+            log.warning("Не знайдено: %s — %s", label, street_info.get("message"))
             directory.update_one(
                 {"_id": doc["_id"]},
                 {"$set": {
-                    "last_error": info.get("message") or info.get("error"),
+                    "last_error": street_info.get("message") or street_info.get("error"),
                     "last_check_at": datetime.now(timezone.utc),
                 }},
             )
             errors += 1
             continue
 
-        new_fp = queue_fingerprint(
-            info.get("queue", ""),
-            info.get("subqueue", ""),
-            info.get("houses", ""),
-            info.get("note", ""),
+        # street-level snapshot у directory (для діагностики; сповіщення — per-house)
+        street_fp = queue_fingerprint(
+            street_info.get("queue", ""),
+            street_info.get("subqueue", ""),
+            street_info.get("houses", ""),
+            street_info.get("note", ""),
         )
-        old_fp = doc.get("queue_fp") or ""
+        directory.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {
+                "queue": street_info.get("queue", ""),
+                "subqueue": street_info.get("subqueue", ""),
+                "houses": street_info.get("houses", ""),
+                "note": street_info.get("note", ""),
+                "queue_fp": street_fp,
+                "matched_rem": street_info.get("matched_rem"),
+                "matched_city": street_info.get("matched_city"),
+                "matched_street": street_info.get("matched_street"),
+                "all_houses": street_info.get("all_houses") or [],
+                "updated_at": datetime.now(timezone.utc),
+                "last_check_at": datetime.now(timezone.utc),
+                "last_error": None,
+            }},
+        )
 
-        update_fields = {
-            "queue": info.get("queue", ""),
-            "subqueue": info.get("subqueue", ""),
-            "houses": info.get("houses", ""),
-            "note": info.get("note", ""),
-            "queue_fp": new_fp,
-            "matched_rem": info.get("matched_rem"),
-            "matched_city": info.get("matched_city"),
-            "matched_street": info.get("matched_street"),
-            "updated_at": datetime.now(timezone.utc),
-            "last_check_at": datetime.now(timezone.utc),
-            "last_error": None,
-        }
-        directory.update_one({"_id": doc["_id"]}, {"$set": update_fields})
+        # Користувачі з цією вулицею — черга рахується по їхньому номеру будинку
+        cursor = users.find({"notify": True})
+        for user in cursor:
+            addrs = user.get("addresses") or (
+                [user["address"]] if user.get("address") else []
+            )
+            new_addrs = []
+            touched = False
+            notify_info = None
+            notify_label_house = ""
 
-        if old_fp and new_fp and old_fp != new_fp:
-            changed += 1
-            log.info("Зміна черги: %s", label)
-
-            # знайти користувачів з цією адресою
-            cursor = users.find({"notify": True})
-            for user in cursor:
-                addrs = user.get("addresses") or (
-                    [user["address"]] if user.get("address") else []
-                )
-                touched = False
-                new_addrs = []
-                for a in addrs:
-                    if addr_matches_doc(a, doc):
-                        a = {
-                            **a,
-                            "queue": update_fields["queue"],
-                            "subqueue": update_fields["subqueue"],
-                            "queue_houses": update_fields["houses"],
-                            "queue_note": update_fields["note"],
-                            "queue_fp": new_fp,
-                            "queue_updated_at": datetime.now(timezone.utc).isoformat(),
-                            "queue_key": doc["_id"],
-                        }
-                        touched = True
+            for a in addrs:
+                if not addr_matches_doc(a, doc):
                     new_addrs.append(a)
-
-                if not touched:
                     continue
 
-                users.update_one(
-                    {"telegram_id": user["telegram_id"]},
-                    {"$set": {"addresses": new_addrs}, "$unset": {"address": ""}},
+                house = (a.get("house") or "").strip()
+                info = apply_house_to_info(street_info, house)
+                new_fp = queue_fingerprint(
+                    info.get("queue", ""),
+                    info.get("subqueue", ""),
+                    # у fp кладемо саме house (не весь список), щоб не плутати з чужими номерами
+                    house or (info.get("houses") or ""),
+                    info.get("note", ""),
                 )
+                old_fp = a.get("queue_fp") or ""
 
-                text = (
-                    "🔔 <b>Змінилася черга відключень:</b>\n\n"
-                    f"<b>{city}, {street}</b>\n"
-                    f"{format_queue_msg(info)}"
-                )
-                try:
-                    import asyncio
+                updated = {
+                    **a,
+                    "queue": info.get("queue", ""),
+                    "subqueue": info.get("subqueue", ""),
+                    "queue_houses": info.get("houses", ""),
+                    "queue_note": info.get("note", ""),
+                    "queue_fp": new_fp,
+                    "queue_updated_at": datetime.now(timezone.utc).isoformat(),
+                    "queue_key": doc["_id"],
+                }
+                if house:
+                    updated["house"] = house
 
-                    async def _send():
-                        await bot.send_message(
-                            chat_id=user["telegram_id"],
-                            text=text,
-                            parse_mode="HTML",
-                        )
+                new_addrs.append(updated)
+                touched = True
 
-                    asyncio.run(_send())
-                    notified_users += 1
-                    log.info("Сповіщено %s", user["telegram_id"])
-                    time.sleep(0.3)
-                except Exception as e:
-                    log.error("Не вдалося надіслати %s: %s", user.get("telegram_id"), e)
+                if old_fp and new_fp and old_fp != new_fp:
+                    changed += 1
+                    notify_info = info
+                    notify_label_house = house
+                    log.info(
+                        "Зміна черги: %s house=%s old_fp=%s new_fp=%s matched=%s",
+                        label, house or "—", old_fp[:40], new_fp[:40],
+                        info.get("house_matched"),
+                    )
+                elif not old_fp and new_fp:
+                    log.info("Перша фіксація черги (без notify): %s house=%s", label, house or "—")
 
-        elif not old_fp and new_fp:
-            # перший успішний запис без сповіщення (щоб не спамити історією)
-            log.info("Перша фіксація черги (без notify): %s", label)
+            if not touched:
+                continue
+
+            users.update_one(
+                {"telegram_id": user["telegram_id"]},
+                {"$set": {"addresses": new_addrs}, "$unset": {"address": ""}},
+            )
+
+            if notify_info is None:
+                continue
+
+            city_s = city
+            street_s = street
+            house_bit = f", буд. {notify_label_house}" if notify_label_house else ""
+            text_msg = (
+                "🔔 <b>Змінилася черга відключень:</b>\n\n"
+                f"<b>{city_s}, {street_s}{house_bit}</b>\n"
+                f"{format_queue_msg(notify_info)}"
+            )
+            try:
+                async def _send(tid=user["telegram_id"], body=text_msg):
+                    await bot.send_message(
+                        chat_id=tid,
+                        text=body,
+                        parse_mode="HTML",
+                    )
+
+                asyncio.run(_send())
+                notified_users += 1
+                log.info("Сповіщено %s", user["telegram_id"])
+                time.sleep(0.3)
+            except Exception as e:
+                log.error("Не вдалося надіслати %s: %s", user.get("telegram_id"), e)
 
     summary = (
         f"✅ <b>Перевірка черг</b>\n\n"
