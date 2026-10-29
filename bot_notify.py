@@ -416,18 +416,33 @@ def _day_offset(date_str: str) -> int:
 def _dates_from_changes(
     changes: Optional[Dict[str, List[dict]]],
     fallback: str,
+    labs: Optional[Sequence[str]] = None,
 ) -> List[str]:
-    """Унікальні дати з diff, у форматі YYYY-MM-DD, за зростанням (спочатку раніша)."""
+    """Унікальні дати з diff, у форматі YYYY-MM-DD, за зростанням (спочатку раніша).
+
+    Якщо передано labs — беремо дати лише з цих черг (щоб не тягнути
+    «чужі» дати інших черг і не показувати порожні блоки).
+    """
     seen = set()
-    for items in (changes or {}).values():
+    src = changes or {}
+    if labs is not None:
+        keys = [lab for lab in labs if lab]
+        iter_items = (src.get(lab) or [] for lab in keys)
+    else:
+        iter_items = src.values()
+    for items in iter_items:
         for c in items or []:
             d = _ymd(c.get("date") or "")
             if d:
                 seen.add(d)
     if not seen:
+        # Не підставляємо сьогодні «на всяк випадок», якщо changes є,
+        # але для потрібних labs дат немає — краще порожній список.
+        if labs is not None and src:
+            return []
         fb = _ymd(fallback) or datetime.now().strftime("%Y-%m-%d")
         return [fb]
-    return sorted(seen)  # 27.10 перед 28.10
+    return sorted(seen)
 
 
 def _norm_street(name: str) -> str:
@@ -766,6 +781,10 @@ def build_changes_text(
     """
     Блок «що змінилось» — під скрін.
     Групує по датах; «новий графік» на день — одним рядком на кілька черг.
+
+    Не спамить: якщо для черг користувача на дату немає реальних items
+    (ні new, ні added/removed з інтервалами) — дата/черга просто пропускається.
+    Якщо після фільтрації нічого не лишилось — повертає порожній рядок.
     """
     changes = changes or {}
     labs_order: List[str] = []
@@ -773,48 +792,64 @@ def build_changes_text(
         if lab and lab not in labs_order:
             labs_order.append(lab)
 
-    dates = _dates_from_changes(changes, date_str)
-    labs_str = ", ".join(_html_esc(x) for x in labs_order) if labs_order else "—"
-    lines = [
-        f"Для черг {labs_str} 🔔 <b>ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!</b>",
-        "",
-    ]
+    if not labs_order:
+        return ""
+
+    # Дати лише з черг цього користувача — інакше з'являються «чужі» дні
+    # з порожнім «оновлення графіка».
+    dates = _dates_from_changes(changes, date_str, labs=labs_order)
+
+    body_blocks: List[str] = []
+    labs_with_any_change: List[str] = []
 
     for d in dates:
-        lines.append(f"📅 {_html_esc(_fmt_date_display(d))}")
-        lines.append("")
-
-        # черги, для яких на цей день лише «новий графік» без інтервалів
         new_sched_labs: List[str] = []
         detail_labs: List[Tuple[str, List[dict]]] = []
+
         for lab in labs_order:
             items = _items_for_lab_day(changes, lab, d, dates)
             if _is_new_schedule_only(items):
                 new_sched_labs.append(lab)
             elif items:
+                # є реальні зміни інтервалів (added/removed або new з часом)
                 detail_labs.append((lab, items))
-            else:
-                detail_labs.append((lab, []))
+            # else: порожньо → НЕ додаємо «оновлення графіка»
+
+        if not new_sched_labs and not detail_labs:
+            # На цю дату для черг користувача нічого немає — пропуск
+            continue
+
+        block: List[str] = [f"📅 {_html_esc(_fmt_date_display(d))}", ""]
 
         if new_sched_labs:
             labs_txt = ", ".join(_html_esc(x) for x in new_sched_labs)
-            lines.append(
+            block.append(
                 f"🆕 Для черг <b>{labs_txt}</b> додали новий графік на цей день"
             )
-            lines.append("")
+            block.append("")
+            for lab in new_sched_labs:
+                if lab not in labs_with_any_change:
+                    labs_with_any_change.append(lab)
 
         for lab, items in detail_labs:
             if lab in new_sched_labs:
                 continue
-            lines.append(f"▶️ Черга <b>{_html_esc(lab)}</b>:")
-            if not items:
-                lines.append("оновлення графіка")
-            else:
-                for c in items:
-                    lines.append(_change_line(c))
-            lines.append("")
+            block.append(f"▶️ Черга <b>{_html_esc(lab)}</b>:")
+            for c in items:
+                block.append(_change_line(c))
+            block.append("")
+            if lab not in labs_with_any_change:
+                labs_with_any_change.append(lab)
 
-    return "\n".join(lines).strip()
+        body_blocks.append("\n".join(block).rstrip())
+
+    if not body_blocks:
+        # Немає жодної реальної зміни для черг цього користувача
+        return ""
+
+    labs_str = ", ".join(_html_esc(x) for x in labs_with_any_change) if labs_with_any_change else "—"
+    header = f"Для черг {labs_str} 🔔 <b>ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!</b>"
+    return (header + "\n\n" + "\n\n".join(body_blocks)).strip()
 
 
 def _addr_head_line(lab: str, addr: dict) -> str:
@@ -892,10 +927,15 @@ def build_schedule_text(
       адреса + цитата з інтервалами / деталями
       🔋 / 🔄 — згортаєма група адрес без відключень
     """
-    dates = _dates_from_changes(changes, date_str)
     items = list(queue_labels_with_addr)
     if not items:
         return ""
+    labs_for_dates = [lab for lab, _ in items if lab]
+    dates = _dates_from_changes(changes, date_str, labs=labs_for_dates or None)
+    if not dates:
+        # немає дат у changes для цих черг — один день з fallback (сьогодні)
+        fb = _ymd(date_str) or datetime.now().strftime("%Y-%m-%d")
+        dates = [fb]
 
     # адреси без черги — один блок на все повідомлення (не на кожен день)
     queued_items = [
@@ -1147,12 +1187,24 @@ def notify_bot_users_with_images(
             schedule_text = build_schedule_text(
                 qs_with_addr, changes=changes, date_str=date_str
             )
+            # Не спамимо: якщо для черг юзера немає реальних змін —
+            # не підставляємо порожнє «Оновлення графіка».
+            # schedule_text лишаємо (корисно при новому дні).
             if changes_text and schedule_text:
                 full_text = f"{changes_text}\n\n{schedule_text}"
+            elif changes_text:
+                full_text = changes_text
+            elif schedule_text and changes:
+                # є global changes, але не для цих черг — лише розклад, без шапки «оновлення»
+                full_text = schedule_text
+            elif schedule_text:
+                full_text = schedule_text
             else:
-                full_text = changes_text or schedule_text or (
-                    message or header or "🔔 Оновлення графіка"
+                # зовсім нічого змістовного для цього юзера
+                log_to_buffer(
+                    f"ℹ️ skip DM tid={tid}: немає змін і розкладу для черг {labs}"
                 )
+                continue
         else:
             full_text = (
                 (message or header or "🔔 Оновлення")

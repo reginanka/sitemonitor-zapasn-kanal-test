@@ -756,9 +756,34 @@ def notify_bot_users(
             header = msg.split("\n")[0].strip()
 
         changes = _extract_changes_for_dm(diff or {})
+        # Дата для fallback: перша реальна дата з changes (new/changed),
+        # а не завжди «сьогодні» — інакше при новому графіку на завтра
+        # з'являлось порожнє «оновлення» на сьогодні.
+        date_str = _dt.now().strftime("%d.%m.%Y")
+        seen_dates = []
+        for items in changes.values():
+            for c in items or []:
+                d = (c.get("date") or "").strip()
+                if d and d not in seen_dates:
+                    seen_dates.append(d)
+        if seen_dates:
+            # беремо найранішу (як є в diff; формат DD.MM.YYYY або YYYY-MM-DD)
+            try:
+                def _key(s: str):
+                    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+                        try:
+                            return _dt.strptime(s, fmt)
+                        except ValueError:
+                            continue
+                    return _dt.max
+                date_str = sorted(seen_dates, key=_key)[0]
+            except Exception:
+                date_str = seen_dates[0]
+
         log_to_buffer(
             f"📬 DM prepare: queues={changed_queues} "
             f"changes_keys={list(changes.keys())} "
+            f"date_str={date_str} "
             f"has_ztoe_token={bool(os.getenv('ZTOE_BOT_TOKEN'))}"
         )
 
@@ -767,7 +792,7 @@ def notify_bot_users(
             queue_keys=changed_queues or [],
             all_user_queues=False,
             header=header,
-            date_str=_dt.now().strftime("%d.%m.%Y"),
+            date_str=date_str,
             personalize=True,
             changes=changes,
         )
