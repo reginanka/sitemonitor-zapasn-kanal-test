@@ -1010,7 +1010,14 @@ def build_schedule_text(
             )
         )
 
-    return "\n".join(parts).strip()
+    body = "\n".join(parts).strip()
+    if not body:
+        return ""
+    # Заголовок першого повідомлення під скріном
+    return (
+        "📊 <b>АКТУАЛЬНИЙ ГРАФІК З УРАХУВАННЯМ ЗМІН</b>\n\n"
+        + body
+    )
 
 
 def build_personal_dm(
@@ -1024,9 +1031,10 @@ def build_personal_dm(
         date_str = datetime.now().strftime("%d.%m.%Y")
     a = build_changes_text(queue_labels_with_addr, changes, date_str)
     b = build_schedule_text(queue_labels_with_addr, changes=changes, date_str=date_str)
-    if a and b:
-        return f"{a}\n\n{b}"
-    return a or b or "🔔 Оновлення графіка"
+    # спочатку актуальний графік, потім зміни
+    if b and a:
+        return f"{b}\n\n{a}"
+    return b or a or "🔔 Оновлення графіка"
 
 
 
@@ -1187,20 +1195,15 @@ def notify_bot_users_with_images(
             schedule_text = build_schedule_text(
                 qs_with_addr, changes=changes, date_str=date_str
             )
-            # Не спамимо: якщо для черг юзера немає реальних змін —
-            # не підставляємо порожнє «Оновлення графіка».
-            # schedule_text лишаємо (корисно при новому дні).
-            if changes_text and schedule_text:
-                full_text = f"{changes_text}\n\n{schedule_text}"
-            elif changes_text:
-                full_text = changes_text
-            elif schedule_text and changes:
-                # є global changes, але не для цих черг — лише розклад, без шапки «оновлення»
-                full_text = schedule_text
+            # Під фото — спочатку актуальний графік (з заголовком),
+            # потім блок змін (якщо є). Не спамимо порожнім «оновленням».
+            if schedule_text and changes_text:
+                full_text = f"{schedule_text}\n\n{changes_text}"
             elif schedule_text:
                 full_text = schedule_text
+            elif changes_text:
+                full_text = changes_text
             else:
-                # зовсім нічого змістовного для цього юзера
                 log_to_buffer(
                     f"ℹ️ skip DM tid={tid}: немає змін і розкладу для черг {labs}"
                 )
