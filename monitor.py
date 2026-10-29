@@ -964,7 +964,8 @@ def main():
     except Exception as e:
         log_to_buffer(f"❌ Критична помилка: {e}")
     finally:
-        send_log_to_channel()
+        # 151 — гілка «Гпв крон»
+        send_log_to_channel(message_thread_id=151)
         log_to_buffer("🏁 Завершення роботи скрипта")
 
 

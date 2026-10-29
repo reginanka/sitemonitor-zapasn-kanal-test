@@ -280,8 +280,10 @@ def addr_matches_doc(addr: dict, doc: dict) -> bool:
 
 
 
-def send_log(text: str) -> None:
-    """Пише підсумок у лог-канал ботом репо (TELEGRAM_BOT_TOKEN), не ботом відключень."""
+def send_log(text: str, message_thread_id: int = 155) -> None:
+    """Пише підсумок у лог-групу ботом репо (TELEGRAM_BOT_TOKEN).
+    155 — гілка «Перевірка черг».
+    """
     channel = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or os.getenv("ZTOE_LOG_CHANNEL_ID")
     log_token = os.getenv("TELEGRAM_BOT_TOKEN")  # той самий, що в інших monitor'ах
     if not channel:
@@ -293,9 +295,16 @@ def send_log(text: str) -> None:
     try:
         log_bot = Bot(token=log_token)
         async def _send():
-            await log_bot.send_message(chat_id=channel, text=text, parse_mode="HTML")
+            kwargs = {
+                "chat_id": channel,
+                "text": text,
+                "parse_mode": "HTML",
+            }
+            if message_thread_id is not None:
+                kwargs["message_thread_id"] = message_thread_id
+            await log_bot.send_message(**kwargs)
         asyncio.run(_send())
-        log.info("Лог надіслано в %s", channel)
+        log.info("Лог надіслано в %s (thread=%s)", channel, message_thread_id)
     except Exception as e:
         log.error("Не вдалося надіслати в лог-канал: %s", e)
 

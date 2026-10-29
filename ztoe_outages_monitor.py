@@ -1023,7 +1023,12 @@ def main() -> int:
         try:
 
             async def _log():
-                await bot.send_message(chat_id=int(log_chat), text=summary)
+                # 153 — гілка «Аварії, ремонти крон»
+                await bot.send_message(
+                    chat_id=int(log_chat),
+                    text=summary,
+                    message_thread_id=153,
+                )
 
             asyncio.run(_log())
         except Exception as e:
