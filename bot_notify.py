@@ -1031,10 +1031,10 @@ def build_personal_dm(
         date_str = datetime.now().strftime("%d.%m.%Y")
     a = build_changes_text(queue_labels_with_addr, changes, date_str)
     b = build_schedule_text(queue_labels_with_addr, changes=changes, date_str=date_str)
-    # спочатку актуальний графік, потім зміни
-    if b and a:
-        return f"{b}\n\n{a}"
-    return b or a or "🔔 Оновлення графіка"
+    # спочатку зміни (під фото), потім актуальний графік
+    if a and b:
+        return f"{a}\n\n{b}"
+    return a or b or "🔔 Оновлення графіка"
 
 
 
@@ -1195,26 +1195,37 @@ def notify_bot_users_with_images(
             schedule_text = build_schedule_text(
                 qs_with_addr, changes=changes, date_str=date_str
             )
-            # Під фото — спочатку актуальний графік (з заголовком),
-            # потім блок змін (якщо є). Не спамимо порожнім «оновленням».
-            if schedule_text and changes_text:
-                full_text = f"{schedule_text}\n\n{changes_text}"
-            elif schedule_text:
-                full_text = schedule_text
-            elif changes_text:
-                full_text = changes_text
-            else:
+            if not changes_text and not schedule_text:
                 log_to_buffer(
                     f"ℹ️ skip DM tid={tid}: немає змін і розкладу для черг {labs}"
                 )
                 continue
+
+            # 1) Під фото — ТІЛЬКИ блок змін (якщо є).
+            # 2) Далі окремо — актуальний графік (з 📊), з розбиттям по ліміту.
+            # Не склеюємо в один текст: інакше кілька 📅 ламають plan_dm_messages.
+            caption = ""
+            follow: list[str] = []
+
+            if changes_text and schedule_text:
+                # зміни під фото; графік — наступними повідомленнями
+                caption, ch_follow = plan_dm_messages(changes_text)
+                follow.extend(ch_follow)
+                sch_cap, sch_follow = plan_dm_messages(schedule_text)
+                if sch_cap:
+                    follow.append(sch_cap)
+                follow.extend(sch_follow)
+            elif changes_text:
+                caption, follow = plan_dm_messages(changes_text)
+            else:
+                # лише графік — може бути під фото
+                caption, follow = plan_dm_messages(schedule_text)
         else:
             full_text = (
                 (message or header or "🔔 Оновлення")
                 + f"\n\n📌 Твої черги: <b>{', '.join(_html_esc(x) for x in labs)}</b>"
             )
-
-        caption, follow = plan_dm_messages(full_text)
+            caption, follow = plan_dm_messages(full_text)
 
         ok = False
         photo_ok = False
@@ -1236,7 +1247,7 @@ def notify_bot_users_with_images(
                         tid, [], part[:TEXT_LIMIT], bot_token=bot_token
                     ) or ok
         else:
-            pieces = [p for p in [caption, *follow] if p] or [full_text]
+            pieces = [p for p in [caption, *follow] if p]
             for part in pieces:
                 part_ok = send_photos_sync(
                     tid, [], part[:TEXT_LIMIT], bot_token=bot_token
