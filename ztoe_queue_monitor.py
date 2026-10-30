@@ -22,6 +22,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from collections import Counter
 from typing import Optional
 
 import httpx
@@ -342,7 +343,7 @@ def fetch_queue(otg_name: str, city_name: str, street_name: str) -> dict:
         rem_query = re.sub(r"\s*рем\s*$", "", otg_name or "", flags=re.I).strip()
         rem = _best_match(rems, rem_query)
         if not rem:
-            return {"error": "rem_not_found", "message": f"РЕМ не знайдено: {otg_name}"}
+            return {"error": "rem_not_found", "message": f"РЕМ {otg_name} не знайдено"}
 
         time.sleep(REQUEST_PAUSE_SEC)
         r = client.post(BASE, data={"rem_id": rem[0]})
@@ -356,7 +357,7 @@ def fetch_queue(otg_name: str, city_name: str, street_name: str) -> dict:
             }
         city = _best_match(cities, city_name)
         if not city:
-            return {"error": "city_not_found", "message": f"Пункт не знайдено: {city_name}"}
+            return {"error": "city_not_found", "message": f"Пункт {city_name} не знайдено"}
 
         time.sleep(REQUEST_PAUSE_SEC)
         r = client.post(BASE, data={"rem_id": rem[0], "naspunkt_id": city[0]})
@@ -370,7 +371,7 @@ def fetch_queue(otg_name: str, city_name: str, street_name: str) -> dict:
             }
         street = _best_match(streets, street_name)
         if not street:
-            return {"error": "street_not_found", "message": f"Вулицю не знайдено: {street_name}"}
+            return {"error": "street_not_found", "message": f"Вулицю {street_name} не знайдено"}
 
         time.sleep(REQUEST_PAUSE_SEC)
         r = client.post(
@@ -514,8 +515,9 @@ def main() -> int:
     skipped_temp = 0
     notified_users = 0
     errors = 0
-    error_details: list[str] = []
-    temp_details: list[str] = []
+    error_msg_counts: Counter = Counter()
+    error_doc_ids: list = []
+    temp_msg_counts: Counter = Counter()
 
     for doc in docs:
         otg = doc.get("otg_name") or ""
@@ -536,7 +538,8 @@ def main() -> int:
                 }},
             )
             errors += 1
-            error_details.append(f"• {label} — {e}")
+            error_msg_counts[str(e)] += 1
+            error_doc_ids.append(doc.get("_id"))
             continue
 
         if street_info.get("temporary"):
@@ -550,7 +553,7 @@ def main() -> int:
                 }},
             )
             skipped_temp += 1
-            temp_details.append(f"• {label} — {msg}")
+            temp_msg_counts[msg] += 1
             continue
 
         if street_info.get("error"):
@@ -564,7 +567,8 @@ def main() -> int:
                 }},
             )
             errors += 1
-            error_details.append(f"• {label} — {msg}")
+            error_msg_counts[msg] += 1
+            error_doc_ids.append(doc.get("_id"))
             continue
 
         # street-level snapshot у directory (для діагностики; сповіщення — per-house)
@@ -698,16 +702,41 @@ def main() -> int:
             except Exception as e:
                 log.error("Не вдалося надіслати %s: %s", user.get("telegram_id"), e)
 
-    # Обрізаємо довгі списки, щоб не впертись у ліміт Telegram (~4096)
-    def _fmt_block(title: str, items: list[str], limit: int = 15) -> str:
-        if not items:
-            return ""
-        shown = items[:limit]
-        extra = len(items) - len(shown)
-        body = "\n".join(shown)
-        if extra > 0:
-            body += f"\n… ще {extra}"
-        return f"\n\n<b>{title}</b>\n{body}"
+    # Скільки користувачів мають адреси з помилкових записів directory
+    users_with_errors = 0
+    if error_doc_ids:
+        err_id_set = {i for i in error_doc_ids if i is not None}
+        # також індекс помилкових ключів (otg/city/street) на випадок без _id match
+        err_docs = list(directory.find({"_id": {"$in": list(err_id_set)}})) if err_id_set else []
+        for user in users.find({}):
+            addrs = user.get("addresses") or (
+                [user["address"]] if user.get("address") else []
+            )
+            hit = False
+            for a in addrs:
+                if not isinstance(a, dict):
+                    continue
+                for ed in err_docs:
+                    if addr_matches_doc(a, ed):
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                users_with_errors += 1
+
+    detail_lines: list[str] = []
+    if errors or skipped_temp:
+        detail_lines.append("<b>Деталі помилок</b>")
+        if errors:
+            detail_lines.append(f"Користувач з помилками: {users_with_errors}")
+            # агреговані причини (повідомлення → кількість адрес)
+            for msg, cnt in error_msg_counts.most_common():
+                detail_lines.append(f"{msg}: {cnt}")
+        if skipped_temp:
+            detail_lines.append(f"Тимчасово недоступно (адрес): {skipped_temp}")
+            for msg, cnt in temp_msg_counts.most_common():
+                detail_lines.append(f"{msg}: {cnt}")
 
     summary = (
         f"✅ <b>Перевірка черг</b>\n\n"
@@ -715,18 +744,20 @@ def main() -> int:
         f"Черга змінилась: <b>{changed}</b>\n"
         f"Сповіщено людей: <b>{notified_users}</b>\n"
         f"Сайт тимчасово недоступний: <b>{skipped_temp}</b>\n"
-        f"Помилок: <b>{errors}</b>"
-        + _fmt_block("Деталі помилок", error_details)
-        + _fmt_block("Тимчасово недоступно", temp_details)
+        f"Помилок всього: <b>{errors}</b>"
     )
+    if detail_lines:
+        summary += "\n\n" + "\n".join(detail_lines)
+
     log.info(
-        "Готово: checked=%s changed=%s notified=%s temp=%s errors=%s",
-        checked, changed, notified_users, skipped_temp, errors,
+        "Готово: checked=%s changed=%s notified=%s temp=%s errors=%s users_err=%s",
+        checked, changed, notified_users, skipped_temp, errors, users_with_errors,
     )
-    if error_details:
-        log.warning("Помилки:\n%s", "\n".join(error_details))
-    if temp_details:
-        log.warning("Тимчасово:\n%s", "\n".join(temp_details))
+    if error_msg_counts:
+        log.warning(
+            "Помилки (агреговано): %s",
+            "; ".join(f"{m}: {c}" for m, c in error_msg_counts.most_common()),
+        )
     send_log(summary)
     return 0
 
