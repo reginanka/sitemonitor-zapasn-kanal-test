@@ -335,16 +335,32 @@ def region_forms(name_uk: str, slug: str) -> tuple:
     return n, n, n
 
 
+def _time_of_day(iso: Optional[str]) -> Optional[str]:
+    """Бере лише час HH:MM (ігнорує календарну дату)."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.strftime("%H:%M")
+    except Exception:
+        return None
+
+
 def comparable(snapshot: Dict) -> Dict:
-    """Що порівнюємо для рішення «чи змінилось»."""
+    """Порівнюємо status + status_code + час періоду (без дати).
+
+    Якщо статус той самий і години періоду ті самі (наприклад 06:00–23:59),
+    а змінилася лише дата (новий день) — сповіщення не шлемо.
+    title_uk / since навмисно не порівнюємо, щоб не було зайвих нотифікацій.
+    """
     period = snapshot.get("period") or {}
+    start = period.get("start") if isinstance(period, dict) else None
+    end = period.get("end") if isinstance(period, dict) else None
     return {
         "status": snapshot.get("status"),
         "status_code": snapshot.get("status_code"),
-        "title_uk": snapshot.get("title_uk"),
-        "since": snapshot.get("since"),
-        "period_start": period.get("start") if isinstance(period, dict) else None,
-        "period_end": period.get("end") if isinstance(period, dict) else None,
+        "period_start_hm": _time_of_day(start),
+        "period_end_hm": _time_of_day(end),
     }
 
 
