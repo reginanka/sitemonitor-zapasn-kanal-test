@@ -514,6 +514,8 @@ def main() -> int:
     skipped_temp = 0
     notified_users = 0
     errors = 0
+    error_details: list[str] = []
+    temp_details: list[str] = []
 
     for doc in docs:
         otg = doc.get("otg_name") or ""
@@ -534,30 +536,35 @@ def main() -> int:
                 }},
             )
             errors += 1
+            error_details.append(f"• {label} — {e}")
             continue
 
         if street_info.get("temporary"):
-            log.warning("Тимчасово недоступно: %s — %s", label, street_info.get("message"))
+            msg = street_info.get("message") or "temporary"
+            log.warning("Тимчасово недоступно: %s — %s", label, msg)
             directory.update_one(
                 {"_id": doc["_id"]},
                 {"$set": {
-                    "last_error": street_info.get("message") or "temporary",
+                    "last_error": msg,
                     "last_check_at": datetime.now(timezone.utc),
                 }},
             )
             skipped_temp += 1
+            temp_details.append(f"• {label} — {msg}")
             continue
 
         if street_info.get("error"):
-            log.warning("Не знайдено: %s — %s", label, street_info.get("message"))
+            msg = street_info.get("message") or street_info.get("error") or "unknown"
+            log.warning("Не знайдено: %s — %s", label, msg)
             directory.update_one(
                 {"_id": doc["_id"]},
                 {"$set": {
-                    "last_error": street_info.get("message") or street_info.get("error"),
+                    "last_error": msg,
                     "last_check_at": datetime.now(timezone.utc),
                 }},
             )
             errors += 1
+            error_details.append(f"• {label} — {msg}")
             continue
 
         # street-level snapshot у directory (для діагностики; сповіщення — per-house)
@@ -691,6 +698,17 @@ def main() -> int:
             except Exception as e:
                 log.error("Не вдалося надіслати %s: %s", user.get("telegram_id"), e)
 
+    # Обрізаємо довгі списки, щоб не впертись у ліміт Telegram (~4096)
+    def _fmt_block(title: str, items: list[str], limit: int = 15) -> str:
+        if not items:
+            return ""
+        shown = items[:limit]
+        extra = len(items) - len(shown)
+        body = "\n".join(shown)
+        if extra > 0:
+            body += f"\n… ще {extra}"
+        return f"\n\n<b>{title}</b>\n{body}"
+
     summary = (
         f"✅ <b>Перевірка черг</b>\n\n"
         f"Перевірено адрес: <b>{checked}</b>\n"
@@ -698,11 +716,17 @@ def main() -> int:
         f"Сповіщено людей: <b>{notified_users}</b>\n"
         f"Сайт тимчасово недоступний: <b>{skipped_temp}</b>\n"
         f"Помилок: <b>{errors}</b>"
+        + _fmt_block("Деталі помилок", error_details)
+        + _fmt_block("Тимчасово недоступно", temp_details)
     )
     log.info(
         "Готово: checked=%s changed=%s notified=%s temp=%s errors=%s",
         checked, changed, notified_users, skipped_temp, errors,
     )
+    if error_details:
+        log.warning("Помилки:\n%s", "\n".join(error_details))
+    if temp_details:
+        log.warning("Тимчасово:\n%s", "\n".join(temp_details))
     send_log(summary)
     return 0
 
