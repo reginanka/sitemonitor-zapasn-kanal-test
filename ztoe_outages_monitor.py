@@ -743,6 +743,11 @@ def main() -> int:
     outages_full = db["outages"]
 
     users = list(users_col.find({"notify": True}))
+    try:
+        from bot_notify import user_wants, is_quiet_now
+        users = [u for u in users if user_wants(u, "accidents")]
+    except Exception as e:
+        log.warning("prefs filter failed: %s", e)
     groups: Dict[Tuple[int, int], List[Tuple[dict, dict]]] = {}
     for u in users:
         for addr in get_user_addresses(u):
@@ -984,22 +989,37 @@ def main() -> int:
 
 
     sent = 0
+    try:
+        from bot_notify import is_quiet_now
+    except Exception:
+        def is_quiet_now(_u):
+            return False
+    # notified tid -> user doc (збережемо з groups)
+    _user_by_tid = {}
+    for _pairs in groups.values():
+        for _u, _a in _pairs:
+            tid_u = _u.get("telegram_id")
+            if tid_u is not None:
+                _user_by_tid[int(tid_u)] = _u
+
     for tid, item_list in notified.items():
         # [(outage, addr), ...]
         text = build_notify_message(db, item_list)
+        silent = is_quiet_now(_user_by_tid.get(int(tid)))
 
-        async def _send(chat_id=tid, body=text):
+        async def _send(chat_id=tid, body=text, silent=silent):
             await bot.send_message(
                 chat_id=chat_id,
                 text=body[:4096],
                 parse_mode="HTML",
                 disable_web_page_preview=True,
+                disable_notification=silent,
             )
 
         try:
             asyncio.run(_send())
             sent += 1
-            log.info("Надіслано %s (outages=%s)", tid, len(item_list))
+            log.info("Надіслано %s (outages=%s silent=%s)", tid, len(item_list), silent)
             time.sleep(0.4)
         except Exception as e:
             log.error("Send fail %s: %s", tid, e)

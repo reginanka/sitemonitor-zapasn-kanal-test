@@ -598,6 +598,11 @@ def main() -> int:
 
         # Користувачі з цією вулицею — черга рахується по їхньому номеру будинку
         cursor = users.find({"notify": True})
+        try:
+            from bot_notify import user_wants as _user_wants
+        except Exception:
+            def _user_wants(u, kind):
+                return True
         for user in cursor:
             addrs = user.get("addresses") or (
                 [user["address"]] if user.get("address") else []
@@ -688,16 +693,25 @@ def main() -> int:
                 f"Стало: <b>{now}</b>"
             )
             try:
-                async def _send(tid=user["telegram_id"], body=text_msg):
+                from bot_notify import is_quiet_now as _is_quiet
+            except Exception:
+                def _is_quiet(_u):
+                    return False
+            if not _user_wants(user, "hourly"):
+                continue
+            try:
+                silent = _is_quiet(user)
+                async def _send(tid=user["telegram_id"], body=text_msg, silent=silent):
                     await bot.send_message(
                         chat_id=tid,
                         text=body,
                         parse_mode="HTML",
+                        disable_notification=silent,
                     )
 
                 asyncio.run(_send())
                 notified_users += 1
-                log.info("Сповіщено %s", user["telegram_id"])
+                log.info("Сповіщено %s silent=%s", user["telegram_id"], silent)
                 time.sleep(0.3)
             except Exception as e:
                 log.error("Не вдалося надіслати %s: %s", user.get("telegram_id"), e)

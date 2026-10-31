@@ -578,7 +578,8 @@ def main() -> None:
             from telegram_handler import send_photos_sync
             import os
 
-            targets = collect_notify_targets(None)
+            from bot_notify import is_quiet_now, load_notify_users
+            targets = collect_notify_targets(None, kind="ukrenergo")
             bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
             if not targets:
                 log_to_buffer("ℹ️ Немає підписників бота для DM статусу")
@@ -588,10 +589,17 @@ def main() -> None:
                 images: list = []
                 if image_path and image_path.exists():
                     images = [image_path.read_bytes()]
+                users_by_tid = {
+                    int(u["telegram_id"]): u
+                    for u in load_notify_users("ukrenergo")
+                    if u.get("telegram_id") is not None
+                }
                 sent = 0
                 for tid in targets.keys():
+                    silent = is_quiet_now(users_by_tid.get(int(tid)))
                     ok = send_photos_sync(
-                        tid, images, message, bot_token=bot_token
+                        tid, images, message, bot_token=bot_token,
+                        disable_notification=silent,
                     )
                     if ok:
                         sent += 1

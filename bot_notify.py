@@ -86,6 +86,75 @@ def user_addresses(u: dict) -> list:
     return []
 
 
+# ---------- user notify preferences ----------
+# users.notify_prefs: {accidents, hourly, ukrenergo}
+# quiet_mode + quiet_from/quiet_to (hours, quiet_to exclusive, may wrap midnight)
+
+PREF_DEFAULTS = {"accidents": True, "hourly": True, "ukrenergo": True}
+
+
+def user_prefs(u: dict | None) -> dict:
+    if not u:
+        return dict(PREF_DEFAULTS)
+    raw = u.get("notify_prefs")
+    if isinstance(raw, dict):
+        return {k: bool(raw.get(k, True)) for k in PREF_DEFAULTS}
+    if u.get("notify", True) is False:
+        return {k: False for k in PREF_DEFAULTS}
+    return dict(PREF_DEFAULTS)
+
+
+def user_wants(u: dict | None, kind: str) -> bool:
+    """kind: accidents | hourly | ukrenergo. False if master notify off or pref off."""
+    if not u:
+        return False
+    if u.get("notify", True) is False:
+        return False
+    prefs = user_prefs(u)
+    if kind not in prefs:
+        return True
+    return bool(prefs.get(kind))
+
+
+def is_quiet_now(u: dict | None) -> bool:
+    """True → send with disable_notification (без звуку)."""
+    if not u or not u.get("quiet_mode"):
+        return False
+    try:
+        qf = int(u.get("quiet_from", 23)) % 24
+        qt = int(u.get("quiet_to", 7)) % 24
+    except (TypeError, ValueError):
+        qf, qt = 23, 7
+    try:
+        from zoneinfo import ZoneInfo
+        hour = datetime.now(ZoneInfo("Europe/Kyiv")).hour
+    except Exception:
+        hour = datetime.now().hour
+    if qf == qt:
+        return True
+    if qf < qt:
+        return qf <= hour < qt
+    return hour >= qf or hour < qt
+
+
+def load_notify_users(kind: str | None = None) -> list:
+    """
+    Користувачі з notify=true.
+    Якщо kind заданий — лише ті, у кого цей тип увімкнений.
+    """
+    try:
+        db = get_db()
+        users = list(db["users"].find({"notify": True}))
+    except Exception as e:
+        log_to_buffer(f"❌ Mongo users: {e}")
+        return []
+    if kind is None:
+        return users
+    return [u for u in users if user_wants(u, kind)]
+
+
+
+
 _NO_GPV_MARKERS = (
     "не вимикається",
     "не вимикають",
@@ -163,6 +232,8 @@ def format_address(addr: dict) -> str:
 
 def collect_notify_targets(
     queue_keys: Optional[Sequence[str]] = None,
+    *,
+    kind: Optional[str] = None,
 ) -> Dict[int, List[Tuple[str, dict]]]:
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
@@ -170,8 +241,7 @@ def collect_notify_targets(
         return {}
 
     try:
-        db = get_db()
-        users = list(db["users"].find({"notify": True}))
+        users = load_notify_users(kind)
     except Exception as e:
         log_to_buffer(f"❌ Mongo users: {e}")
         return {}
@@ -1151,6 +1221,7 @@ def notify_bot_users_with_images(
     date_str: str = "",
     personalize: bool = True,
     changes: Optional[Dict[str, List[dict]]] = None,
+    kind: Optional[str] = "hourly",
 ) -> None:
     """
     Формат DM як /check:
@@ -1165,12 +1236,22 @@ def notify_bot_users_with_images(
         return
 
     if all_user_queues:
-        targets = collect_notify_targets(None)
+        targets = collect_notify_targets(None, kind=kind)
     else:
         if not queue_keys:
             log_to_buffer("ℹ️ Немає черг для DM")
             return
-        targets = collect_notify_targets(queue_keys)
+        targets = collect_notify_targets(queue_keys, kind=kind)
+
+    # для quiet_mode
+    try:
+        _users_by_tid = {
+            int(u["telegram_id"]): u
+            for u in load_notify_users(kind)
+            if u.get("telegram_id") is not None
+        }
+    except Exception:
+        _users_by_tid = {}
 
     if not targets:
         log_to_buffer(
@@ -1191,6 +1272,7 @@ def notify_bot_users_with_images(
     failed = 0
     for tid, qs_with_addr in targets.items():
         labs = sorted({lab for lab, _ in qs_with_addr})
+        silent = is_quiet_now(_users_by_tid.get(int(tid)))
 
         if personalize:
             changes_text = build_changes_text(qs_with_addr, changes, date_str)
@@ -1234,11 +1316,15 @@ def notify_bot_users_with_images(
 
         if images:
             photo_ok = send_photos_sync(
-                tid, images, caption or "🔔 Оновлення графіка", bot_token=bot_token
+                tid, images, caption or "🔔 Оновлення графіка", bot_token=bot_token,
+                disable_notification=silent,
             )
             ok = photo_ok
             for part in follow:
-                text_ok = send_photos_sync(tid, [], part[:TEXT_LIMIT], bot_token=bot_token)
+                text_ok = send_photos_sync(
+                    tid, [], part[:TEXT_LIMIT], bot_token=bot_token,
+                    disable_notification=silent,
+                )
                 ok = ok or text_ok
             if not ok:
                 log_to_buffer(f"⚠️ DM photo fail tid={tid}, шлю лише текст")
@@ -1246,13 +1332,15 @@ def notify_bot_users_with_images(
                     if not part:
                         continue
                     ok = send_photos_sync(
-                        tid, [], part[:TEXT_LIMIT], bot_token=bot_token
+                        tid, [], part[:TEXT_LIMIT], bot_token=bot_token,
+                        disable_notification=silent,
                     ) or ok
         else:
             pieces = [p for p in [caption, *follow] if p]
             for part in pieces:
                 part_ok = send_photos_sync(
-                    tid, [], part[:TEXT_LIMIT], bot_token=bot_token
+                    tid, [], part[:TEXT_LIMIT], bot_token=bot_token,
+                    disable_notification=silent,
                 )
                 ok = ok or part_ok
 

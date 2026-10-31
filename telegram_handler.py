@@ -69,6 +69,7 @@ async def send_photos_with_caption(
     caption: str = "",
     *,
     bot_token: Optional[str] = None,
+    disable_notification: bool = False,
 ) -> bool:
     """
     Надіслати 1..N картинок одним повідомленням.
@@ -92,6 +93,7 @@ async def send_photos_with_caption(
                 text=caption[:4096],
                 parse_mode="HTML",
                 disable_web_page_preview=True,
+                disable_notification=disable_notification,
             )
             return True
 
@@ -101,6 +103,7 @@ async def send_photos_with_caption(
                 photo=images[0],
                 caption=cap or None,
                 parse_mode="HTML" if cap else None,
+                disable_notification=disable_notification,
             )
             return True
 
@@ -114,7 +117,7 @@ async def send_photos_with_caption(
                     parse_mode="HTML" if i == 0 and cap else None,
                 )
             )
-        await bot.send_media_group(chat_id=chat_id, media=media)
+        await bot.send_media_group(chat_id=chat_id, media=media, disable_notification=disable_notification)
         return True
     except TelegramError as e:
         logger.error(f"❌ Помилка send_photos chat={chat_id}: {e}")
@@ -150,6 +153,7 @@ def send_photos_sync(
     caption: str = "",
     *,
     bot_token: Optional[str] = None,
+    disable_notification: bool = False,
 ) -> bool:
     """Синхронна обгортка send_photos_with_caption."""
     try:
@@ -158,7 +162,11 @@ def send_photos_sync(
         try:
             return loop.run_until_complete(
                 send_photos_with_caption(
-                    chat_id, images, caption, bot_token=bot_token
+                    chat_id,
+                    images,
+                    caption,
+                    bot_token=bot_token,
+                    disable_notification=disable_notification,
                 )
             )
         finally:
