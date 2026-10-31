@@ -88,7 +88,8 @@ def user_addresses(u: dict) -> list:
 
 # ---------- user notify preferences ----------
 # users.notify_prefs: {accidents, hourly, ukrenergo}
-# quiet_mode + quiet_from/quiet_to (hours, quiet_to exclusive, may wrap midnight)
+# quiet_mode + quiet_from/quiet_to (години) + quiet_from_min/quiet_to_min (хвилини)
+# quiet_to exclusive; інтервал може переходити через північ
 
 PREF_DEFAULTS = {"accidents": True, "hourly": True, "ukrenergo": True}
 
@@ -116,25 +117,48 @@ def user_wants(u: dict | None, kind: str) -> bool:
     return bool(prefs.get(kind))
 
 
+def _clamp_h(v, default: int = 23) -> int:
+    try:
+        return int(v) % 24
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_m(v, default: int = 0) -> int:
+    try:
+        m = int(v)
+        if m < 0:
+            return 0
+        if m > 59:
+            return 59
+        return m
+    except (TypeError, ValueError):
+        return default
+
+
 def is_quiet_now(u: dict | None) -> bool:
-    """True → send with disable_notification (без звуку)."""
+    """True → send with disable_notification (без звуку).
+    Підтримує quiet_from_min / quiet_to_min (як у ZTOE-боті).
+    """
     if not u or not u.get("quiet_mode"):
         return False
-    try:
-        qf = int(u.get("quiet_from", 23)) % 24
-        qt = int(u.get("quiet_to", 7)) % 24
-    except (TypeError, ValueError):
-        qf, qt = 23, 7
+    fh = _clamp_h(u.get("quiet_from", 23), 23)
+    fm = _clamp_m(u.get("quiet_from_min", 0), 0)
+    th = _clamp_h(u.get("quiet_to", 7), 7)
+    tm = _clamp_m(u.get("quiet_to_min", 0), 0)
     try:
         from zoneinfo import ZoneInfo
-        hour = datetime.now(ZoneInfo("Europe/Kyiv")).hour
+        now = datetime.now(ZoneInfo("Europe/Kyiv"))
     except Exception:
-        hour = datetime.now().hour
-    if qf == qt:
+        now = datetime.now()
+    cur = now.hour * 60 + now.minute
+    start = fh * 60 + fm
+    end = th * 60 + tm
+    if start == end:
         return True
-    if qf < qt:
-        return qf <= hour < qt
-    return hour >= qf or hour < qt
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end
 
 
 def load_notify_users(kind: str | None = None) -> list:
