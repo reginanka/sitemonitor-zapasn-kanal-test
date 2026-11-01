@@ -87,11 +87,17 @@ def user_addresses(u: dict) -> list:
 
 
 # ---------- user notify preferences ----------
-# users.notify_prefs: {accidents, hourly, ukrenergo}
+# users.notify_prefs: {accidents, hourly, ukrenergo, region}
 # quiet_mode + quiet_from/quiet_to (години) + quiet_from_min/quiet_to_min (хвилини)
 # quiet_to exclusive; інтервал може переходити через північ
+# region — зведення «Стан області» (крон ztoe-accidents-summary)
 
-PREF_DEFAULTS = {"accidents": True, "hourly": True, "ukrenergo": True}
+PREF_DEFAULTS = {
+    "accidents": True,
+    "hourly": True,
+    "ukrenergo": True,
+    "region": True,
+}
 
 
 def user_prefs(u: dict | None) -> dict:
@@ -106,7 +112,7 @@ def user_prefs(u: dict | None) -> dict:
 
 
 def user_wants(u: dict | None, kind: str) -> bool:
-    """kind: accidents | hourly | ukrenergo. False if master notify off or pref off."""
+    """kind: accidents | hourly | ukrenergo | region. False if master notify off or pref off."""
     if not u:
         return False
     if u.get("notify", True) is False:

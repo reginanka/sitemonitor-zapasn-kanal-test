@@ -60,6 +60,108 @@ def send_notification(message: str, image_path=None) -> bool:
         return False
 
 
+def _user_wants_region(u: dict) -> bool:
+    """notify_prefs.region (за замовч. True, якщо ключа немає)."""
+    if u.get("notify", True) is False:
+        return False
+    raw = u.get("notify_prefs")
+    if isinstance(raw, dict):
+        return bool(raw.get("region", True))
+    return True
+
+
+def _is_quiet_now(u: dict) -> bool:
+    """Тихий режим з хвилинами (як у bot_notify / ZTOE-боті)."""
+    if not u.get("quiet_mode"):
+        return False
+    try:
+        fh = int(u.get("quiet_from", 23)) % 24
+        th = int(u.get("quiet_to", 7)) % 24
+    except (TypeError, ValueError):
+        fh, th = 23, 7
+    try:
+        fm = max(0, min(59, int(u.get("quiet_from_min", 0) or 0)))
+        tm = max(0, min(59, int(u.get("quiet_to_min", 0) or 0)))
+    except (TypeError, ValueError):
+        fm, tm = 0, 0
+    now = datetime.now(KYIV)
+    cur = now.hour * 60 + now.minute
+    start = fh * 60 + fm
+    end = th * 60 + tm
+    if start == end:
+        return True
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end
+
+
+def send_region_dms(message: str) -> tuple[int, int]:
+    """
+    Особисті DM підписникам з notify_prefs.region=true.
+    Повертає (sent, failed).
+    """
+    token = (
+        os.getenv("ZTOE_BOT_TOKEN")
+        or os.getenv("TELEGRAM_BOT_TOKEN")
+        or ""
+    ).strip()
+    if not token:
+        log_to_buffer("⚠️ ZTOE_BOT_TOKEN / TELEGRAM_BOT_TOKEN немає — DM region пропуск")
+        return 0, 0
+
+    try:
+        from pymongo import MongoClient
+    except Exception as e:
+        log_to_buffer(f"❌ pymongo для DM: {e}")
+        return 0, 0
+
+    uri = (os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI") or "").strip()
+    db_name = (os.getenv("ZTOE_MONGO_DB") or os.getenv("MONGO_DB") or "").strip()
+    if not uri or not db_name:
+        log_to_buffer("⚠️ Mongo URI/DB немає — DM region пропуск")
+        return 0, 0
+
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+        users = list(client[db_name]["users"].find({"notify": {"$ne": False}}))
+    except Exception as e:
+        log_to_buffer(f"❌ Mongo users для DM: {e}")
+        return 0, 0
+
+    targets = [u for u in users if _user_wants_region(u) and u.get("telegram_id")]
+    log_to_buffer(f"📬 region DM candidates: {len(targets)} (з {len(users)} notify)")
+
+    sent = failed = 0
+    for u in targets:
+        tid = u.get("telegram_id")
+        silent = _is_quiet_now(u)
+        try:
+            r = httpx.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={
+                    "chat_id": str(tid),
+                    "text": message[:4096],
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": "true",
+                    "disable_notification": "true" if silent else "false",
+                },
+                timeout=30,
+            )
+            if r.status_code == 200 and (r.json() or {}).get("ok"):
+                sent += 1
+            else:
+                failed += 1
+                log_to_buffer(
+                    f"❌ region DM tid={tid}: HTTP {r.status_code} {r.text[:120]}"
+                )
+        except Exception as e:
+            failed += 1
+            log_to_buffer(f"❌ region DM tid={tid}: {e}")
+
+    log_to_buffer(f"📬 region DM: sent={sent} failed={failed}")
+    return sent, failed
+
+
 # --- logging buffer (сумісно з log_utils + fallback) ---
 _log_lines: list[str] = []
 
@@ -690,9 +792,14 @@ def main() -> int:
         ok = send_notification(msg)
         if ok:
             notified_ok = True
-            log_to_buffer(f"✓ Telegram: звіт відправлено ({len(msg)} символів)")
+            log_to_buffer(f"✓ Telegram канал: звіт відправлено ({len(msg)} символів)")
         else:
-            log_to_buffer("❌ Telegram: не вдалося відправити")
+            log_to_buffer("❌ Telegram канал: не вдалося відправити")
+        # Особисті DM тим, у кого увімкнено «Стан області» (notify_prefs.region)
+        try:
+            send_region_dms(msg)
+        except Exception as e:
+            log_to_buffer(f"❌ region DM batch failed: {e}")
     else:
         log_to_buffer("⏭ Telegram: пропущено (антиспам / рівень)")
 
