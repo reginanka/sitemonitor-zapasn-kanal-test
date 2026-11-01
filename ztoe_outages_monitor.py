@@ -989,6 +989,8 @@ def main() -> int:
 
 
     sent = 0
+    sent_quiet = 0
+    sent_sound = 0
     try:
         from bot_notify import is_quiet_now
     except Exception:
@@ -1019,6 +1021,10 @@ def main() -> int:
         try:
             asyncio.run(_send())
             sent += 1
+            if silent:
+                sent_quiet += 1
+            else:
+                sent_sound += 1
             log.info("Надіслано %s (outages=%s silent=%s)", tid, len(item_list), silent)
             time.sleep(0.4)
         except Exception as e:
@@ -1030,7 +1036,7 @@ def main() -> int:
         f"Підписників: {len(users)}\n"
         f"Локацій: {groups_checked}\n"
         f"Подій для розсилки: {n_events}\n"
-        f"Сповіщень: {sent}"
+        f"Сповіщень: {sent} (🔊={sent_sound} 🔇={sent_quiet})"
     )
     log.info("%s", summary.replace("\n", " | "))
 

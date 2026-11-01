@@ -132,6 +132,7 @@ def send_region_dms(message: str) -> tuple[int, int]:
     log_to_buffer(f"📬 region DM candidates: {len(targets)} (з {len(users)} notify)")
 
     sent = failed = 0
+    sent_quiet = sent_sound = 0
     for u in targets:
         tid = u.get("telegram_id")
         silent = _is_quiet_now(u)
@@ -149,6 +150,10 @@ def send_region_dms(message: str) -> tuple[int, int]:
             )
             if r.status_code == 200 and (r.json() or {}).get("ok"):
                 sent += 1
+                if silent:
+                    sent_quiet += 1
+                else:
+                    sent_sound += 1
             else:
                 failed += 1
                 log_to_buffer(
@@ -159,6 +164,10 @@ def send_region_dms(message: str) -> tuple[int, int]:
             log_to_buffer(f"❌ region DM tid={tid}: {e}")
 
     log_to_buffer(f"📬 region DM: sent={sent} failed={failed}")
+    log_to_buffer(
+        f"📬 region DM: sent={sent} failed={failed} (🔊={sent_sound} 🔇={sent_quiet})"
+    )
+
     return sent, failed
 
 

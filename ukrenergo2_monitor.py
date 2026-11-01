@@ -582,6 +582,8 @@ def main() -> None:
                     if u.get("telegram_id") is not None
                 }
                 sent = 0
+                sent_quiet = 0
+                sent_sound = 0
                 for tid in targets.keys():
                     silent = is_quiet_now(users_by_tid.get(int(tid)))
                     ok = send_photos_sync(
@@ -590,8 +592,13 @@ def main() -> None:
                     )
                     if ok:
                         sent += 1
+                        if silent:
+                            sent_quiet += 1
+                        else:
+                            sent_sound += 1
                 log_to_buffer(
                     f"📬 DM статусу Укренерго: sent={sent}/{len(targets)}"
+                    f" (🔊={sent_sound} 🔇={sent_quiet})"
                     f"{' +img' if images else ''}"
                 )
         except Exception as e:

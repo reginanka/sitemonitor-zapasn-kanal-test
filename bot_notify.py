@@ -1300,6 +1300,8 @@ def notify_bot_users_with_images(
 
     sent = 0
     failed = 0
+    sent_quiet = 0
+    sent_sound = 0
     for tid, qs_with_addr in targets.items():
         labs = sorted({lab for lab, _ in qs_with_addr})
         silent = is_quiet_now(_users_by_tid.get(int(tid)))
@@ -1376,9 +1378,14 @@ def notify_bot_users_with_images(
 
         if ok:
             sent += 1
+            if silent:
+                sent_quiet += 1
+            else:
+                sent_sound += 1
             log_to_buffer(
                 f"✓ DM tid={tid} queues={labs} photo={photo_ok} "
                 f"caption_len={len(caption)} follow={len(follow)} "
+                f"{'🔇' if silent else '🔊'} "
                 f"(фото+текст як /check)"
             )
         else:
@@ -1390,5 +1397,6 @@ def notify_bot_users_with_images(
         time.sleep(0.05)
 
     log_to_buffer(
-        f"📬 DM бота: sent={sent} failed={failed} users={len(targets)}"
+        f"📬 DM бота: sent={sent} failed={failed} users={len(targets)} "
+        f"(🔊={sent_sound} 🔇={sent_quiet})"
     )
