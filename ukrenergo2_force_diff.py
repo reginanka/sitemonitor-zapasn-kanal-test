@@ -7,7 +7,7 @@ Env:
   FORCE_STATUS          — normal | shortage | outage_schedules | emergency_outages | grid_damage
                           (за замовчуванням — shortage)
   FORCE_STATUS_CODE     — опційно, числовий код (3/4/9/10/11)
-  UKRENERGO2_REGION_SLUG, MAYACHOK_MONGO_URI, MAYACHOK_MONGO_DB тощо — як у monitor
+  UKRENERGO2_REGION_SLUG, MONGO_URI, MONGO_DB тощо — як у monitor
 """
 
 from __future__ import annotations

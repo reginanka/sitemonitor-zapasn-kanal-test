@@ -30,15 +30,10 @@ from pymongo import MongoClient
 
 
 def main() -> int:
-    uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
-    db_name = (
-        os.getenv("ZTOE_MONGO_DB")
-        or os.getenv("MONGO_DB")
-        or os.getenv("MAYACHOK_MONGO_DB")
-        or "vidkluchennya"
-    )
+    uri = os.getenv("MONGO_URI")
+    db_name = os.getenv("MONGO_DB") or "vidkluchennya"
     if not uri:
-        print("❌ Немає MAYACHOK_MONGO_URI / MONGO_URI", file=sys.stderr)
+        print("❌ Немає MONGO_URI", file=sys.stderr)
         return 1
 
     client = MongoClient(uri, serverSelectionTimeoutMS=8000)

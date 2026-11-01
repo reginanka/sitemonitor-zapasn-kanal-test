@@ -115,8 +115,8 @@ def send_region_dms(message: str) -> tuple[int, int]:
         log_to_buffer(f"❌ pymongo для DM: {e}")
         return 0, 0
 
-    uri = (os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI") or "").strip()
-    db_name = (os.getenv("ZTOE_MONGO_DB") or os.getenv("MONGO_DB") or "").strip()
+    uri = (os.getenv("MONGO_URI") or "").strip()
+    db_name = (os.getenv("MONGO_DB") or "").strip()
     if not uri or not db_name:
         log_to_buffer("⚠️ Mongo URI/DB немає — DM region пропуск")
         return 0, 0
@@ -281,15 +281,10 @@ def level_from_cities(total_cities: int) -> Tuple[str, str, str]:
 
 def get_mongo_col():
     """Колекція accidents_summary або None."""
-    uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
+    uri = os.getenv("MONGO_URI")
     if not uri:
         return None
-    db_name = (
-        os.getenv("ZTOE_MONGO_DB")
-        or os.getenv("MONGO_DB")
-        or os.getenv("MAYACHOK_MONGO_DB")
-        or "vidkluchennya"
-    )
+    db_name = os.getenv("MONGO_DB") or "vidkluchennya"
     try:
         from pymongo import MongoClient
 
@@ -649,12 +644,7 @@ def save_to_mongo(
         log_to_buffer("⚠️ Немає MONGO_URI — пропускаємо запис у Mongo")
         return
 
-    db_name = (
-        os.getenv("ZTOE_MONGO_DB")
-        or os.getenv("MONGO_DB")
-        or os.getenv("MAYACHOK_MONGO_DB")
-        or "vidkluchennya"
-    )
+    db_name = os.getenv("MONGO_DB") or "vidkluchennya"
 
     try:
         prev = prev or {}

@@ -2,8 +2,8 @@
 Запис у спільну Mongo БД vidkluchennya (бот ztoe + sitemonitor).
 
 Env:
-  MAYACHOK_MONGO_URI | MONGO_URI
-  ZTOE_MONGO_DB | MONGO_DB | MAYACHOK_MONGO_DB  (default: vidkluchennya)
+  MONGO_URI  — connection string
+  MONGO_DB   — назва БД (default: vidkluchennya)
 
 PNG по чергах більше НЕ зберігаються.
 Залишено лише site screenshot (один скрін ЖОЕ).
@@ -19,20 +19,15 @@ from typing import Any, Optional
 from pymongo import MongoClient
 from gridfs import GridFS
 
-# Єдиний ланцюг імені БД для monitor / ukrenergo2 / бота ztoe.
-# У GitHub Secrets виставте ZTOE_MONGO_DB (або MONGO_DB) однаково для всіх workflow.
-DB_NAME = (
-    os.getenv("ZTOE_MONGO_DB")
-    or os.getenv("MONGO_DB")
-    or os.getenv("MAYACHOK_MONGO_DB")
-    or "vidkluchennya"
-)
+# Єдина назва БД для monitor / ukrenergo2 / бота ztoe.
+# У GitHub Secrets виставте MONGO_DB однаково для всіх workflow.
+DB_NAME = os.getenv("MONGO_DB") or "vidkluchennya"
 
 
 def get_db():
-    uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
+    uri = os.getenv("MONGO_URI")
     if not uri:
-        raise RuntimeError("Немає MONGO_URI / MAYACHOK_MONGO_URI")
+        raise RuntimeError("Немає MONGO_URI")
     client = MongoClient(uri, serverSelectionTimeoutMS=15000)
     client.admin.command("ping")
     return client[DB_NAME]

@@ -30,21 +30,9 @@ REGION_NAME_OVERRIDE = (os.getenv("UKRENERGO2_REGION_NAME") or "").strip()
 SUBSCRIBE = os.getenv("SUBSCRIBE", "")
 STALE_HOURS = 2
 
-# Mongo: той самий URI, що для Маячка (або окремий)
-MONGO_URI = (
-    os.getenv("MAYACHOK_MONGO_URI")
-    or os.getenv("MONGO_URI")
-    or ""
-).strip()
-# Той самий ланцюг, що mongo_store.py / бот ztoe (не powerbot!).
-# Інакше статус пишеться в одну БД, а /check читає з іншої.
-MONGO_DB = (
-    os.getenv("ZTOE_MONGO_DB")
-    or os.getenv("MONGO_DB")
-    or os.getenv("MAYACHOK_MONGO_DB")
-    or os.getenv("MONGO_DB_NAME")
-    or "vidkluchennya"
-).strip()
+# Mongo: єдині змінні для всього проєкту
+MONGO_URI = (os.getenv("MONGO_URI") or "").strip()
+MONGO_DB = (os.getenv("MONGO_DB") or "vidkluchennya").strip()
 # Колекція стану Укренерго 2
 COLLECTION = "ukrenergo2_states"
 IMAGES_DIR = Path("assets/ukrenergo2")
@@ -117,8 +105,7 @@ def esc(value: Any) -> str:
 def _get_db():
     if not MONGO_URI:
         raise RuntimeError(
-            "MAYACHOK_MONGO_URI (або MONGO_URI) не задано — "
-            "стан Укренерго 2 зберігається в MongoDB"
+            "MONGO_URI не задано — стан Укренерго 2 зберігається в MongoDB"
         )
     from pymongo import MongoClient
 

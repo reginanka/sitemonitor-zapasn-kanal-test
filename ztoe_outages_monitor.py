@@ -726,11 +726,11 @@ def user_queue_key(addr: dict) -> str:
 
 
 def main() -> int:
-    mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
+    mongo_uri = os.getenv("MONGO_URI")
     if not mongo_uri:
         log.error("Немає MONGO_URI")
         return 1
-    db_name = os.getenv("ZTOE_MONGO_DB") or os.getenv("MONGO_DB") or "vidkluchennya"
+    db_name = os.getenv("MONGO_DB") or "vidkluchennya"
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not bot_token:
         log.error("Немає ZTOE_BOT_TOKEN")

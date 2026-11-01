@@ -7,8 +7,8 @@
 якщо змінилася — сповіщає користувачів з users (notify=true) і оновлює їх addresses.
 
 Secrets / env:
-  MAYACHOK_MONGO_URI або MONGO_URI  — MongoDB connection string
-  ZTOE_MONGO_DB або MONGO_DB        — назва БД (напр. vidkluchennya)
+  MONGO_URI  — MongoDB connection string
+  MONGO_DB   — назва БД (напр. vidkluchennya)
   ZTOE_BOT_TOKEN або TELEGRAM_BOT_TOKEN — токен бота для сповіщень користувачам
 """
 
@@ -484,12 +484,12 @@ def send_log(text: str, message_thread_id: int = 155) -> None:
 
 
 def main() -> int:
-    mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
-    mongo_db = os.getenv("ZTOE_MONGO_DB") or os.getenv("MONGO_DB") or "vidkluchennya"
+    mongo_uri = os.getenv("MONGO_URI")
+    mongo_db = os.getenv("MONGO_DB") or "vidkluchennya"
     bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 
     if not mongo_uri:
-        log.error("Немає MAYACHOK_MONGO_URI / MONGO_URI")
+        log.error("Немає MONGO_URI")
         return 1
     if not bot_token:
         log.error("Немає ZTOE_BOT_TOKEN / TELEGRAM_BOT_TOKEN")

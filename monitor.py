@@ -625,9 +625,9 @@ def sync_schedules_to_mongo(
     date / slots беруться з реальних дат у records (current.json),
     а не лише з «сьогодні по годиннику раннера».
     """
-    mongo_uri = os.getenv("MAYACHOK_MONGO_URI") or os.getenv("MONGO_URI")
+    mongo_uri = os.getenv("MONGO_URI")
     if not mongo_uri:
-        log_to_buffer("⚠️ MONGO_URI / MAYACHOK_MONGO_URI не задано — пропуск запису графіків у БД")
+        log_to_buffer("⚠️ MONGO_URI не задано — пропуск запису графіків у БД")
         return
 
     try:
