@@ -22,6 +22,8 @@ Env:
 
 from __future__ import annotations
 
+import re
+
 import asyncio
 import logging
 import os
@@ -678,9 +680,24 @@ def matches_building(outage: dict, house: str) -> bool:
     return h2 in tokens or any(t.lstrip("0") == h2 for t in tokens)
 
 
-def outage_to_mongo_doc(outage: dict, queue_key: str = "") -> dict:
-    from outage_events import parse_queue_from_koment
 
+_GPV_RE = re.compile(
+    r"(?:ГПВ|черг[аи]?)\s*[-–]?\s*(\d+)\s*[.,]\s*(\d+)",
+    re.IGNORECASE,
+)
+
+
+def parse_queue_from_koment(koment: str):
+    """Витягує мітку черги на кшталт «3.1» з koment, або None."""
+    if not koment:
+        return None
+    m = _GPV_RE.search(koment)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    return None
+
+
+def outage_to_mongo_doc(outage: dict, queue_key: str = "") -> dict:
     city = outage.get("city") or {}
     street = outage.get("street") or {}
     otg = outage.get("otg") or {}
