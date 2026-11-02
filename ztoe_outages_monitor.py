@@ -748,7 +748,7 @@ def main() -> int:
         log.error("Немає MONGO_URI")
         return 1
     db_name = os.getenv("MONGO_DB") or "vidkluchennya"
-    bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    bot_token = os.getenv("ZTOE_BOT_TOKEN")
     if not bot_token:
         log.error("Немає ZTOE_BOT_TOKEN")
         return 1

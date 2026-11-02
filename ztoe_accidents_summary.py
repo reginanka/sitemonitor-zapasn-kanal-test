@@ -100,13 +100,9 @@ def send_region_dms(message: str) -> tuple[int, int]:
     Особисті DM підписникам з notify_prefs.region=true.
     Повертає (sent, failed).
     """
-    token = (
-        os.getenv("ZTOE_BOT_TOKEN")
-        or os.getenv("TELEGRAM_BOT_TOKEN")
-        or ""
-    ).strip()
+    token = (os.getenv("ZTOE_BOT_TOKEN") or "").strip()
     if not token:
-        log_to_buffer("⚠️ ZTOE_BOT_TOKEN / TELEGRAM_BOT_TOKEN немає — DM region пропуск")
+        log_to_buffer("⚠️ ZTOE_BOT_TOKEN немає — DM region пропуск")
         return 0, 0
 
     try:
@@ -209,11 +205,13 @@ def send_log_to_channel(title: str = "📊 ЛОГ · АВАРІЇ ЖОЕ", messa
     except Exception as e:
         print(f"log_utils send failed: {e}")
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+    token = os.getenv("ZTOE_BOT_TOKEN") or ""
     chat_id = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or ""
     if not token or not chat_id or not _log_lines:
         if not chat_id:
             print("⚠️ TELEGRAM_LOG_CHANNEL_ID не задано — лог у канал не піде")
+        elif not token:
+            print("⚠️ ZTOE_BOT_TOKEN не задано — лог у канал не піде")
         return
 
     try:

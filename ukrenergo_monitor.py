@@ -341,7 +341,7 @@ def main() -> None:
 
             from bot_notify import is_quiet_now, load_notify_users
             targets = collect_notify_targets(None, kind="ukrenergo")
-            bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+            bot_token = os.getenv("ZTOE_BOT_TOKEN")
             if not targets:
                 log_to_buffer("ℹ️ Немає підписників бота для DM статусу")
             elif not bot_token:

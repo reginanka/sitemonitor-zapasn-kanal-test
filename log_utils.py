@@ -6,7 +6,8 @@ from typing import List, Optional
 import pytz
 import requests
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Логи шле тільки ZTOE-бот (без fallback на TELEGRAM_BOT_TOKEN)
+ZTOE_BOT_TOKEN = os.getenv("ZTOE_BOT_TOKEN")
 TELEGRAM_LOG_CHANNEL_ID = os.getenv("TELEGRAM_LOG_CHANNEL_ID")
 # опційно: глобальний thread (якщо не передали в send_log_to_channel)
 TELEGRAM_LOG_THREAD_ID = os.getenv("TELEGRAM_LOG_THREAD_ID")
@@ -34,8 +35,9 @@ def send_log_to_channel(
     Одне повідомлення в лог-групу (з гілкою) + файл .txt з повним логом.
     message_thread_id — ID теми (topic) у супергрупі.
     Якщо не передано — береться з TELEGRAM_LOG_THREAD_ID (env).
+    Шле виключно через ZTOE_BOT_TOKEN.
     """
-    if not TELEGRAM_LOG_CHANNEL_ID or not TELEGRAM_BOT_TOKEN or not log_messages:
+    if not TELEGRAM_LOG_CHANNEL_ID or not ZTOE_BOT_TOKEN or not log_messages:
         return
 
     # пріоритет: аргумент → env → без гілки
@@ -63,7 +65,7 @@ def send_log_to_channel(
             "utf-8"
         )
 
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        url = f"https://api.telegram.org/bot{ZTOE_BOT_TOKEN}/sendDocument"
         files = {
             "document": (filename, io.BytesIO(file_bytes), "text/plain; charset=utf-8"),
         }
@@ -86,7 +88,7 @@ def send_log_to_channel(
             if thread_id is not None:
                 fallback_data["message_thread_id"] = thread_id
             requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                f"https://api.telegram.org/bot{ZTOE_BOT_TOKEN}/sendMessage",
                 data=fallback_data,
                 timeout=10,
             )

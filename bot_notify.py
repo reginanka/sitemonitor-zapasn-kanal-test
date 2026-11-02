@@ -265,9 +265,9 @@ def collect_notify_targets(
     *,
     kind: Optional[str] = None,
 ) -> Dict[int, List[Tuple[str, dict]]]:
-    bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    bot_token = os.getenv("ZTOE_BOT_TOKEN")
     if not bot_token:
-        log_to_buffer("⚠️ ZTOE_BOT_TOKEN / TELEGRAM_BOT_TOKEN немає — пропуск DM")
+        log_to_buffer("⚠️ ZTOE_BOT_TOKEN немає — пропуск DM")
         return {}
 
     try:
@@ -1260,9 +1260,9 @@ def notify_bot_users_with_images(
       якщо не вміщається — під фото лише шапка, дні окремими повідомленнями.
       другий день — завжди окремо, якщо не вліз у caption.
     """
-    bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    bot_token = os.getenv("ZTOE_BOT_TOKEN")
     if not bot_token:
-        log_to_buffer("⚠️ Немає токена бота — DM не шлемо")
+        log_to_buffer("⚠️ Немає ZTOE_BOT_TOKEN — DM не шлемо")
         return
 
     if all_user_queues:

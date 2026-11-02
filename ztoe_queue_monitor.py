@@ -9,7 +9,7 @@
 Secrets / env:
   MONGO_URI  — MongoDB connection string
   MONGO_DB   — назва БД (напр. vidkluchennya)
-  ZTOE_BOT_TOKEN або TELEGRAM_BOT_TOKEN — токен бота для сповіщень користувачам
+  ZTOE_BOT_TOKEN — токен бота для сповіщень користувачам і логів
 """
 
 from __future__ import annotations
@@ -454,16 +454,16 @@ def addr_matches_doc(addr: dict, doc: dict) -> bool:
 
 
 def send_log(text: str, message_thread_id: int = 155) -> None:
-    """Пише підсумок у лог-групу ботом репо (TELEGRAM_BOT_TOKEN).
+    """Пише підсумок у лог-групу ботом ZTOE (ZTOE_BOT_TOKEN).
     155 — гілка «Перевірка черг».
     """
     channel = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or os.getenv("ZTOE_LOG_CHANNEL_ID")
-    log_token = os.getenv("TELEGRAM_BOT_TOKEN")  # той самий, що в інших monitor'ах
+    log_token = os.getenv("ZTOE_BOT_TOKEN")
     if not channel:
         log.info("TELEGRAM_LOG_CHANNEL_ID не задано — пропуск лог-каналу")
         return
     if not log_token:
-        log.info("TELEGRAM_BOT_TOKEN не задано — пропуск лог-каналу")
+        log.info("ZTOE_BOT_TOKEN не задано — пропуск лог-каналу")
         return
     try:
         log_bot = Bot(token=log_token)
@@ -486,13 +486,13 @@ def send_log(text: str, message_thread_id: int = 155) -> None:
 def main() -> int:
     mongo_uri = os.getenv("MONGO_URI")
     mongo_db = os.getenv("MONGO_DB") or "vidkluchennya"
-    bot_token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    bot_token = os.getenv("ZTOE_BOT_TOKEN")
 
     if not mongo_uri:
         log.error("Немає MONGO_URI")
         return 1
     if not bot_token:
-        log.error("Немає ZTOE_BOT_TOKEN / TELEGRAM_BOT_TOKEN")
+        log.error("Немає ZTOE_BOT_TOKEN")
         return 1
 
     client = MongoClient(mongo_uri, serverSelectionTimeoutMS=15000)
