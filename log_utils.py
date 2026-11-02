@@ -37,7 +37,13 @@ def send_log_to_channel(
     Якщо не передано — береться з TELEGRAM_LOG_THREAD_ID (env).
     Шле виключно через ZTOE_BOT_TOKEN.
     """
-    if not TELEGRAM_LOG_CHANNEL_ID or not ZTOE_BOT_TOKEN or not log_messages:
+    if not log_messages:
+        return
+    if not TELEGRAM_LOG_CHANNEL_ID:
+        print("⚠️ TELEGRAM_LOG_CHANNEL_ID не задано — лог у канал не піде")
+        return
+    if not ZTOE_BOT_TOKEN:
+        print("⚠️ ZTOE_BOT_TOKEN не задано — лог у канал не піде (логи шле тільки ZTOE-бот)")
         return
 
     # пріоритет: аргумент → env → без гілки
