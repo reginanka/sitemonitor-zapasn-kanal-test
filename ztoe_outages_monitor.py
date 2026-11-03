@@ -4,6 +4,8 @@
 
 Оптимізації:
 - один fetch на otg_id (без city), фільтр міста в пам'яті
+- ловить продовження аварії по addr_day (city+street+buildings+день),
+  навіть коли ЖОЕ видає новий id замість оновлення старого
 - спільний httpx.Client
 - bulk_write у Mongo замість поштучних update_one
 - без подвійного retry empty+city
@@ -238,6 +240,21 @@ def soft_fingerprint(outage: dict) -> str:
     return f"{city}|{sid}|{','.join(parts)}|{start}"
 
 
+def addr_day_key(outage: dict) -> str:
+    """
+    Ключ «та сама адреса + той самий день» — незалежно від id і години старту.
+    Потрібен, щоб ловити продовження аварії, коли ЖОЕ закриває старий запис
+    і відкриває новий id з іншим dateEvent / datePlanIn.
+    """
+    street = outage.get("street") or {}
+    sid = street.get("id") or (street.get("name") or "").strip().lower()
+    buildings = (outage.get("buildingNames") or "").strip().lower()
+    parts = sorted({p.strip() for p in buildings.replace(";", ",").split(",") if p.strip()})
+    city = (outage.get("city") or {}).get("id") or ""
+    day = (outage.get("dateEvent") or outage.get("datePlanIn") or "")[:10]
+    return f"{city}|{sid}|{','.join(parts)}|{day}"
+
+
 def format_outage(outage: dict) -> str:
     city = (outage.get("city") or {}).get("name", "?")
     street = (outage.get("street") or {}).get("name", "?")
@@ -245,15 +262,25 @@ def format_outage(outage: dict) -> str:
     date_event = (outage.get("dateEvent") or "")[:16].replace("T", " ")
     date_plan = (outage.get("datePlanIn") or "")[:16].replace("T", " ")
     icon, type_name, type_desc = outage_notify_label(outage)
-    text = f"{icon} <b>{city}, {street}</b>\n📌 {type_name}"
-    if type_desc:
-        text += f" — {type_desc}"
+    if outage.get("_plan_updated"):
+        text = f"⏱ <b>Оновлення:</b> {city}, {street}\n📌 {type_name}"
+        if type_desc:
+            text += f" — {type_desc}"
+        was = (outage.get("_plan_was") or "")[:16].replace("T", " ")
+        if was and date_plan and was != date_plan:
+            text += f"\n⏳ План увімкнення: <s>{was}</s> → <b>{date_plan}</b>"
+        elif date_plan:
+            text += f"\n⏳ До (план): {date_plan}"
+    else:
+        text = f"{icon} <b>{city}, {street}</b>\n📌 {type_name}"
+        if type_desc:
+            text += f" — {type_desc}"
+        if date_plan:
+            text += f"\n⏳ До (план): {date_plan}"
     if buildings:
         text += f"\n🏘 Будинки: {buildings}"
     if date_event:
         text += f"\n⏰ З: {date_event}"
-    if date_plan:
-        text += f"\n⏳ До (план): {date_plan}"
     koment = (outage.get("koment") or "").strip()
     if koment:
         text += f"\n💬 {koment}"
@@ -844,13 +871,63 @@ def main() -> int:
                 filtered.append(o)
             new_outages = filtered
 
+            # --- продовження / зміна часу по тій самій адресі+дню (навіть при новому id) ---
+            prev_plans_addr = {
+                str(k): str(v)[:16]
+                for k, v in (cache.get("plan_by_addr_day") or {}).items()
+            }
+            plan_updates: list = []
+            seen_plan_oids: set = set()
+            new_fp_set = {content_fingerprint(o) for o in new_outages}
+
+            for o in outages:
+                if not should_notify_outage(o):
+                    continue
+                adk = addr_day_key(o)
+                if not adk:
+                    continue
+                new_plan = (o.get("datePlanIn") or "")[:16]
+                old_plan = (prev_plans_addr.get(adk) or "")[:16]
+                if not old_plan or not new_plan or old_plan == new_plan:
+                    continue
+                # уже піде як «нова» — не дублюємо
+                if content_fingerprint(o) in new_fp_set:
+                    continue
+                oid = make_outage_key(o)
+                if oid in seen_plan_oids:
+                    continue
+                oo = dict(o)
+                oo["_plan_updated"] = True
+                oo["_plan_was"] = old_plan
+                oo["_plan_reason"] = "addr_day"
+                plan_updates.append(oo)
+                seen_plan_oids.add(oid)
+                log.info(
+                    "otg=%s city=%s plan change (addr_day): %s → %s id=%s",
+                    otg_id,
+                    city_id,
+                    old_plan,
+                    new_plan,
+                    o.get("id"),
+                )
+
+            if plan_updates:
+                log.info(
+                    "otg=%s city=%s plan_updates=%s",
+                    otg_id,
+                    city_id,
+                    len(plan_updates),
+                )
+                new_outages = list(new_outages) + plan_updates
+
             log.info(
-                "otg=%s city=%s fetched=%s cache_fps=%s new=%s",
+                "otg=%s city=%s fetched=%s cache_fps=%s new=%s plan_upd=%s",
                 otg_id,
                 city_id,
                 len(outages),
                 len(prev_fps),
-                len(new_outages),
+                max(0, len(new_outages) - len(plan_updates)),
+                len(plan_updates),
             )
 
             # Bulk upsert full docs (для /check)
@@ -940,25 +1017,34 @@ def main() -> int:
                             addr.get("house"),
                         )
 
-            # Кеш fps (soft_fps з капом, щоб документ не товстішав роками)
-            if prev_fps or matched_fps or not new_outages:
-                soft_stored = merge_soft_fps(current_soft, prev_soft, SOFT_FPS_MAX)
-                outages_col.update_one(
-                    {"_id": cache_key},
-                    {
-                        "$set": {
-                            "ids": list(current_ids),
-                            "fps": list(current_fps),
-                            "soft_fps": soft_stored,
-                            "updated_at": datetime.now(timezone.utc),
-                            "count": len(current_ids),
-                        }
-                    },
-                    upsert=True,
-                )
-            else:
+            # Кеш завжди оновлюємо (інакше втрачаємо plan_by_addr_day і «не бачимо» продовжень)
+            soft_stored = merge_soft_fps(current_soft, prev_soft, SOFT_FPS_MAX)
+            plan_by_addr_day = {}
+            for o in outages:
+                adk = addr_day_key(o)
+                plan = (o.get("datePlanIn") or "")[:16]
+                if adk and plan:
+                    # беремо найпізніший plan на випадок кількох записів
+                    prev_p = plan_by_addr_day.get(adk, "")
+                    if not prev_p or plan > prev_p:
+                        plan_by_addr_day[adk] = plan
+            outages_col.update_one(
+                {"_id": cache_key},
+                {
+                    "$set": {
+                        "ids": list(current_ids),
+                        "fps": list(current_fps),
+                        "soft_fps": soft_stored,
+                        "plan_by_addr_day": plan_by_addr_day,
+                        "updated_at": datetime.now(timezone.utc),
+                        "count": len(current_ids),
+                    }
+                },
+                upsert=True,
+            )
+            if new_outages and not matched_fps:
                 log.warning(
-                    "otg=%s city=%s: new=%s but 0 matched — cache NOT updated (можна виправити адреси і повторити)",
+                    "otg=%s city=%s: new/plan=%s but 0 matched — адреса не збіглась",
                     otg_id,
                     city_id,
                     len(new_outages),
