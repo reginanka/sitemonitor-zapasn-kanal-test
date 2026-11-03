@@ -841,31 +841,86 @@ def main() -> int:
         from bot_notify import user_wants as _user_wants, is_quiet_now as _is_quiet
     except Exception:
         def _user_wants(u, kind):
+            # як у боті: notify не False → можна
+            if not u:
+                return False
+            if u.get("notify", True) is False:
+                return False
             return True
 
         def _is_quiet(_u):
             return False
 
-    # --- зібрати унікальні вулиці з підписників ---
-    raw_users = list(users_col.find({"notify": True}))
-    users = [u for u in raw_users if _user_wants(u, "hourly")]
+    def _addr_list(u: dict) -> list:
+        if isinstance(u.get("addresses"), list) and u["addresses"]:
+            return [a for a in u["addresses"] if isinstance(a, dict)]
+        if isinstance(u.get("address"), dict):
+            return [u["address"]]
+        return []
 
-    # key -> {otg, city, street, pairs: [(user, addr_index, addr), ...]}
+    def _city_of(a: dict) -> str:
+        return (
+            a.get("city_name")
+            or a.get("city")
+            or (a.get("cityName") if isinstance(a.get("cityName"), str) else "")
+            or ""
+        ).strip()
+
+    def _street_of(a: dict) -> str:
+        return (
+            a.get("street_name")
+            or a.get("street")
+            or a.get("streetName")
+            or ""
+        ).strip()
+
+    def _otg_of(a: dict) -> str:
+        return (
+            a.get("otg_name")
+            or a.get("otg")
+            or a.get("rem_name")
+            or a.get("otgName")
+            or ""
+        ).strip()
+
+    # notify: true АБО поле відсутнє (у боті default True)
+    raw_users = list(
+        users_col.find({"$or": [{"notify": True}, {"notify": {"$exists": False}}]})
+    )
+    # Фільтр hourly лише на етапі РОЗСИЛКИ; перевірку черг робимо для всіх з notify
+    users = list(raw_users)
+
     streets: dict = {}
+    skip_reasons: Counter = Counter()
     for u in users:
-        addrs = u.get("addresses") or ([u["address"]] if u.get("address") else [])
-        if not isinstance(addrs, list):
+        addrs = _addr_list(u)
+        if not addrs:
+            skip_reasons["no_addresses"] += 1
             continue
         for idx, a in enumerate(addrs):
-            if not isinstance(a, dict):
+            street = _street_of(a)
+            city = _city_of(a)
+            otg = _otg_of(a)
+            # лише черга без вулиці — з сайту не звірити
+            if a.get("queue_only") and not street:
+                skip_reasons["queue_only"] += 1
                 continue
-            # queue-only без вулиці — кроном чергу з сайту не витягнути
-            if a.get("queue_only") and not (a.get("street_name") or a.get("street")):
+            if not street:
+                skip_reasons["no_street"] += 1
+                log.info(
+                    "skip addr tid=%s keys=%s",
+                    u.get("telegram_id"),
+                    sorted(a.keys()),
+                )
                 continue
-            otg = (a.get("otg_name") or "").strip()
-            city = (a.get("city_name") or "").strip()
-            street = (a.get("street_name") or a.get("street") or "").strip()
-            if not city or not street:
+            if not city:
+                skip_reasons["no_city"] += 1
+                log.info(
+                    "skip no city tid=%s street=%r keys=%s",
+                    u.get("telegram_id"),
+                    street,
+                    sorted(a.keys()),
+                )
                 continue
             key = address_key(otg, city, street)
             bucket = streets.setdefault(
@@ -875,19 +930,22 @@ def main() -> int:
             bucket["pairs"].append((u, idx, a))
 
     log.info(
-        "users=%s streets_unique=%s timeout=%ss pause=%ss skip_min=%s",
+        "users=%s streets_unique=%s skip=%s timeout=%ss pause=%ss skip_min=%s",
         len(users),
         len(streets),
+        dict(skip_reasons),
         HTTP_TIMEOUT,
         REQUEST_PAUSE_SEC,
         SKIP_RECENT_MINUTES,
     )
 
     if not streets:
+        detail = ", ".join(f"{k}={v}" for k, v in skip_reasons.most_common()) or "—"
         send_log(
             "✅ <b>Перевірка черг</b>\n\n"
-            "Немає адрес з вулицею для перевірки "
-            f"(підписників notify: {len(raw_users)})."
+            "Немає адрес з вулицею для перевірки.\n"
+            f"Юзерів у вибірці: <b>{len(raw_users)}</b>\n"
+            f"Причини пропуску: {detail}"
         )
         return 0
 
