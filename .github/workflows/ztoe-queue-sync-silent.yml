@@ -1,4 +1,4 @@
-name: ZTOE queues weekly
+name: ZTOE queues weekly silent
 
 on:
   workflow_dispatch:
