@@ -827,9 +827,13 @@ def addr_matches_doc(addr: dict, doc: dict) -> bool:
         == _norm(doc.get("street_name", ""))
     )
 
-def send_log(text: str, message_thread_id: int = 155) -> None:
-    """Пише підсумок у лог-групу ботом ZTOE (ZTOE_BOT_TOKEN).
-    155 — гілка «Перевірка черг».
+# Гілка «Перевірка черг» у лог-групі. Не публічний канал.
+QUEUE_LOG_THREAD_ID = 155
+
+
+def send_log(text: str, message_thread_id: int = QUEUE_LOG_THREAD_ID) -> None:
+    """Підсумок у лог-групу ботом ZTOE (ZTOE_BOT_TOKEN + TELEGRAM_LOG_CHANNEL_ID).
+    Той самий чат і гілка 155, що й звичайна перевірка черг. Користувачам це не йде.
     """
     channel = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or os.getenv("ZTOE_LOG_CHANNEL_ID")
     log_token = os.getenv("ZTOE_BOT_TOKEN")
@@ -954,20 +958,11 @@ def main() -> int:
                 continue
             if not street:
                 skip_reasons["no_street"] += 1
-                log.info(
-                    "skip addr tid=%s keys=%s",
-                    u.get("telegram_id"),
-                    sorted(a.keys()),
-                )
+                log.info("skip addr: no street")
                 continue
             if not city:
                 skip_reasons["no_city"] += 1
-                log.info(
-                    "skip no city tid=%s street=%r keys=%s",
-                    u.get("telegram_id"),
-                    street,
-                    sorted(a.keys()),
-                )
+                log.info("skip addr: no city")
                 continue
             key = address_key(otg, city, street)
             bucket = streets.setdefault(
@@ -1008,6 +1003,9 @@ def main() -> int:
     errors = 0
     error_msg_counts: Counter = Counter()
     temp_msg_counts: Counter = Counter()
+    changed_cities: set[str] = set()
+    changed_user_ids: set[int] = set()
+    quiet_sync = os.getenv("ZTOE_QUEUE_SILENT", "").strip().lower() in ("1", "true", "yes")
 
     # run-level cache: key -> street_info dict
     run_cache: dict = {}
@@ -1038,7 +1036,7 @@ def main() -> int:
         if last_check and (now - last_check) < skip_delta and key not in run_cache:
             # можна взяти snapshot з directory якщо є queue
             if doc and (doc.get("queue") is not None or doc.get("all_houses")):
-                log.info("skip recent (%s min): %s", SKIP_RECENT_MINUTES, label)
+                log.info("skip recent (%s min)", SKIP_RECENT_MINUTES)
                 skipped_recent += 1
                 # synthetic street_info з directory для per-house update без мережі
                 street_info = {
@@ -1060,13 +1058,13 @@ def main() -> int:
                     continue
                 run_cache[key] = street_info
             else:
-                log.info("skip recent but no snapshot, will fetch: %s", label)
+                log.info("skip recent but no snapshot, will fetch")
 
         if key not in run_cache:
             try:
                 street_info = find_queue(otg, city, street)
             except httpx.TimeoutException as e:
-                log.warning("Timeout для %s: %s", label, e)
+                log.warning("Timeout")
                 directory.update_one(
                     {"_id": key},
                     {
@@ -1104,7 +1102,7 @@ def main() -> int:
 
             if street_info.get("temporary"):
                 msg = street_info.get("message") or street_info.get("error") or "temporary"
-                log.warning("Тимчасово недоступно: %s — %s", label, msg)
+                log.warning("Тимчасово недоступно")
                 directory.update_one(
                     {"_id": key},
                     {
@@ -1124,7 +1122,7 @@ def main() -> int:
 
             if street_info.get("error") and not street_info.get("ok"):
                 msg = street_info.get("message") or street_info.get("error") or "unknown"
-                log.warning("Не знайдено: %s — %s", label, msg)
+                log.warning("Не знайдено")
                 directory.update_one(
                     {"_id": key},
                     {
@@ -1184,10 +1182,7 @@ def main() -> int:
             run_cache[key] = street_info
             checked += 1
             log.info(
-                "fetched %s q=%s.%s houses=%s pairs=%s",
-                label,
-                street_info.get("queue"),
-                street_info.get("subqueue"),
+                "fetched houses=%s pairs=%s",
                 len(street_info.get("all_houses") or []),
                 len(pairs),
             )
@@ -1269,6 +1264,8 @@ def main() -> int:
 
                 if old_fp and queue_number_fp(old_q, old_sq) != queue_number_fp(new_q, new_sq):
                     changed += 1
+                    changed_cities.add(city)
+                    changed_user_ids.add(int(tid))
                     notify_info = {**info, "queue": new_q, "subqueue": new_sq}
                     notify_label_house = house
                     notify_old = {
@@ -1276,15 +1273,9 @@ def main() -> int:
                         "subqueue": old_sq,
                         "note": a.get("queue_note") or "",
                     }
-                    log.info(
-                        "Зміна черги: %s house=%s %s|%s → %s|%s",
-                        label, house or "—", old_q, old_sq, new_q, new_sq,
-                    )
+                    log.info("Зміна черги (адресу в лог не пишемо)")
                 elif not old_fp and new_fp:
-                    log.info(
-                        "Перша фіксація черги (без notify): %s house=%s q=%s|%s",
-                        label, house or "—", new_q, new_sq,
-                    )
+                    log.info("Перша фіксація черги (без notify, адресу в лог не пишемо)")
 
             if not touched:
                 continue
@@ -1297,7 +1288,7 @@ def main() -> int:
                 {"$set": {"addresses": new_addrs}, "$unset": {"address": ""}},
             )
 
-            if notify_info is None:
+            if notify_info is None or quiet_sync:
                 continue
             if not _user_wants(user, "hourly"):
                 continue
@@ -1314,10 +1305,7 @@ def main() -> int:
                 notify_info.get("note", ""),
             )
             if was == now_lbl:
-                log.info(
-                    "Підпис не змінився, notify пропущено: %s %s",
-                    tid, was,
-                )
+                log.info("Підпис не змінився, notify пропущено")
                 continue
             text_msg = (
                 "🔔 <b>Змінилася черга відключень:</b>\n\n"
@@ -1338,22 +1326,37 @@ def main() -> int:
 
                 asyncio.run(_send())
                 notified_users += 1
-                log.info("Надіслано %s silent=%s", tid, silent)
+                log.info("Надіслано silent=%s", silent)
                 time.sleep(0.35)
             except Exception as e:
-                log.error("Не вдалося надіслати %s: %s", tid, e)
+                log.error("Не вдалося надіслати сповіщення")
 
-    summary = (
-        f"✅ <b>Перевірка черг</b>\n\n"
-        f"Підписників: <b>{len(users)}</b>\n"
-        f"Унікальних вулиць: <b>{len(streets)}</b>\n"
-        f"Запитів на сайт: <b>{checked}</b>\n"
-        f"Пропущено (недавно): <b>{skipped_recent}</b>\n"
-        f"Черга змінилась: <b>{changed}</b>\n"
-        f"Сповіщено людей: <b>{notified_users}</b>\n"
-        f"Сайт тимчасово недоступний: <b>{skipped_temp}</b>\n"
-        f"Помилок: <b>{errors}</b>"
-    )
+    if quiet_sync:
+        cities = sorted(changed_cities, key=lambda s: s.lower())
+        city_block = "\n".join(f"• {c}" for c in cities) if cities else "—"
+        summary = (
+            "✅ <b>Тихе оновлення черг</b>\n\n"
+            f"Користувачів, у кого замінили чергу: <b>{len(changed_user_ids)}</b>\n"
+            f"Адрес зі зміненою чергою: <b>{changed}</b>\n"
+            f"Населених пунктів: <b>{len(cities)}</b>\n"
+            f"{city_block}\n\n"
+            "Користувачам нічого не надіслано.\n"
+            f"Запитів на сайт: <b>{checked}</b>\n"
+            f"Помилок: <b>{errors}</b>\n"
+            f"Сайт тимчасово недоступний: <b>{skipped_temp}</b>"
+        )
+    else:
+        summary = (
+            f"✅ <b>Перевірка черг</b>\n\n"
+            f"Підписників: <b>{len(users)}</b>\n"
+            f"Унікальних вулиць: <b>{len(streets)}</b>\n"
+            f"Запитів на сайт: <b>{checked}</b>\n"
+            f"Пропущено (недавно): <b>{skipped_recent}</b>\n"
+            f"Черга змінилась: <b>{changed}</b>\n"
+            f"Сповіщено людей: <b>{notified_users}</b>\n"
+            f"Сайт тимчасово недоступний: <b>{skipped_temp}</b>\n"
+            f"Помилок: <b>{errors}</b>"
+        )
     if error_msg_counts:
         summary += "\n\n<b>Помилки</b>\n" + "\n".join(
             f"{m}: {c}" for m, c in error_msg_counts.most_common()
@@ -1367,7 +1370,7 @@ def main() -> int:
         "Готово users=%s streets=%s fetched=%s skip_recent=%s changed=%s notified=%s temp=%s err=%s",
         len(users), len(streets), checked, skipped_recent, changed, notified_users, skipped_temp, errors,
     )
-    send_log(summary)
+    send_log(summary, message_thread_id=QUEUE_LOG_THREAD_ID)
     return 0
 
 
