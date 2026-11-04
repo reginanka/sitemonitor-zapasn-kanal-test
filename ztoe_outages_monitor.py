@@ -510,6 +510,78 @@ def _classify_mongo_outage(doc: dict) -> Optional[str]:
     return None
 
 
+def split_day_slots(date_event: str, date_plan_in: str) -> List[dict]:
+    """
+    Розкласти проміжок API по добах. Годинник береться як у рядку, без зсуву TZ.
+    03.11 21:35 → 04.11 17:00 дає
+      03.11 21:35–24:00 і 04.11 00:00–17:00.
+    """
+
+    def wall(value: str):
+        s = (value or "").strip()
+        if len(s) < 16 or s[4] != "-" or s[10] not in "T ":
+            return None
+        try:
+            datetime.strptime(s[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+        hm = s[11:16]
+        if len(hm) != 5 or hm[2] != ":":
+            return None
+        return s[:10], hm
+
+    a = wall(date_event)
+    b = wall(date_plan_in)
+    if not a or not b:
+        return []
+    start_day, start_hm = a
+    end_day, end_hm = b
+    if (end_day, end_hm) <= (start_day, start_hm):
+        return []
+    day = datetime.strptime(start_day, "%Y-%m-%d").date()
+    last = datetime.strptime(end_day, "%Y-%m-%d").date()
+    if (last - day).days > 6:
+        last = day + timedelta(days=6)
+    slots: List[dict] = []
+    while day <= last:
+        ymd = day.isoformat()
+        if ymd == start_day and ymd == end_day:
+            slots.append({"date": ymd, "from": start_hm, "to": end_hm})
+        elif ymd == start_day:
+            slots.append({"date": ymd, "from": start_hm, "to": "24:00"})
+        elif ymd == end_day:
+            if end_hm != "00:00":
+                slots.append({"date": ymd, "from": "00:00", "to": end_hm})
+        else:
+            slots.append({"date": ymd, "from": "00:00", "to": "24:00"})
+        day += timedelta(days=1)
+    return slots
+
+
+def _slots_for_doc_day(doc: dict, ymd: str) -> List[Tuple[str, str]]:
+    """Готовий day_slots з Mongo, інакше той самий розклад із сирих дат."""
+    found: List[Tuple[str, str]] = []
+    for s in doc.get("day_slots") or []:
+        if not isinstance(s, dict):
+            continue
+        if str(s.get("date") or "")[:10] != ymd:
+            continue
+        fr = str(s.get("from") or "")[:5]
+        to = str(s.get("to") or "")[:5]
+        if fr and to:
+            found.append((fr, to))
+    if found:
+        return found
+    return [
+        (s["from"], s["to"])
+        for s in split_day_slots(
+            str(doc.get("dateEvent") or doc.get("date_from") or ""),
+            str(doc.get("datePlanIn") or doc.get("date_to") or ""),
+        )
+        if s.get("date") == ymd
+    ]
+
+
 def _buckets_for_addr_day(db, addr: dict, ymd: str) -> Dict[str, List[Tuple[str, str]]]:
     empty: Dict[str, List[Tuple[str, str]]] = {
         "emergency": [],
@@ -526,9 +598,8 @@ def _buckets_for_addr_day(db, addr: dict, ymd: str) -> Dict[str, List[Tuple[str,
         q["city_name"] = {"$regex": f"^{city}$", "$options": "i"}
     buckets = {"emergency": [], "repair": [], "other": []}
     for doc in db["outages"].find(q).limit(200):
-        de = str(doc.get("dateEvent") or doc.get("date_from") or "")
-        dp = str(doc.get("datePlanIn") or doc.get("date_to") or "")
-        if not (de.startswith(ymd) or dp.startswith(ymd)):
+        day_hit = _slots_for_doc_day(doc, ymd)
+        if not day_hit:
             continue
         ds = (doc.get("street_name") or "").strip().lower()
         sn = _norm_street(street)
@@ -548,10 +619,8 @@ def _buckets_for_addr_day(db, addr: dict, ymd: str) -> Dict[str, List[Tuple[str,
         kind = _classify_mongo_outage(doc)
         if not kind:
             continue
-        start = de[11:16] if len(de) >= 16 else ""
-        end = dp[11:16] if len(dp) >= 16 else ""
-        if start and end:
-            buckets[kind].append((start, end))
+        for fr, to in day_hit:
+            buckets[kind].append((fr, to))
     for k in buckets:
         buckets[k] = _merge_intervals(buckets[k])
     return buckets
@@ -561,6 +630,7 @@ def format_schedule_block_for_notify(
     db,
     addr: dict,
     outage: dict,
+    ymd: Optional[str] = None,
 ) -> str:
     """
     Блок під подією — стиль /check:
@@ -568,7 +638,7 @@ def format_schedule_block_for_notify(
       Деталі лише якщо є аварійні / ремонтні / інші
       (без спаму «🟠 Ремонтні: немає»).
     """
-    ymd = _outage_day_ymd(outage)
+    ymd = ymd or _outage_day_ymd(outage)
     display = _display_date_from_ymd(ymd)
     lab = user_queue_key(addr) or outage.get("_user_queue") or ""
     sched = _load_queue_doc(db, lab) if lab else None
@@ -644,26 +714,31 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
     """
     items: [(outage, addr), ...]
     Верх: список подій з датами.
-    Низ: графік на день події (сума погодинних+аварійних+ремонтних).
+    Низ: графік окремо на кожен день проміжку.
     """
     lines = ["⚠️ <b>Нові відключення по твоїх адресах:</b>", ""]
     seen_sched: set = set()
     for outage, addr in items[:10]:
         lines.append(format_outage(outage))
         lines.append("")
-        ymd = _outage_day_ymd(outage)
+        slots = split_day_slots(
+            str(outage.get("dateEvent") or ""),
+            str(outage.get("datePlanIn") or ""),
+        )
+        ymds = [s["date"] for s in slots] or [_outage_day_ymd(outage)]
         lab = user_queue_key(addr) or ""
-        key = f"{lab}|{ymd}|{(addr.get('city_name') or '')}|{(addr.get('street_name') or '')}"
-        if key in seen_sched:
-            continue
-        seen_sched.add(key)
-        try:
-            block = format_schedule_block_for_notify(db, addr, outage)
-            if block:
-                lines.append(block)
-                lines.append("")
-        except Exception as e:
-            log.warning("schedule block: %s", e)
+        for ymd in ymds:
+            key = f"{lab}|{ymd}|{(addr.get('city_name') or '')}|{(addr.get('street_name') or '')}"
+            if key in seen_sched:
+                continue
+            seen_sched.add(key)
+            try:
+                block = format_schedule_block_for_notify(db, addr, outage, ymd)
+                if block:
+                    lines.append(block)
+                    lines.append("")
+            except Exception as e:
+                log.warning("schedule block: %s", e)
     return "\n".join(lines).strip()
 
 
@@ -749,6 +824,10 @@ def outage_to_mongo_doc(outage: dict, queue_key: str = "") -> dict:
         "buildingNames": outage.get("buildingNames"),
         "dateEvent": outage.get("dateEvent"),
         "datePlanIn": outage.get("datePlanIn"),
+        "day_slots": split_day_slots(
+            str(outage.get("dateEvent") or ""),
+            str(outage.get("datePlanIn") or ""),
+        ),
         "koment": outage.get("koment"),
         "queue_key": qk,
         "queue": ch,
