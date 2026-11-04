@@ -741,18 +741,65 @@ def address_key(otg_name: str, city_name: str, street_name: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def _is_no_gpv_text(text: str) -> bool:
+    """Як bot/queue_client.py — статус «не вимикають / не відключають»."""
+    t = (text or "").strip().lower()
+    if not t or re.match(r"^[\d.]+$", t):
+        return False
+    return any(
+        m in t
+        for m in (
+            "не вимикається",
+            "не вимикають",
+            "не відключається",
+            "не відключають",
+        )
+    )
+
+
+def canonicalize_queue(queue: str, subqueue: str) -> tuple[str, str]:
+    """Та сама нормалізація, що в bot/handlers/add_address.py при збереженні адреси і /queue."""
+    raw_q = str(queue or "").strip()
+    raw_sq = str(subqueue or "").strip()
+    if _is_no_gpv_text(raw_q) or _is_no_gpv_text(raw_sq):
+        return "не вимикають, крім аварійних", ""
+    if not re.fullmatch(r"[1-6](\.[12])?", raw_q):
+        m = re.search(r"\b([1-6](?:\.[12])?)\b", raw_q)
+        if m:
+            raw_q = m.group(1)
+        else:
+            low = raw_q.lower()
+            if (
+                len(raw_q) > 12
+                or "оберіть" in low
+                or "рем" in low
+                or "андруш" in low
+            ):
+                raw_q = ""
+    if raw_sq and not re.fullmatch(r"[12]", raw_sq):
+        raw_sq = ""
+    return raw_q, raw_sq
+
+
 def queue_fingerprint(queue: str, subqueue: str, houses: str, note: str) -> str:
+    q, sq = canonicalize_queue(queue, subqueue)
     return "|".join([
-        (queue or "").strip(),
-        (subqueue or "").strip(),
+        q,
+        sq,
         (houses or "").strip(),
         (note or "").strip(),
     ])
 
 
 def queue_number_fp(queue: str, subqueue: str) -> str:
-    """Тільки номер черги+підчерги — для рішення «чи слати notify»."""
-    return f"{(queue or '').strip()}|{(subqueue or '').strip()}"
+    """Канонічний номер черги — те, що бачить користувач після /queue."""
+    q, sq = canonicalize_queue(queue, subqueue)
+    # «1» + підчерга «1» і суцільне «1.1» — один і той самий статус
+    if re.fullmatch(r"[1-6]", q) and re.fullmatch(r"[12]", sq):
+        return f"{q}.{sq}"
+    if re.fullmatch(r"[1-6]\.[12]", q):
+        return q
+    return f"{q}|{sq}"
 
 
 def _short_queue_label(queue: str, subqueue: str, note: str = "") -> str:
@@ -1187,22 +1234,28 @@ def main() -> int:
 
                 house = (a.get("house") or "").strip()
                 info = apply_house_to_info(street_info, house)
-                new_fp = queue_fingerprint(
-                    info.get("queue", ""),
-                    info.get("subqueue", ""),
-                    house or (info.get("houses") or ""),
-                    info.get("note", ""),
-                )
                 old_fp = a.get("queue_fp") or ""
                 old_q = (a.get("queue") or "").strip()
                 old_sq = (a.get("subqueue") or "").strip()
-                new_q = (info.get("queue") or "").strip()
-                new_sq = (info.get("subqueue") or "").strip()
+                new_q, new_sq = canonicalize_queue(
+                    info.get("queue", ""),
+                    info.get("subqueue", ""),
+                )
+                # порожній парсинг не затирає вже збережену чергу і не шле «зміну»
+                if not new_q and old_q:
+                    new_q, new_sq = canonicalize_queue(old_q, old_sq)
+                new_fp = queue_fingerprint(
+                    new_q,
+                    new_sq,
+                    house or (info.get("houses") or ""),
+                    info.get("note", ""),
+                )
 
                 updated = {
                     **a,
                     "queue": new_q,
                     "subqueue": new_sq,
+                    "no_gpv": new_q == "не вимикають, крім аварійних",
                     "queue_houses": info.get("houses", ""),
                     "queue_note": info.get("note", ""),
                     "queue_fp": new_fp,
@@ -1216,9 +1269,13 @@ def main() -> int:
 
                 if old_fp and queue_number_fp(old_q, old_sq) != queue_number_fp(new_q, new_sq):
                     changed += 1
-                    notify_info = info
+                    notify_info = {**info, "queue": new_q, "subqueue": new_sq}
                     notify_label_house = house
-                    notify_old = {"queue": old_q, "subqueue": old_sq, "note": a.get("queue_note") or ""}
+                    notify_old = {
+                        "queue": old_q,
+                        "subqueue": old_sq,
+                        "note": a.get("queue_note") or "",
+                    }
                     log.info(
                         "Зміна черги: %s house=%s %s|%s → %s|%s",
                         label, house or "—", old_q, old_sq, new_q, new_sq,
@@ -1253,6 +1310,12 @@ def main() -> int:
                 notify_info.get("subqueue", ""),
                 notify_info.get("note", ""),
             )
+            if was == now_lbl:
+                log.info(
+                    "Підпис не змінився, notify пропущено: %s %s",
+                    tid, was,
+                )
+                continue
             text_msg = (
                 "🔔 <b>Змінилася черга відключень:</b>\n\n"
                 f"<b>{city}, {street}{house_bit}</b>\n\n"
