@@ -1289,6 +1289,9 @@ def main() -> int:
             if not touched:
                 continue
 
+            # Наступна вулиця цього юзера інакше бере знімок з початку прогону
+            # і update_one затирає щойно записані черги.
+            user["addresses"] = new_addrs
             users_col.update_one(
                 {"telegram_id": tid},
                 {"$set": {"addresses": new_addrs}, "$unset": {"address": ""}},
