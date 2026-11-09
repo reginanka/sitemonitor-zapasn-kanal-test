@@ -23,6 +23,7 @@ import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
+import re
 from typing import Any, Dict, List, Set, Tuple
 
 import httpx
@@ -34,31 +35,190 @@ except Exception:
     import pytz
     KYIV = pytz.timezone("Europe/Kyiv")
 
+
+# Telegram HTML message limit; keep margin for safety
+TG_MSG_LIMIT = 4000
+
+
+def split_by_rem_blocks(text: str, limit: int = TG_MSG_LIMIT) -> List[str]:
+    """
+    Ріже довге зведення по межах блоків РЕМ (emoji + <b>Назва</b>).
+    Повертає 1–N частин ≤ limit символів. Header — у першій, footer — в останній.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    lines = text.split("\n")
+    # рядок початку РЕМ: 🔴/🟠/🟡/🟢/⚪ + пробіл + <b>
+    rem_start = re.compile(
+        r"^[\s]*(?:🔴|🟠|🟡|🟢|⚪)\s*<b>[^<]+</b>\s*[—\-]\s*",
+    )
+
+    header: List[str] = []
+    blocks: List[List[str]] = []  # кожен блок = список рядків одного РЕМ
+    footer: List[str] = []
+    current: List[str] | None = None
+    in_rem_zone = False
+    past_blockquote = False
+
+    for line in lines:
+        if rem_start.match(line):
+            in_rem_zone = True
+            if current is not None:
+                blocks.append(current)
+            current = [line]
+            continue
+        if current is not None:
+            # продовження блоку РЕМ (міста, порожні, закриття blockquote)
+            if line.strip() == "</blockquote>":
+                current.append(line)
+                blocks.append(current)
+                current = None
+                past_blockquote = True
+                continue
+            # якщо після blockquote пішли footer-рядки — не чіпаємо current
+            if past_blockquote:
+                footer.append(line)
+            else:
+                current.append(line)
+            continue
+        if in_rem_zone or past_blockquote:
+            footer.append(line)
+        else:
+            header.append(line)
+
+    if current is not None:
+        blocks.append(current)
+
+    # якщо не знайшли жодного РЕМ-блоку — грубий split
+    if not blocks:
+        parts = []
+        rest = text
+        while rest:
+            if len(rest) <= limit:
+                parts.append(rest)
+                break
+            cut = rest.rfind("\n", 0, limit)
+            if cut < limit // 2:
+                cut = limit
+            parts.append(rest[:cut].rstrip())
+            rest = rest[cut:].lstrip("\n")
+        return parts or [text[:limit]]
+
+    header_s = "\n".join(header).rstrip()
+    footer_s = "\n".join(footer).strip()
+    # відкриваємо blockquote лише якщо header його ще не містить
+    open_bq = "<blockquote expandable>"
+    close_bq = "</blockquote>"
+    header_has_bq = open_bq in header_s
+
+    parts: List[str] = []
+    # перша частина: header + скільки влізе РЕМ
+    buf_lines: List[str] = []
+    if header_s:
+        buf_lines.extend(header_s.split("\n"))
+    if not header_has_bq and blocks:
+        # header зазвичай закінчується рядком «Ситуація по РЕМ», blockquote додаємо
+        if open_bq not in "\n".join(buf_lines):
+            buf_lines.append(open_bq)
+
+    def _flush(is_last: bool, extra_footer: str = "") -> None:
+        nonlocal buf_lines
+        body = "\n".join(buf_lines).rstrip()
+        # закрити blockquote якщо відкритий і ще не закритий
+        if open_bq in body and close_bq not in body:
+            body = body + "\n" + close_bq
+        if is_last and extra_footer:
+            body = body + ("\n\n" if body else "") + extra_footer
+        if body:
+            parts.append(body)
+        buf_lines = []
+
+    for bi, block in enumerate(blocks):
+        # прибрати зайві </blockquote> зсередини блоку (ми закриємо самі)
+        clean = [ln for ln in block if ln.strip() != close_bq]
+        candidate_lines = buf_lines + clean
+        candidate = "\n".join(candidate_lines)
+        # запас на закриття blockquote + footer на останній
+        reserve = 20
+        is_last_block = bi == len(blocks) - 1
+        if is_last_block and footer_s:
+            reserve += len(footer_s) + 4
+        if len(candidate) + reserve <= limit or not buf_lines or (
+            # header-only ще порожній від РЕМ — все одно кладемо
+            len(buf_lines) <= (len(header_s.split("\n")) + 2) and not any(
+                rem_start.match(x) for x in buf_lines
+            )
+        ):
+            buf_lines = candidate_lines
+            continue
+        # не влазить — flush поточний (без цього блоку) і почни новий
+        _flush(is_last=False)
+        # нова частина: короткий заголовок-продовження + blockquote
+        buf_lines = [
+            "⚠️ <b>Ситуація по РЕМ</b> (продовження):",
+            open_bq,
+        ] + clean
+
+    _flush(is_last=True, extra_footer=footer_s)
+
+    # safety: якщо щось все одно > limit — грубий доріз
+    fixed: List[str] = []
+    for p in parts:
+        if len(p) <= limit:
+            fixed.append(p)
+            continue
+        rest = p
+        while rest:
+            if len(rest) <= limit:
+                fixed.append(rest)
+                break
+            cut = rest.rfind("\n", 0, limit)
+            if cut < limit // 2:
+                cut = limit
+            fixed.append(rest[:cut].rstrip())
+            rest = rest[cut:].lstrip("\n")
+    return fixed or [text[:limit]]
+
+
 def send_notification(message: str, image_path=None) -> bool:
-    """Шле в TELEGRAM_CHANNEL_ID без preview лінків."""
+    """Шле в TELEGRAM_CHANNEL_ID без preview лінків.
+    Якщо текст довший за ліміт — ріже по межах РЕМ і шле 2–3 повідомлення підряд.
+    """
     token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
     chat_id = os.getenv("TELEGRAM_CHANNEL_ID") or ""
     if not token or not chat_id:
         print("❌ TELEGRAM_BOT_TOKEN або TELEGRAM_CHANNEL_ID не налаштовані")
         return False
-    try:
-        r = httpx.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": message[:4096],
-                "parse_mode": "HTML",
-                "disable_web_page_preview": "true",
-            },
-            timeout=30,
-        )
-        if r.status_code == 200:
-            return True
-        print(f"❌ Telegram send HTTP {r.status_code}: {r.text[:300]}")
+    parts = split_by_rem_blocks(message, TG_MSG_LIMIT)
+    if not parts:
         return False
-    except Exception as e:
-        print(f"❌ Telegram send failed: {e}")
-        return False
+    ok_all = True
+    for i, part in enumerate(parts):
+        try:
+            r = httpx.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={
+                    "chat_id": chat_id,
+                    "text": part[:4096],
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": "true",
+                },
+                timeout=30,
+            )
+            if r.status_code == 200:
+                if len(parts) > 1:
+                    print(f"✓ канал part {i+1}/{len(parts)} ({len(part)} символів)")
+            else:
+                print(f"❌ Telegram send HTTP {r.status_code}: {r.text[:300]}")
+                ok_all = False
+        except Exception as e:
+            print(f"❌ Telegram send failed: {e}")
+            ok_all = False
+    return ok_all
 
 
 def _user_wants_region(u: dict) -> bool:
@@ -128,24 +288,39 @@ def send_region_dms(message: str) -> tuple[int, int]:
     targets = [u for u in users if _user_wants_region(u) and u.get("telegram_id")]
     log_to_buffer(f"📬 region DM candidates: {len(targets)} (з {len(users)} notify)")
 
+    parts = split_by_rem_blocks(message, TG_MSG_LIMIT)
+    if not parts:
+        log_to_buffer("⚠️ region DM: порожнє повідомлення після split")
+        return 0, 0
+    if len(parts) > 1:
+        log_to_buffer(f"✂️ region DM split: {len(parts)} parts, lens={[len(p) for p in parts]}")
+
     sent = failed = 0
     sent_quiet = sent_sound = 0
     for u in targets:
         tid = u.get("telegram_id")
         silent = _is_quiet_now(u)
+        user_ok = True
         try:
-            r = httpx.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data={
-                    "chat_id": str(tid),
-                    "text": message[:4096],
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": "true",
-                    "disable_notification": "true" if silent else "false",
-                },
-                timeout=30,
-            )
-            if r.status_code == 200 and (r.json() or {}).get("ok"):
+            for part in parts:
+                r = httpx.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    data={
+                        "chat_id": str(tid),
+                        "text": part[:4096],
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": "true",
+                        "disable_notification": "true" if silent else "false",
+                    },
+                    timeout=30,
+                )
+                if not (r.status_code == 200 and (r.json() or {}).get("ok")):
+                    user_ok = False
+                    log_to_buffer(
+                        f"❌ region DM tid={tid}: HTTP {r.status_code} {r.text[:120]}"
+                    )
+                    break
+            if user_ok:
                 sent += 1
                 if silent:
                     sent_quiet += 1
@@ -153,9 +328,6 @@ def send_region_dms(message: str) -> tuple[int, int]:
                     sent_sound += 1
             else:
                 failed += 1
-                log_to_buffer(
-                    f"❌ region DM tid={tid}: HTTP {r.status_code} {r.text[:120]}"
-                )
         except Exception as e:
             failed += 1
             log_to_buffer(f"❌ region DM tid={tid}: {e}")
@@ -840,12 +1012,23 @@ def format_message(
             )
 
         if rest:
-            rest_streets = sum(c for _, c in rest)
-            if rest_streets > 0:
-                block.append(
-                    f"    · … ще {len(rest)} нас.п. — {rest_streets} вул. "
-                    f"({_city_pct(rest_streets):.1f}%)"
-                )
+            # < CITY_PCT_MIN: один н.п. → лише назва; кілька → назва + «ще N»
+            if len(rest) == 1:
+                cname, cnt_i = rest[0]
+                if cnt_i > 0:
+                    block.append(
+                        f"    · {city_label(cname)} — {cnt_i} вул. "
+                        f"({_city_pct(cnt_i):.1f}%)"
+                    )
+            else:
+                first_name, _first_cnt = rest[0]
+                more = len(rest) - 1
+                rest_streets = sum(c for _, c in rest)
+                if rest_streets > 0:
+                    block.append(
+                        f"    · {city_label(first_name)} + ще {more} нас.п. — "
+                        f"{rest_streets} вул. ({_city_pct(rest_streets):.1f}%)"
+                    )
 
     if block:
         lines.append("<blockquote expandable>")
