@@ -864,7 +864,7 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     if other:
         extra_lines.append(_format_slots_line("⚪ Інші", other))
 
-    # Немає погодинних, лише аварія/ремонт → компакт без згортання
+    # Немає погодинних, лише аварія/ремонт → цитата як у звичайних блоках
     if not scheduled and extra_lines and all_merged and not addr.get("queue_only"):
         tags = []
         if emerg:
@@ -875,11 +875,8 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
             tags.append("⚪Інше")
         tag_s = f" ({tags[0]})" if len(tags) == 1 else f" ({', '.join(tags)})"
         ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
-        compact = (
-            f"<b>🪫 Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
-            f"<u>{ranges}</u>{tag_s}"
-        )
-        return f"{head}\n{compact}"
+        summary = f"<u>{ranges}</u> ({_fmt_duration(_total_minutes(all_merged))}){tag_s}"
+        return f"{head}\n<blockquote>{summary}</blockquote>"
 
     # Черга без адреси або лише ГПВ — підсумок у цитаті, без «Деталі»
     if addr.get("queue_only") or not extra_lines:
@@ -1070,7 +1067,7 @@ def _outage_under_header(
     if not extra_lines:
         return f"{head}\n<blockquote>{summary}</blockquote>"
 
-    # немає погодинних — компакт з міткою, без expandable
+    # немає погодинних — як звичайний блок: цитата з годинами, тривалість в кінці
     if not scheduled and all_merged:
         tags = []
         if emerg:
@@ -1081,11 +1078,8 @@ def _outage_under_header(
             tags.append("⚪Інше")
         tag_s = f" ({tags[0]})" if len(tags) == 1 else f" ({', '.join(tags)})"
         ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
-        compact = (
-            f"<b>🪫 Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
-            f"<u>{ranges}</u>{tag_s}"
-        )
-        return f"{head}\n{compact}"
+        summary = f"<u>{ranges}</u> ({_fmt_duration(_total_minutes(all_merged))}){tag_s}"
+        return f"{head}\n<blockquote>{summary}</blockquote>"
 
     detail = [summary, "⬇️⬇️⬇️", "Деталі:"]
     if scheduled:

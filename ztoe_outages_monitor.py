@@ -751,7 +751,7 @@ def format_schedule_block_for_notify(
 
     title = f"<b>ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ на {display}</b>"
 
-    # Немає погодинних, є лише аварія/ремонт → компактний рядок без згортання
+    # Немає погодинних, є лише аварія/ремонт → цитата з годинами (без згортання)
     if not scheduled and extra_lines and all_merged:
         tags = []
         if emerg:
@@ -762,11 +762,8 @@ def format_schedule_block_for_notify(
             tags.append("⚪Інше")
         tag_s = f" ({tags[0]})" if len(tags) == 1 else f" ({', '.join(tags)})"
         ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
-        compact = (
-            f"<b>🪫 Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
-            f"<u>{ranges}</u>{tag_s}"
-        )
-        return f"{title}\n\n{compact}"
+        summary = f"<u>{ranges}</u> ({_fmt_duration(_total_minutes(all_merged))}){tag_s}"
+        return f"{title}\n\n<blockquote>{summary}</blockquote>"
 
     if not extra_lines:
         body = "\n".join([title, "", summary])
