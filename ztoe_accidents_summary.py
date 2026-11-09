@@ -4,6 +4,7 @@
 
 - Тягне всі записи з /pw_accidents
 - Рахує унікальні вулиці / нас. пункти по РЕМ
+- Сортує РЕМ за відсотком уражених вулиць у районі (а не лише за кількістю)
 - Під кожним РЕМ — топ населених пунктів (географія)
 - Завжди зберігає знімок у Mongo (accidents_summary: latest + історія по годині)
 - У Telegram-канал шле ЛИШЕ при рівні CRITICAL
@@ -260,6 +261,44 @@ CITY_PREFIX = {
     "Житомир", "Звягель", "Бердичів", "Овруч", "Коростень", "Малин",
 }
 
+# Унікальні вулиці по РЕМ з довідника addresses_directory (mybot_monitor).
+# Ключі — без суфікса « РЕМ». Потрібно для відсотка уражених вулиць у районі.
+REM_TOTAL_STREETS: Dict[str, int] = {
+    "Житомирський": 3183,
+    "Звягельський": 2245,
+    "Овруцький": 1556,
+    "Коростенський": 1463,
+    "Попільнянський": 1148,
+    "Бердичівський": 1096,
+    "Малинський": 867,
+    "Баранівський": 831,
+    "Олевський": 717,
+    "Хорошівський": 699,
+    "Радомишльський": 687,
+    "Чуднівський": 636,
+    "Андрушівський": 582,
+    "Коростишівський": 533,
+    "Любарський": 505,
+    "Черняхівський": 491,
+    "Пулинський": 487,
+    "Брусилівський": 483,
+    "Романівський": 478,
+}
+
+
+def _norm_rem_name(name: str) -> str:
+    """«Звягельський РЕМ» → «Звягельський»."""
+    s = (name or "").strip()
+    s = s.replace(" РЕМ", "").replace(" рем", "").strip()
+    return s
+
+
+def rem_streets_pct(rem_name: str, affected_streets: int) -> float | None:
+    """Відсоток уражених вулиць у РЕМ (None якщо немає totals)."""
+    total = REM_TOTAL_STREETS.get(_norm_rem_name(rem_name))
+    if not total or total <= 0:
+        return None
+    return min(100.0, 100.0 * max(0, int(affected_streets or 0)) / total)
 
 
 # Рівень по кількості населених пунктів (область ~1400 н.п.)
@@ -539,12 +578,18 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
         city_counts = {
             c: len(sids) for c, sids in st["city_streets"].items()
         }
-        rem_out[name] = {
+        streets_n = len(st["streets"])
+        pct = rem_streets_pct(name, streets_n)
+        entry: Dict[str, Any] = {
             "records": st["records"],
-            "streets": len(st["streets"]),
+            "streets": streets_n,
             "cities": len(st["cities"]),
             "city_streets": city_counts,
         }
+        if pct is not None:
+            entry["streets_pct"] = round(pct, 1)
+            entry["streets_total"] = REM_TOTAL_STREETS.get(_norm_rem_name(name))
+        rem_out[name] = entry
 
     return {
         "total_records": len(accidents),
@@ -581,10 +626,22 @@ def format_message(
         "⚠️ <b>Ситуація по РЕМ</b> (від найбільш проблемних):",
     ]
 
-    rem_sorted = sorted(
-        stats["rem"].items(),
-        key=lambda x: (-x[1]["streets"], -x[1]["cities"], -x[1]["records"]),
-    )
+    def _rem_sort_key(item: Tuple[str, dict]) -> Tuple[float, int, int, int]:
+        """Спочатку за % уражених вулиць у районі, далі за абсолютною кількістю."""
+        name, st = item
+        streets = int(st.get("streets") or 0)
+        pct = st.get("streets_pct")
+        if pct is None:
+            pct = rem_streets_pct(name, streets)
+        pct_v = float(pct) if pct is not None else -1.0
+        return (
+            -pct_v,
+            -streets,
+            -int(st.get("cities") or 0),
+            -int(st.get("records") or 0),
+        )
+
+    rem_sorted = sorted(stats["rem"].items(), key=_rem_sort_key)
 
     block: List[str] = []
     for name, st in rem_sorted:
@@ -592,10 +649,20 @@ def format_message(
             continue
         short = name.replace(" РЕМ", "").strip()
         emoji = severity_emoji(st["streets"])
-        block.append(
-            f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
-            f"{st['streets']:,} вул.".replace(",", " ")
-        )
+        pct = st.get("streets_pct")
+        if pct is None:
+            pct = rem_streets_pct(name, st["streets"])
+        streets_s = f"{st['streets']:,}".replace(",", " ")
+        if pct is not None:
+            block.append(
+                f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
+                f"{streets_s} вул. ({pct:.1f}%)"
+            )
+        else:
+            block.append(
+                f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
+                f"{streets_s} вул."
+            )
 
         cities_sorted = sorted(
             st.get("city_streets", {}).items(),
