@@ -261,28 +261,79 @@ CITY_PREFIX = {
     "Житомир", "Звягель", "Бердичів", "Овруч", "Коростень", "Малин",
 }
 
-# Унікальні вулиці по РЕМ з довідника addresses_directory (mybot_monitor).
-# Ключі — без суфікса « РЕМ». Потрібно для відсотка уражених вулиць у районі.
+# Покриття району.
+# Вулиці — з API ZTOE (/pw_streets + /pw_cities→otg), ключі без « РЕМ».
+# Н.п. — з довідника addresses_directory (у API pw_cities дублікати, % н.п. там кривий).
 REM_TOTAL_STREETS: Dict[str, int] = {
-    "Житомирський": 3183,
-    "Звягельський": 2245,
-    "Овруцький": 1556,
-    "Коростенський": 1463,
-    "Попільнянський": 1148,
-    "Бердичівський": 1096,
-    "Малинський": 867,
-    "Баранівський": 831,
-    "Олевський": 717,
-    "Хорошівський": 699,
-    "Радомишльський": 687,
-    "Чуднівський": 636,
-    "Андрушівський": 582,
-    "Коростишівський": 533,
-    "Любарський": 505,
-    "Черняхівський": 491,
-    "Пулинський": 487,
-    "Брусилівський": 483,
-    "Романівський": 478,
+    "Житомирський": 2782,
+    "Звягельський": 2474,
+    "Овруцький": 1670,
+    "Попільнянський": 1418,
+    "Коростенський": 1154,
+    "Малинський": 1126,
+    "Олевський": 890,
+    "Баранівський": 871,
+    "Хорошівський": 785,
+    "Радомишльський": 725,
+    "Бердичівський": 714,
+    "Черняхівський": 703,
+    "Чуднівський": 686,
+    "Любарський": 543,
+    "Пулинський": 524,
+    "Романівський": 464,
+    "Андрушівський": 433,
+    "Коростишівський": 404,
+    "Брусилівський": 357,
+}
+
+REM_TOTAL_CITIES: Dict[str, int] = {
+    "Житомирський": 103,
+    "Звягельський": 224,
+    "Овруцький": 286,
+    "Коростенський": 150,
+    "Попільнянський": 101,
+    "Бердичівський": 66,
+    "Малинський": 110,
+    "Баранівський": 60,
+    "Олевський": 60,
+    "Хорошівський": 78,
+    "Радомишльський": 84,
+    "Чуднівський": 60,
+    "Андрушівський": 41,
+    "Коростишівський": 64,
+    "Любарський": 46,
+    "Черняхівський": 58,
+    "Пулинський": 68,
+    "Брусилівський": 36,
+    "Романівський": 63,
+}
+
+# Якщо otg = АТ «Житомиробленерго» (без РЕМ) — підставляємо РЕМ за назвою н.п.
+# Зібрано з /pw_cities (найчастіший otg для назви).
+CITY_TO_REM: Dict[str, str] = {
+    "Малин": "Малинський РЕМ",
+    "Житомир": "Житомирський РЕМ",
+    "Звягель": "Звягельський РЕМ",
+    "Новоград-Волинський": "Звягельський РЕМ",
+    "Бердичів": "Бердичівський РЕМ",
+    "Коростень": "Коростенський РЕМ",
+    "Овруч": "Овруцький РЕМ",
+    "Олевськ": "Олевський РЕМ",
+    "Радомишль": "Радомишльський РЕМ",
+    "Коростишів": "Коростишівський РЕМ",
+    "Андрушівка": "Андрушівський РЕМ",
+    "Баранівка": "Баранівський РЕМ",
+    "Чуднів": "Чуднівський РЕМ",
+    "Любар": "Любарський РЕМ",
+    "Романів": "Романівський РЕМ",
+    "Пулини": "Пулинський РЕМ",
+    "Черняхів": "Черняхівський РЕМ",
+    "Брусилів": "Брусилівський РЕМ",
+    "Попільня": "Попільнянський РЕМ",
+    "Хорошів": "Хорошівський РЕМ",
+    "Головине": "Черняхівський РЕМ",
+    "Іршанськ": "Хорошівський РЕМ",
+    "Великі Низгірці": "Бердичівський РЕМ",
 }
 
 
@@ -294,11 +345,44 @@ def _norm_rem_name(name: str) -> str:
 
 
 def rem_streets_pct(rem_name: str, affected_streets: int) -> float | None:
-    """Відсоток уражених вулиць у РЕМ (None якщо немає totals)."""
+    """
+    Відсоток уражених вулиць у РЕМ відносно довідника.
+    Може бути >100%, якщо API дає більше унікальних ключів, ніж є в довіднику.
+    """
     total = REM_TOTAL_STREETS.get(_norm_rem_name(rem_name))
     if not total or total <= 0:
         return None
-    return min(100.0, 100.0 * max(0, int(affected_streets or 0)) / total)
+    n = max(0, int(affected_streets or 0))
+    return 100.0 * n / total
+
+
+def rem_cities_pct(rem_name: str, affected_cities: int) -> float | None:
+    """Відсоток уражених н.п. у РЕМ (надійніший за вулиці)."""
+    total = REM_TOTAL_CITIES.get(_norm_rem_name(rem_name))
+    if not total or total <= 0:
+        return None
+    n = max(0, int(affected_cities or 0))
+    return min(100.0, 100.0 * n / total)
+
+
+def rem_coverage_pct(
+    rem_name: str, affected_streets: int, affected_cities: int
+) -> tuple[float | None, str]:
+    """
+    Ключ сортування: max(% н.п., % вул.), щоб район з повним покриттям
+    н.п. не програвав через розбіжність довідника по вулицях.
+    """
+    sp = rem_streets_pct(rem_name, affected_streets)
+    cp = rem_cities_pct(rem_name, affected_cities)
+    candidates = []
+    if cp is not None:
+        candidates.append((cp, "cities"))
+    if sp is not None:
+        candidates.append((min(sp, 100.0), "streets"))  # для сорту не роздуваємо >100
+    if not candidates:
+        return None, "streets"
+    candidates.sort(key=lambda x: -x[0])
+    return candidates[0]
 
 
 # Рівень по кількості населених пунктів (область ~1400 н.п.)
@@ -555,8 +639,13 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
         sid = street.get("id")
         oname = (otg.get("name") or "").strip() or "?"
 
+        # АТ «Житомиробленерго» без конкретного РЕМ — пробуємо визначити РЕМ по н.п.
         if "Житомиробленерго" in oname and "РЕМ" not in oname:
-            oname = "Інше (обленерго)"
+            mapped = CITY_TO_REM.get(cname)
+            if mapped:
+                oname = mapped
+            else:
+                oname = "Інше (обленерго)"
 
         street_key = sid if sid is not None else (cname, street.get("name"))
         city_key = cid if cid is not None else cname
@@ -579,16 +668,25 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
             c: len(sids) for c, sids in st["city_streets"].items()
         }
         streets_n = len(st["streets"])
-        pct = rem_streets_pct(name, streets_n)
+        cities_n = len(st["cities"])
+        sp = rem_streets_pct(name, streets_n)
+        cp = rem_cities_pct(name, cities_n)
+        cov, cov_kind = rem_coverage_pct(name, streets_n, cities_n)
         entry: Dict[str, Any] = {
             "records": st["records"],
             "streets": streets_n,
-            "cities": len(st["cities"]),
+            "cities": cities_n,
             "city_streets": city_counts,
         }
-        if pct is not None:
-            entry["streets_pct"] = round(pct, 1)
+        if sp is not None:
+            entry["streets_pct"] = round(sp, 1)
             entry["streets_total"] = REM_TOTAL_STREETS.get(_norm_rem_name(name))
+        if cp is not None:
+            entry["cities_pct"] = round(cp, 1)
+            entry["cities_total"] = REM_TOTAL_CITIES.get(_norm_rem_name(name))
+        if cov is not None:
+            entry["coverage_pct"] = round(cov, 1)
+            entry["coverage_kind"] = cov_kind
         rem_out[name] = entry
 
     return {
@@ -627,17 +725,18 @@ def format_message(
     ]
 
     def _rem_sort_key(item: Tuple[str, dict]) -> Tuple[float, int, int, int]:
-        """Спочатку за % уражених вулиць у районі, далі за абсолютною кількістю."""
+        """Спочатку за % покриття району (вулиці або н.п.), далі за кількістю."""
         name, st = item
         streets = int(st.get("streets") or 0)
-        pct = st.get("streets_pct")
+        cities = int(st.get("cities") or 0)
+        pct = st.get("coverage_pct")
         if pct is None:
-            pct = rem_streets_pct(name, streets)
+            pct, _ = rem_coverage_pct(name, streets, cities)
         pct_v = float(pct) if pct is not None else -1.0
         return (
             -pct_v,
             -streets,
-            -int(st.get("cities") or 0),
+            -cities,
             -int(st.get("records") or 0),
         )
 
@@ -649,14 +748,25 @@ def format_message(
             continue
         short = name.replace(" РЕМ", "").strip()
         emoji = severity_emoji(st["streets"])
-        pct = st.get("streets_pct")
-        if pct is None:
-            pct = rem_streets_pct(name, st["streets"])
         streets_s = f"{st['streets']:,}".replace(",", " ")
-        if pct is not None:
+
+        cp = st.get("cities_pct")
+        sp = st.get("streets_pct")
+        if cp is None:
+            cp = rem_cities_pct(name, st["cities"])
+        if sp is None:
+            sp = rem_streets_pct(name, st["streets"])
+
+        pct_parts: List[str] = []
+        if cp is not None:
+            pct_parts.append(f"{cp:.1f}% н.п.")
+        if sp is not None:
+            # для показу не роздуваємо понад 100% (розбіжність довідника)
+            pct_parts.append(f"{min(sp, 100.0):.1f}% вул.")
+        if pct_parts:
             block.append(
                 f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
-                f"{streets_s} вул. ({pct:.1f}%)"
+                f"{streets_s} вул. ({' / '.join(pct_parts)})"
             )
         else:
             block.append(
@@ -669,7 +779,7 @@ def format_message(
             key=lambda x: -x[1],
         )[:TOP_CITIES_PER_REM]
         for cname, cnt in cities_sorted:
-            block.append(f"    · {city_label(cname)} — {cnt}")
+            block.append(f"    · {city_label(cname)} — {cnt} вул.")
 
     if block:
         lines.append("<blockquote expandable>")
