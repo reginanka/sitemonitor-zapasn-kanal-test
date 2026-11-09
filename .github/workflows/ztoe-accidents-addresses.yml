@@ -1,0 +1,38 @@
+name: ZTOE accidents addresses (manual)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ztoe-accidents-addresses
+  cancel-in-progress: false
+
+jobs:
+  addresses:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      ZTOE_API_BASE: ${{ secrets.ZTOE_API_BASE }}
+      ZTOE_BOT_TOKEN: ${{ secrets.ZTOE_BOT_TOKEN }}
+      TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
+      # опційно: скільки адрес (за замовч. 20)
+      MAX_ADDRESSES: "20"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "httpx~=0.26.0" requests
+
+      - name: Run accidents addresses
+        run: python ztoe_accidents_addresses.py
+        
