@@ -240,6 +240,21 @@ def soft_fingerprint(outage: dict) -> str:
     return f"{city}|{sid}|{','.join(parts)}|{start}"
 
 
+def notify_dedup_key(outage: dict, house: str = "") -> str:
+    """
+    Ключ для злиття дублів: одна вулиця + будинок користувача + той самий проміжок.
+    Ігнорує різний список buildingNames з API (Шкільна vs ШКІЛЬНА, 1..8 vs 1,15,2,4…).
+    """
+    street = outage.get("street") or {}
+    sname = _norm_street(street.get("name") or "")
+    sid = street.get("id") or sname
+    city = (outage.get("city") or {}).get("id") or (outage.get("city") or {}).get("name") or ""
+    start = (outage.get("dateEvent") or "")[:16]
+    end = (outage.get("datePlanIn") or "")[:16]
+    h = (house or "").strip().lower().lstrip("0") or "0"
+    return f"{city}|{sid}|{sname}|{h}|{start}|{end}"
+
+
 def addr_day_key(outage: dict) -> str:
     """
     Ключ «та сама адреса + той самий день» — незалежно від id і години старту.
@@ -266,6 +281,8 @@ def format_outage(outage: dict) -> str:
         text = f"⏱ <b>Оновлення:</b> {city}, {street}\n📌 {type_name}"
         if type_desc:
             text += f" — {type_desc}"
+        if buildings:
+            text += f"\n🏘 Будинки: {buildings}"
         was = (outage.get("_plan_was") or "")[:16].replace("T", " ")
         if was and date_plan and was != date_plan:
             text += f"\n⏳ План увімкнення: <s>{was}</s> → <b>{date_plan}</b>"
@@ -275,12 +292,12 @@ def format_outage(outage: dict) -> str:
         text = f"{icon} <b>{city}, {street}</b>\n📌 {type_name}"
         if type_desc:
             text += f" — {type_desc}"
+        if buildings:
+            text += f"\n🏘 Будинки: {buildings}"
+        if date_event:
+            text += f"\n⏰ З: {date_event}"
         if date_plan:
             text += f"\n⏳ До (план): {date_plan}"
-    if buildings:
-        text += f"\n🏘 Будинки: {buildings}"
-    if date_event:
-        text += f"\n⏰ З: {date_event}"
     koment = (outage.get("koment") or "").strip()
     if koment:
         text += f"\n💬 {koment}"
@@ -453,6 +470,111 @@ def _display_date_from_ymd(ymd: str) -> str:
         return ymd
 
 
+def _parse_iso_dt(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        s = s.replace("Z", "+00:00")
+        if "T" in s:
+            return datetime.fromisoformat(s)
+        if len(s) >= 16 and s[10] == " ":
+            return datetime.fromisoformat(s.replace(" ", "T", 1))
+        if len(s) >= 10 and s[4] == "-":
+            return datetime.fromisoformat(s[:10])
+    except Exception:
+        return None
+    return None
+
+
+def _interval_on_day(de: str, dp: str, ymd: str) -> Optional[Tuple[str, str]]:
+    """
+    Розрізає інтервал [dateEvent, datePlanIn] на шматок саме для дня ymd.
+    Приклад: 2026-11-03 21:35 → 2026-11-04 17:00
+      ymd=03 → 21:35-24:00
+      ymd=04 → 00:00-17:00
+    """
+    start_dt = _parse_iso_dt(de)
+    end_dt = _parse_iso_dt(dp)
+    if not start_dt or not end_dt:
+        # fallback: якщо обидві дати того ж дня / одна з них
+        start = de[11:16] if len(de) >= 16 else ""
+        end = dp[11:16] if len(dp) >= 16 else ""
+        if de.startswith(ymd) and dp.startswith(ymd) and start and end:
+            return (start, end)
+        if de.startswith(ymd) and start:
+            return (start, "24:00")
+        if dp.startswith(ymd) and end:
+            return ("00:00", end)
+        return None
+
+    # naive compare by calendar day (API timestamps are local-ish)
+    day0 = datetime.strptime(ymd[:10], "%Y-%m-%d")
+    day1 = day0 + timedelta(days=1)
+    s = start_dt.replace(tzinfo=None) if start_dt.tzinfo else start_dt
+    e = end_dt.replace(tzinfo=None) if end_dt.tzinfo else end_dt
+    if e <= s:
+        return None
+    # no overlap with [day0, day1)
+    if e <= day0 or s >= day1:
+        return None
+    a = max(s, day0)
+    b = min(e, day1)
+    if b <= a:
+        return None
+    start_s = a.strftime("%H:%M")
+    if b >= day1:
+        end_s = "24:00"
+    else:
+        end_s = b.strftime("%H:%M")
+        if end_s == "00:00" and b > a:
+            end_s = "24:00"
+    if start_s == end_s:
+        return None
+    return (start_s, end_s)
+
+
+def _outage_span_ymds(outage: dict, *, from_ymd: Optional[str] = None) -> List[str]:
+    """Усі календарні дні, які покриває аварія (від max(start, from_ymd) до end)."""
+    de = str(outage.get("dateEvent") or outage.get("date_from") or "")
+    dp = str(outage.get("datePlanIn") or outage.get("date_to") or "")
+    start_dt = _parse_iso_dt(de)
+    end_dt = _parse_iso_dt(dp)
+    if not start_dt:
+        y = _outage_day_ymd(outage)
+        return [y] if y else []
+    s = start_dt.replace(tzinfo=None) if getattr(start_dt, "tzinfo", None) else start_dt
+    if end_dt:
+        e = end_dt.replace(tzinfo=None) if getattr(end_dt, "tzinfo", None) else end_dt
+    else:
+        e = s
+    if e < s:
+        e = s
+    # якщо кінець рівно опівночі — останній день не включаємо
+    end_day = e.date()
+    if e.hour == 0 and e.minute == 0 and getattr(e, "second", 0) == 0 and e > s:
+        end_day = (e - timedelta(seconds=1)).date()
+    start_day = s.date()
+    if from_ymd:
+        try:
+            floor = datetime.strptime(from_ymd[:10], "%Y-%m-%d").date()
+            if start_day < floor:
+                start_day = floor
+        except ValueError:
+            pass
+    if start_day > end_day:
+        return []
+    out = []
+    cur = start_day
+    # захист від дуже довгих інтервалів
+    for _ in range(14):
+        out.append(cur.strftime("%Y-%m-%d"))
+        if cur >= end_day:
+            break
+        cur = cur + timedelta(days=1)
+    return out
+
+
 def _sched_day_index(sched: Optional[dict], ymd: str) -> int:
     """
     0 = slots (date з графіка), 1 = slots_tomorrow (date+1).
@@ -479,6 +601,10 @@ def _sched_day_index(sched: Optional[dict], ymd: str) -> int:
 
 
 def _classify_mongo_outage(doc: dict) -> Optional[str]:
+    """
+    emergency | repair | other | None (ГПВ).
+    typeOff=1 часто плутали з ГПВ — відсікаємо лише sub=2 / «ГПВ» у koment.
+    """
     koment = (doc.get("koment") or "").upper()
     if "ГПВ" in koment:
         return None
@@ -499,8 +625,7 @@ def _classify_mongo_outage(doc: dict) -> Optional[str]:
         return "emergency"
     if has_sub and sub > 0:
         return "other"
-    if not has_sub and t == 1:
-        return None
+    # typeOff=1 без sub — реальна аварія (ГПВ уже відсіяні вище)
     if t == 1:
         return "emergency"
     if t in (0, 3):
@@ -548,10 +673,9 @@ def _buckets_for_addr_day(db, addr: dict, ymd: str) -> Dict[str, List[Tuple[str,
         kind = _classify_mongo_outage(doc)
         if not kind:
             continue
-        start = de[11:16] if len(de) >= 16 else ""
-        end = dp[11:16] if len(dp) >= 16 else ""
-        if start and end:
-            buckets[kind].append((start, end))
+        piece = _interval_on_day(de, dp, ymd)
+        if piece:
+            buckets[kind].append(piece)
     for k in buckets:
         buckets[k] = _merge_intervals(buckets[k])
     return buckets
@@ -561,21 +685,32 @@ def format_schedule_block_for_notify(
     db,
     addr: dict,
     outage: dict,
+    ymd: Optional[str] = None,
 ) -> str:
     """
     Блок під подією — стиль /check:
       Світла не буде (N год): <u>…</u>
       Деталі лише якщо є аварійні / ремонтні / інші
       (без спаму «🟠 Ремонтні: немає»).
+    ymd — конкретний день (для багатоденних аварій); інакше день старту.
     """
-    ymd = _outage_day_ymd(outage)
+    ymd = ymd or _outage_day_ymd(outage)
     display = _display_date_from_ymd(ymd)
     lab = user_queue_key(addr) or outage.get("_user_queue") or ""
     sched = _load_queue_doc(db, lab) if lab else None
     day_idx = _sched_day_index(sched, ymd)
     scheduled = _slots_from_sched(sched, day=day_idx)
     buckets = _buckets_for_addr_day(db, addr, ymd)
-    emerg = _subtract_intervals(buckets.get("emergency") or [], scheduled)
+    emerg = list(buckets.get("emergency") or [])
+    # Завжди додаємо інтервал САМОЇ події зі сповіщення (навіть якщо Mongo
+    # ще не встиг / classification пропустив). Інакше при відсутності ГПВ
+    # виходить «🔄 Дані очікуємо» хоча аварія вже в повідомленні.
+    de = str(outage.get("dateEvent") or outage.get("date_from") or "")
+    dp = str(outage.get("datePlanIn") or outage.get("date_to") or "")
+    self_piece = _interval_on_day(de, dp, ymd)
+    if self_piece:
+        emerg.append(self_piece)
+    emerg = _subtract_intervals(_merge_intervals(emerg), scheduled)
     repair = _subtract_intervals(
         buckets.get("repair") or [], scheduled + emerg
     )
@@ -584,12 +719,11 @@ def format_schedule_block_for_notify(
     )
     all_merged = _merge_intervals(scheduled + emerg + repair + other)
 
-    # day_idx < 0 → дата поза ГПВ (далекий ремонт); не казати «світло весь день»
+    # day_idx < 0 → дата поза ГПВ; але якщо є аварія/ремонт — показуємо їх
     has_gpv_data = day_idx >= 0
 
     if all_merged:
         ranges = ", ".join(_fmt_range(a, b) for a, b in all_merged)
-        # один <u> на всі інтервали — як у /check
         summary = (
             f"<b>🪫 Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
             f"<u>{ranges}</u>"
@@ -615,28 +749,34 @@ def format_schedule_block_for_notify(
     if other:
         extra_lines.append(line("⚪ Інші", other))
 
-    # далека дата без ГПВ: лише ремонт/аварія — короткий блок без фейкових «Погодинні»
-    if not extra_lines:
-        body = "\n".join(
-            [
-                f"<b>ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ на {display}</b>",
-                "",
-                summary,
-            ]
+    title = f"<b>ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ на {display}</b>"
+
+    # Немає погодинних, є лише аварія/ремонт → компактний рядок без згортання
+    if not scheduled and extra_lines and all_merged:
+        tags = []
+        if emerg:
+            tags.append("⚠️Аварія")
+        if repair:
+            tags.append("🛠Ремонт")
+        if other:
+            tags.append("⚪Інше")
+        tag_s = f" ({tags[0]})" if len(tags) == 1 else f" ({', '.join(tags)})"
+        ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
+        compact = (
+            f"<b>🪫 Світла не буде ({_fmt_duration(_total_minutes(all_merged))}):</b> "
+            f"<u>{ranges}</u>{tag_s}"
         )
+        return f"{title}\n\n{compact}"
+
+    if not extra_lines:
+        body = "\n".join([title, "", summary])
         return f"<blockquote>{body}</blockquote>"
 
     detail = [summary, "⬇️⬇️⬇️", "Деталі:"]
     if scheduled:
         detail.append(line("⏰ Погодинні", scheduled))
     detail.extend(extra_lines)
-    body = "\n".join(
-        [
-            f"<b>ОНОВЛЕНИЙ ГРАФІК ВІДКЛЮЧЕНЬ на {display}</b>",
-            "",
-            *detail,
-        ]
-    )
+    body = "\n".join([title, "", *detail])
     return f"<blockquote expandable>{body}</blockquote>"
 
 
@@ -644,26 +784,33 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
     """
     items: [(outage, addr), ...]
     Верх: список подій з датами.
-    Низ: графік на день події (сума погодинних+аварійних+ремонтних).
+    Низ: графік на кожен день покриття (від сьогодні / старту до кінця плану).
     """
     lines = ["⚠️ <b>Нові відключення по твоїх адресах:</b>", ""]
     seen_sched: set = set()
+    # «сьогодні» по Києву (UTC+2 зимою; для відсікання минулих днів достатньо)
+    today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
     for outage, addr in items[:10]:
         lines.append(format_outage(outage))
         lines.append("")
-        ymd = _outage_day_ymd(outage)
+        ymds = _outage_span_ymds(outage, from_ymd=today_ymd)
+        if not ymds:
+            ymds = [_outage_day_ymd(outage)]
         lab = user_queue_key(addr) or ""
-        key = f"{lab}|{ymd}|{(addr.get('city_name') or '')}|{(addr.get('street_name') or '')}"
-        if key in seen_sched:
-            continue
-        seen_sched.add(key)
-        try:
-            block = format_schedule_block_for_notify(db, addr, outage)
-            if block:
-                lines.append(block)
-                lines.append("")
-        except Exception as e:
-            log.warning("schedule block: %s", e)
+        city = (addr.get("city_name") or "")
+        street = (addr.get("street_name") or "")
+        for ymd in ymds:
+            key = f"{lab}|{ymd}|{city}|{street}"
+            if key in seen_sched:
+                continue
+            seen_sched.add(key)
+            try:
+                block = format_schedule_block_for_notify(db, addr, outage, ymd=ymd)
+                if block:
+                    lines.append(block)
+                    lines.append("")
+            except Exception as e:
+                log.warning("schedule block: %s", e)
     return "\n".join(lines).strip()
 
 
@@ -987,10 +1134,18 @@ def main() -> int:
                             outage["_user_queue"] = uqk
                         notified.setdefault(tid, [])
                         fp = content_fingerprint(outage)
-                        if any(
-                            content_fingerprint(x[0] if isinstance(x, tuple) else x) == fp
-                            for x in notified[tid]
-                        ):
+                        dkey = notify_dedup_key(outage, str(house))
+                        already = False
+                        for x in notified[tid]:
+                            prev_o = x[0] if isinstance(x, tuple) else x
+                            if content_fingerprint(prev_o) == fp:
+                                already = True
+                                break
+                            # той самий будинок + той самий проміжок (різні списки будинків з API)
+                            if notify_dedup_key(prev_o, str(house)) == dkey:
+                                already = True
+                                break
+                        if already:
                             continue
                         notified[tid].append((outage, addr))
                         matched_fps.add(fp)
@@ -1062,20 +1217,22 @@ def main() -> int:
                 del_out.deleted_count,
                 OUTAGES_RETENTION_HOURS,
             )
-            # Сироти: typeOff=1 без switchSubReason (старий спам «аварій» 21–24 тощо).
-            # Після upsert цього прогону актуальні вже мають switchSubReason.
-            del_legacy = outages_full.delete_many(
+            # Прибираємо лише явні ГПВ-сироти (typeOff=1 + «ГПВ» у koment),
+            # НЕ чіпаємо звичайні аварії без switchSubReason — вони потрібні /check і monitor.py.
+            del_gpv = outages_full.delete_many(
                 {
                     "typeOff": 1,
+                    "koment": {"$regex": "ГПВ", "$options": "i"},
                     "$or": [
                         {"switchSubReason": {"$exists": False}},
                         {"switchSubReason": None},
+                        {"switchSubReason": 2},
                     ],
                 }
             )
             log.info(
-                "outages cleanup legacy typeOff=1 without switchSubReason: deleted=%s",
-                del_legacy.deleted_count,
+                "outages cleanup GPV orphans typeOff=1: deleted=%s",
+                del_gpv.deleted_count,
             )
         if OUTAGES_CACHE_RETENTION_DAYS > 0:
             cache_cutoff = datetime.now(timezone.utc) - timedelta(
