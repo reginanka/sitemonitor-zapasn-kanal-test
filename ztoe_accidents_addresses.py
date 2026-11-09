@@ -4,7 +4,7 @@
 
 - Тягне всі записи з /pw_accidents (той самий спосіб, що й ztoe_accidents_summary)
 - Фільтрує лише справжні аварії (ГАВ/СГАВ, без ГПВ)
-- Збирає унікальні адреси: н.п. + вулиця
+- Збирає унікальні адреси: н.п. + вулиця + номери будинків (buildingNames)
 - Бере перші 20 і шле в TELEGRAM_LOG_CHANNEL_ID
 - Без Mongo, без summary, без каналу сповіщень
 """
@@ -228,10 +228,11 @@ def fetch_all_accidents() -> List[dict]:
 
 def extract_addresses(accidents: List[dict], limit: int = 20) -> List[str]:
     """
-    Унікальні адреси у форматі н.п. + вулиця.
+    Унікальні адреси: н.п., вулиця, буд. N.
+    Ключ унікальності: (н.п., вулиця, buildingNames).
     Порядок — як прийшли з API (перші limit унікальних).
     """
-    seen: Set[Tuple[str, str]] = set()
+    seen: Set[Tuple[str, str, str]] = set()
     result: List[str] = []
 
     for a in accidents:
@@ -240,6 +241,7 @@ def extract_addresses(accidents: List[dict], limit: int = 20) -> List[str]:
 
         cname = (city.get("name") or "").strip() or "?"
         sname = (street.get("name") or "").strip() or ""
+        buildings = (a.get("buildingNames") or "").strip()
 
         # fallback: іноді назва вулиці може бути в інших полях
         if not sname:
@@ -247,17 +249,18 @@ def extract_addresses(accidents: List[dict], limit: int = 20) -> List[str]:
                 (a.get("streetName") or a.get("street_name") or "")
             ).strip()
 
-        key = (cname, sname)
+        key = (cname, sname, buildings)
         if key in seen:
             continue
         seen.add(key)
 
+        parts: List[str] = [city_label(cname)]
         if sname:
-            line = f"{city_label(cname)}, {sname}"
-        else:
-            line = city_label(cname)
+            parts.append(sname)
+        if buildings and buildings not in ("0", "-", "—"):
+            parts.append(f"буд. {buildings}")
 
-        result.append(line)
+        result.append(", ".join(parts))
         if len(result) >= limit:
             break
 
