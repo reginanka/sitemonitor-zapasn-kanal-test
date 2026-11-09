@@ -310,6 +310,9 @@ REM_TOTAL_CITIES: Dict[str, int] = {
 
 # Якщо otg = АТ «Житомиробленерго» (без РЕМ) — підставляємо РЕМ за назвою н.п.
 # Зібрано з /pw_cities (найчастіший otg для назви).
+OBLAST_TOTAL_STREETS = sum(REM_TOTAL_STREETS.values())
+OBLAST_TOTAL_CITIES = sum(REM_TOTAL_CITIES.values())
+
 CITY_TO_REM: Dict[str, str] = {
     "Малин": "Малинський РЕМ",
     "Житомир": "Житомирський РЕМ",
@@ -478,14 +481,30 @@ def should_notify_channel(
     return True, f"перше сповіщення за день, рівень {level}"
 
 
-def severity_emoji(streets: int) -> str:
-    if streets >= 400:
+def severity_emoji(streets: int = 0, coverage_pct: float | None = None) -> str:
+    """
+    Колір за % покриття району (як сортування).
+    Якщо % немає — fallback на абсолютну кількість вулиць.
+    """
+    if coverage_pct is not None:
+        p = float(coverage_pct)
+        if p >= 30:
+            return "🔴"
+        if p >= 15:
+            return "🟠"
+        if p >= 5:
+            return "🟡"
+        if p > 0:
+            return "🟢"
+        return "⚪"
+    n = int(streets or 0)
+    if n >= 400:
         return "🔴"
-    if streets >= 150:
+    if n >= 150:
         return "🟠"
-    if streets >= 50:
+    if n >= 50:
         return "🟡"
-    if streets > 0:
+    if n > 0:
         return "🟢"
     return "⚪"
 
@@ -713,13 +732,27 @@ def format_message(
         level_meta = level_from_cities(total_cities)
     _level_code, level_emoji, level_label = level_meta
 
+    cities_pct_obl = None
+    streets_pct_obl = None
+    if OBLAST_TOTAL_CITIES > 0:
+        cities_pct_obl = min(100.0, 100.0 * int(total_cities or 0) / OBLAST_TOTAL_CITIES)
+    if OBLAST_TOTAL_STREETS > 0:
+        streets_pct_obl = min(100.0, 100.0 * int(total_streets or 0) / OBLAST_TOTAL_STREETS)
+
+    header_counts = (
+        f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
+        f"(загалом <b>{total_streets:,}</b> вулиць)"
+    ).replace(",", " ")
+    if cities_pct_obl is not None and streets_pct_obl is not None:
+        header_counts += (
+            f" — <b>{cities_pct_obl:.1f}%</b> н.п. / <b>{streets_pct_obl:.1f}%</b> вул. області"
+        )
+    header_counts += "."
+
     lines: List[str] = [
         f"{level_emoji}<b>{level_label}</b> стан електромереж у Житомирській області",
         "",
-        (
-            f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
-            f"(загалом <b>{total_streets:,}</b> вулиць)."
-        ).replace(",", " "),
+        header_counts,
         "",
         "⚠️ <b>Ситуація по РЕМ</b> (від найбільш проблемних):",
     ]
@@ -747,7 +780,6 @@ def format_message(
         if st["streets"] == 0:
             continue
         short = name.replace(" РЕМ", "").strip()
-        emoji = severity_emoji(st["streets"])
         streets_s = f"{st['streets']:,}".replace(",", " ")
 
         cp = st.get("cities_pct")
@@ -756,6 +788,11 @@ def format_message(
             cp = rem_cities_pct(name, st["cities"])
         if sp is None:
             sp = rem_streets_pct(name, st["streets"])
+
+        cov = st.get("coverage_pct")
+        if cov is None:
+            cov, _ = rem_coverage_pct(name, st["streets"], st["cities"])
+        emoji = severity_emoji(st["streets"], coverage_pct=cov)
 
         pct_parts: List[str] = []
         if cp is not None:
@@ -778,8 +815,18 @@ def format_message(
             st.get("city_streets", {}).items(),
             key=lambda x: -x[1],
         )[:TOP_CITIES_PER_REM]
+        rem_total = REM_TOTAL_STREETS.get(_norm_rem_name(name))
+        rem_affected = int(st.get("streets") or 0) or 1
         for cname, cnt in cities_sorted:
-            block.append(f"    · {city_label(cname)} — {cnt} вул.")
+            cnt_i = int(cnt or 0)
+            # % від усіх вулиць РЕМ (довідник API); fallback — частка серед аварійних у РЕМ
+            if rem_total and rem_total > 0:
+                city_pct = 100.0 * cnt_i / rem_total
+            else:
+                city_pct = 100.0 * cnt_i / rem_affected
+            block.append(
+                f"    · {city_label(cname)} — {cnt_i} вул. ({city_pct:.1f}%)"
+            )
 
     if block:
         lines.append("<blockquote expandable>")
@@ -845,6 +892,19 @@ def save_to_mongo(
             last_notified_at = prev.get("last_notified_at")
             last_notified_cities = prev.get("last_notified_cities")
 
+        oc_pct = None
+        os_pct = None
+        if OBLAST_TOTAL_CITIES > 0:
+            oc_pct = round(
+                min(100.0, 100.0 * int(stats["total_cities"] or 0) / OBLAST_TOTAL_CITIES),
+                1,
+            )
+        if OBLAST_TOTAL_STREETS > 0:
+            os_pct = round(
+                min(100.0, 100.0 * int(stats["total_streets"] or 0) / OBLAST_TOTAL_STREETS),
+                1,
+            )
+
         doc = {
             "_id": "latest",
             "as_of": as_of.isoformat(),
@@ -853,6 +913,8 @@ def save_to_mongo(
             "total_streets": stats["total_streets"],
             "total_cities": stats["total_cities"],
             "zhytomyr_streets": stats["zhytomyr_streets"],
+            "oblast_cities_pct": oc_pct,
+            "oblast_streets_pct": os_pct,
             "rem": stats["rem"],
             "message": message,
             "level": level,
