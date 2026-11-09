@@ -254,8 +254,9 @@ API_BASE = (os.getenv("ZTOE_API_BASE") or "").rstrip("/")
 AVARII_ZHOE = (os.getenv("AVARII_ZHOE") or "").strip()
 SUBSCRIBE = (os.getenv("SUBSCRIBE") or "").strip()
 
-# скільки топ-населених пунктів показувати під кожним РЕМ
-TOP_CITIES_PER_REM = 5
+# н.п. під РЕМ: показуємо окремо, якщо ≥ CITY_PCT_MIN % вулиць району
+CITY_PCT_MIN = 1.0
+CITY_LIST_MAX = 20  # захист від занадто довгого списку
 
 CITY_PREFIX = {
     "Житомир", "Звягель", "Бердичів", "Овруч", "Коростень", "Малин",
@@ -811,22 +812,40 @@ def format_message(
                 f"{streets_s} вул."
             )
 
-        cities_sorted = sorted(
+        city_items = sorted(
             st.get("city_streets", {}).items(),
             key=lambda x: -x[1],
-        )[:TOP_CITIES_PER_REM]
+        )
         rem_total = REM_TOTAL_STREETS.get(_norm_rem_name(name))
         rem_affected = int(st.get("streets") or 0) or 1
-        for cname, cnt in cities_sorted:
-            cnt_i = int(cnt or 0)
-            # % від усіх вулиць РЕМ (довідник API); fallback — частка серед аварійних у РЕМ
+
+        def _city_pct(cnt_i: int) -> float:
             if rem_total and rem_total > 0:
-                city_pct = 100.0 * cnt_i / rem_total
+                return 100.0 * cnt_i / rem_total
+            return 100.0 * cnt_i / rem_affected
+
+        # окремо — н.п. з ≥ CITY_PCT_MIN % вулиць району; дрібні → «ще N»
+        shown: list = []
+        rest: list = []
+        for cname, cnt in city_items:
+            cnt_i = int(cnt or 0)
+            if _city_pct(cnt_i) >= CITY_PCT_MIN and len(shown) < CITY_LIST_MAX:
+                shown.append((cname, cnt_i))
             else:
-                city_pct = 100.0 * cnt_i / rem_affected
+                rest.append((cname, cnt_i))
+
+        for cname, cnt_i in shown:
             block.append(
-                f"    · {city_label(cname)} — {cnt_i} вул. ({city_pct:.1f}%)"
+                f"    · {city_label(cname)} — {cnt_i} вул. ({_city_pct(cnt_i):.1f}%)"
             )
+
+        if rest:
+            rest_streets = sum(c for _, c in rest)
+            if rest_streets > 0:
+                block.append(
+                    f"    · … ще {len(rest)} нас.п. — {rest_streets} вул. "
+                    f"({_city_pct(rest_streets):.1f}%)"
+                )
 
     if block:
         lines.append("<blockquote expandable>")
