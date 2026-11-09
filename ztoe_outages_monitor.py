@@ -270,12 +270,52 @@ def addr_day_key(outage: dict) -> str:
     return f"{city}|{sid}|{','.join(parts)}|{day}"
 
 
+def _fmt_ddmm(dt: datetime) -> str:
+    return dt.strftime("%d.%m")
+
+
+def _fmt_hhmm_dt(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
+
+def format_forecast_period(date_event: str, date_plan: str) -> str:
+    """
+    Один рядок періоду:
+      той самий день → Прогнозований період: 09:00-20:10 (09.11)
+      кілька днів   → Прогнозований період: з 22:00 (09.11) до 01:00 (17.11)
+    """
+    start = _parse_iso_dt(date_event)
+    end = _parse_iso_dt(date_plan)
+
+    if start is not None:
+        start = start.replace(tzinfo=None) if getattr(start, "tzinfo", None) else start
+    if end is not None:
+        end = end.replace(tzinfo=None) if getattr(end, "tzinfo", None) else end
+
+    if start and end:
+        if start.date() == end.date():
+            return (
+                f"Прогнозований період: {_fmt_hhmm_dt(start)}-{_fmt_hhmm_dt(end)} "
+                f"({_fmt_ddmm(start)})"
+            )
+        return (
+            f"Прогнозований період: з {_fmt_hhmm_dt(start)} ({_fmt_ddmm(start)}) "
+            f"до {_fmt_hhmm_dt(end)} ({_fmt_ddmm(end)})"
+        )
+    if start:
+        return f"Прогнозований період: з {_fmt_hhmm_dt(start)} ({_fmt_ddmm(start)})"
+    if end:
+        return f"Прогнозований період: до {_fmt_hhmm_dt(end)} ({_fmt_ddmm(end)})"
+    return ""
+
+
 def format_outage(outage: dict) -> str:
     city = (outage.get("city") or {}).get("name", "?")
     street = (outage.get("street") or {}).get("name", "?")
     buildings = (outage.get("buildingNames") or "").strip()
-    date_event = (outage.get("dateEvent") or "")[:16].replace("T", " ")
-    date_plan = (outage.get("datePlanIn") or "")[:16].replace("T", " ")
+    date_event_raw = outage.get("dateEvent") or ""
+    date_plan_raw = outage.get("datePlanIn") or ""
+    date_plan = (date_plan_raw or "")[:16].replace("T", " ")
     icon, type_name, type_desc = outage_notify_label(outage)
     if outage.get("_plan_updated"):
         text = f"⏱ <b>Оновлення:</b> {city}, {street}\n📌 {type_name}"
@@ -284,20 +324,22 @@ def format_outage(outage: dict) -> str:
         if buildings:
             text += f"\n🏘 Будинки: {buildings}"
         was = (outage.get("_plan_was") or "")[:16].replace("T", " ")
+        period = format_forecast_period(date_event_raw, date_plan_raw)
         if was and date_plan and was != date_plan:
-            text += f"\n⏳ План увімкнення: <s>{was}</s> → <b>{date_plan}</b>"
-        elif date_plan:
-            text += f"\n⏳ До (план): {date_plan}"
+            text += f"\n⏳ План: <s>{was}</s> → <b>{date_plan}</b>"
+            if period:
+                text += f"\n📅 {period}"
+        elif period:
+            text += f"\n📅 {period}"
     else:
         text = f"{icon} <b>{city}, {street}</b>\n📌 {type_name}"
         if type_desc:
             text += f" — {type_desc}"
         if buildings:
             text += f"\n🏘 Будинки: {buildings}"
-        if date_event:
-            text += f"\n⏰ З: {date_event}"
-        if date_plan:
-            text += f"\n⏳ До (план): {date_plan}"
+        period = format_forecast_period(date_event_raw, date_plan_raw)
+        if period:
+            text += f"\n📅 {period}"
     koment = (outage.get("koment") or "").strip()
     if koment:
         text += f"\n💬 {koment}"
