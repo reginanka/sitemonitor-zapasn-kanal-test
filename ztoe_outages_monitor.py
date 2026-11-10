@@ -215,6 +215,50 @@ def fetch_all_outages(
     return accidents + planned
 
 
+def _fetch_pages_by_city(
+    client: httpx.Client,
+    path: str,
+    city_id: int,
+) -> List[dict]:
+    """Фетч лише по city.id — обходить криві otg-прив'язки в довіднику міст."""
+    items: List[dict] = []
+    page = 1
+    while page <= 40:
+        params = {"page": page, "itemsPerPage": 100, "city.id": city_id}
+        r = client.get(f"{API_BASE}{path}", params=params)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            items.extend(data)
+            break
+        batch = data.get("hydra:member") or []
+        items.extend(batch)
+        if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
+            break
+        page += 1
+    return items
+
+
+def fetch_outages_by_city(client: httpx.Client, city_id: int) -> List[dict]:
+    """
+    Тягне аварії/плани по city.id.
+    Важливо: у довіднику ЖОЕ деякі міста (напр. Коростень id=430)
+    прив'язані до чужого РЕМ (Хорошівський замість Коростенського).
+    Фетч по otg.id тоді повертає 0 записів. По city.id — коректні дані.
+    """
+    accidents = _fetch_pages_by_city(client, "/pw_accidents", city_id)
+    try:
+        planned = _fetch_pages_by_city(client, "/pw_accident_planeds", city_id)
+    except Exception as e:
+        log.warning("planeds error city=%s: %s", city_id, e)
+        planned = []
+    for a in accidents:
+        a["_source"] = "accidents"
+    for p in planned:
+        p["_source"] = "planeds"
+    return accidents + planned
+
+
 def filter_by_city(outages: List[dict], city_id: int) -> List[dict]:
     """Якщо city_id=0 — повертаємо все. Інакше лишаємо збіг або без city (плани часто без міста)."""
     if not city_id:
@@ -901,9 +945,17 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
 
 def _norm_street(name: str) -> str:
     s = (name or "").strip().lower()
-    for pfx in ("вул.", "вул ", "пров.", "провулок ", "проспект ", "пр.", "бульвар ", "пл.", "площа "):
+    # прибрати префікси типу вулиці
+    for pfx in (
+        "вул.", "вул ", "вулиця ", "пров.", "провулок ",
+        "проспект ", "пр.", "бульвар ", "б-р ", "пл.", "площа ",
+        "м.", "м ",
+    ):
         if s.startswith(pfx):
-            s = s[len(pfx) :].strip()
+            s = s[len(pfx):].strip()
+    # зайві пробіли / апострофи різних видів
+    s = s.replace("'", "").replace("’", "").replace("`", "")
+    s = " ".join(s.split())
     return s
 
 
@@ -911,15 +963,18 @@ def matches_street(outage: dict, street_id, street_name: str) -> bool:
     o_street = outage.get("street") or {}
     o_street_id = o_street.get("id")
     o_street_name = (o_street.get("name") or "").lower()
+    # точний id
     if street_id and o_street_id is not None and str(o_street_id) == str(street_id):
         return True
     a = _norm_street(street_name)
     b = _norm_street(o_street_name)
-    if a and b and (a in b or b in a):
+    if not a or not b:
+        return False
+    # повний збіг після нормалізації (Грушевського ≡ ГРУШЕВСЬКОГО)
+    if a == b:
         return True
-    if street_name and street_name.lower() in o_street_name:
-        return True
-    if street_name and o_street_name and o_street_name in street_name.lower():
+    # один містить інший (Михайла Грушевського ⊃ Грушевського)
+    if a in b or b in a:
         return True
     return False
 
@@ -1091,21 +1146,37 @@ def main() -> int:
         },
     )
 
-    # Кеш fetch по otg (без city) — головна економія при кількох city в одній ОТГ
+    # Кеш fetch:
+    # - по city_id (надійніше: обходить криві otg у довіднику міст)
+    # - по otg_id (для адрес без city_id)
+    city_outages_cache: Dict[int, List[dict]] = {}
     otg_outages_cache: Dict[int, List[dict]] = {}
 
+    unique_cities = sorted({cid for (_, cid) in groups if cid})
     try:
-        for otg_id in unique_otgs:
+        for city_id in unique_cities:
+            try:
+                city_outages_cache[city_id] = fetch_outages_by_city(http, city_id)
+                log.info("city=%s fetched_total=%s", city_id, len(city_outages_cache[city_id]))
+            except Exception as e:
+                log.error("Fetch city=%s: %s", city_id, e)
+                city_outages_cache[city_id] = []
+
+        # otg-фетч лише для груп без city_id
+        otgs_without_city = sorted({otg for (otg, cid) in groups if not cid})
+        for otg_id in otgs_without_city:
             try:
                 otg_outages_cache[otg_id] = fetch_all_outages(http, otg_id, None)
-                log.info("otg=%s fetched_total=%s", otg_id, len(otg_outages_cache[otg_id]))
+                log.info("otg=%s (no city) fetched_total=%s", otg_id, len(otg_outages_cache[otg_id]))
             except Exception as e:
                 log.error("Fetch otg=%s: %s", otg_id, e)
                 otg_outages_cache[otg_id] = []
 
         for (otg_id, city_id), group_pairs in groups.items():
-            raw = otg_outages_cache.get(otg_id) or []
-            outages = filter_by_city(raw, city_id)
+            if city_id:
+                outages = list(city_outages_cache.get(city_id) or [])
+            else:
+                outages = list(otg_outages_cache.get(otg_id) or [])
 
             groups_checked += 1
             current_ids = {make_outage_key(o) for o in outages}
