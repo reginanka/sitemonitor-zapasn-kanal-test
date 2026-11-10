@@ -10,16 +10,27 @@
 - bulk_write у Mongo замість поштучних update_one
 - без подвійного retry empty+city
 
+Архітектура сповіщень (v1.4):
+- Глобальний outages_cache (fps / soft_fps / plan_by_addr_day) — лише для
+  детекції змін в API і продовжень аварій.
+- Per-user дедуп у колекції user_outage_notified:
+  ключ = telegram_id + notify_dedup_key.
+  Завдяки цьому користувач, який додав адресу ПІСЛЯ появи аварії,
+  все одно отримає сповіщення про поточні активні відключення.
+- matches_building нормалізує номери (033 ≡ 33, 33а ≡ 33А тощо).
+
 Cleanup (щоб база не роздувалась):
 - outages: delete документи з updated_at старші за OUTAGES_RETENTION_HOURS (default 48)
 - outages_cache: soft_fps обрізається до SOFT_FPS_MAX (default 3000);
   документи cache, які давно не оновлювались (OUTAGES_CACHE_RETENTION_DAYS, default 30),
   видаляються (застарілі групи адрес)
+- user_outage_notified: TTL через expires_at (default 7 днів)
 
 Env:
   OUTAGES_RETENTION_HOURS      — TTL повних записів у outages (default 48)
   SOFT_FPS_MAX                 — макс. розмір soft_fps у cache (default 3000)
   OUTAGES_CACHE_RETENTION_DAYS — TTL неактивних ключів cache (default 30)
+  USER_NOTIFIED_TTL_DAYS       — TTL записів per-user дедупу (default 7)
 """
 
 from __future__ import annotations
@@ -54,6 +65,7 @@ if not API_BASE:
 OUTAGES_RETENTION_HOURS = int(os.getenv("OUTAGES_RETENTION_HOURS", "48"))
 SOFT_FPS_MAX = int(os.getenv("SOFT_FPS_MAX", "3000"))
 OUTAGES_CACHE_RETENTION_DAYS = int(os.getenv("OUTAGES_CACHE_RETENTION_DAYS", "30"))
+USER_NOTIFIED_TTL_DAYS = int(os.getenv("USER_NOTIFIED_TTL_DAYS", "7"))
 
 
 def merge_soft_fps(current_soft: Set[str], prev_soft: Set[str], limit: int = SOFT_FPS_MAX) -> List[str]:
@@ -880,19 +892,53 @@ def matches_street(outage: dict, street_id, street_name: str) -> bool:
     return False
 
 
+def _parse_house(h: str) -> tuple[str, str]:
+    """
+    Повертає (числова_частина, суфікс у lower).
+    '033'  → ('33', '')
+    '33а'  → ('33', 'а')
+    '33-А' → ('33', 'а')
+    '33 а' → ('33', 'а')
+    '33А'  → ('33', 'а')
+    """
+    h = (h or "").strip().lower().replace(" ", "").replace("-", "")
+    m = re.match(r"^0*(\d+)([а-яa-z]*)$", h, re.IGNORECASE)
+    if m:
+        return m.group(1), m.group(2)
+    return h, ""
+
+
 def matches_building(outage: dict, house: str) -> bool:
+    """
+    Матч будинку користувача з buildingNames з API.
+    - 33  матчить 33, 033, 33а, 33А, 33 а
+    - 33а матчить тільки 33а / 33А (суфікс обов'язковий)
+    - 33  НЕ матчить 330
+    """
     house = (house or "").strip()
     if not house:
         return True
     buildings = (outage.get("buildingNames") or "").strip()
     if not buildings:
         return True
-    tokens = {p.strip().lower() for p in buildings.replace(";", ",").split(",") if p.strip()}
-    h = house.lower()
-    if h in tokens:
-        return True
-    h2 = h.lstrip("0") or "0"
-    return h2 in tokens or any(t.lstrip("0") == h2 for t in tokens)
+
+    tokens = {
+        p.strip().lower()
+        for p in buildings.replace(";", ",").split(",")
+        if p.strip()
+    }
+
+    user_num, user_suf = _parse_house(house)
+
+    for t in tokens:
+        tok_num, tok_suf = _parse_house(t)
+        if tok_num != user_num:
+            continue
+        # користувач без суфікса → підходить будь-який токен з цим номером
+        # користувач із суфіксом → потрібен точний збіг суфікса
+        if not user_suf or user_suf == tok_suf:
+            return True
+    return False
 
 
 
@@ -973,6 +1019,7 @@ def main() -> int:
     users_col = db["users"]
     outages_col = db["outages_cache"]
     outages_full = db["outages"]
+    notified_col = db["user_outage_notified"]
 
     users = list(users_col.find({"notify": True}))
     try:
@@ -1157,14 +1204,26 @@ def main() -> int:
 
             matched_fps: set = set()
 
-            if new_outages:
+            # --- Per-user нотифікації по ВСІХ активних аваріях ---
+            # Глобальний fps-кеш лишається для детекції змін/продовжень.
+            # Тут перевіряємо кожного підписника окремо: якщо йому ще не
+            # слали цей notify_dedup_key — шлемо (навіть якщо аварія стара).
+            active_outages = [o for o in outages if should_notify_outage(o)]
+            # plan_updates теж треба врахувати (вони вже додані в new_outages,
+            # але можуть не бути в active_outages як окремі об'єкти з _plan_updated)
+            plan_update_ids = {id(o) for o in new_outages if o.get("_plan_updated")}
+            for o in new_outages:
+                if o.get("_plan_updated") and o not in active_outages:
+                    active_outages.append(o)
+
+            if active_outages:
                 for user, addr in group_pairs:
                     tid = user.get("telegram_id")
                     if not tid:
                         continue
                     street_id = addr.get("street_id") or addr.get("streetId")
                     street_name = (addr.get("street_name") or addr.get("street") or "").strip().lower()
-                    house = addr.get("house") or addr.get("building") or ""
+                    house = str(addr.get("house") or addr.get("building") or "")
                     uqk = user_queue_key(addr)
 
                     # queue_key на full docs тільки для зматчених адрес
@@ -1173,7 +1232,7 @@ def main() -> int:
                         for outage in outages:
                             if not matches_street(outage, street_id, street_name):
                                 continue
-                            if not matches_building(outage, str(house)):
+                            if not matches_building(outage, house):
                                 continue
                             doc = outage_to_mongo_doc(outage, queue_key=uqk)
                             queue_ops.append(
@@ -1186,51 +1245,87 @@ def main() -> int:
                         if queue_ops:
                             outages_full.bulk_write(queue_ops, ordered=False)
 
-                    for outage in new_outages:
+                    # які dedup_key вже слали цій людині
+                    already_keys = {
+                        d["dedup_key"]
+                        for d in notified_col.find(
+                            {"telegram_id": int(tid)},
+                            projection={"dedup_key": 1, "_id": 0},
+                        )
+                    }
+
+                    for outage in active_outages:
                         if not matches_street(outage, street_id, street_name):
                             continue
-                        if not matches_building(outage, str(house)):
+                        if not matches_building(outage, house):
                             continue
-                        if uqk:
-                            outage["_user_queue"] = uqk
-                        notified.setdefault(tid, [])
+
+                        dkey = notify_dedup_key(outage, house)
+                        if dkey in already_keys:
+                            continue
+
+                        # внутрішній дедуп у межах одного прогону
                         fp = content_fingerprint(outage)
-                        dkey = notify_dedup_key(outage, str(house))
-                        already = False
-                        for x in notified[tid]:
+                        already_run = False
+                        for x in notified.get(tid, []):
                             prev_o = x[0] if isinstance(x, tuple) else x
                             if content_fingerprint(prev_o) == fp:
-                                already = True
+                                already_run = True
                                 break
-                            # той самий будинок + той самий проміжок (різні списки будинків з API)
-                            if notify_dedup_key(prev_o, str(house)) == dkey:
-                                already = True
+                            if notify_dedup_key(prev_o, house) == dkey:
+                                already_run = True
                                 break
-                        if already:
+                        if already_run:
                             continue
-                        notified[tid].append((outage, addr))
+
+                        outage_copy = dict(outage)
+                        if uqk:
+                            outage_copy["_user_queue"] = uqk
+
+                        notified.setdefault(tid, []).append((outage_copy, addr))
                         matched_fps.add(fp)
+                        already_keys.add(dkey)
+
+                        # фіксуємо, що цій людині вже слали
+                        notify_id = f"{int(tid)}:{dkey}"
+                        notified_col.update_one(
+                            {"_id": notify_id},
+                            {
+                                "$set": {
+                                    "telegram_id": int(tid),
+                                    "dedup_key": dkey,
+                                    "notified_at": datetime.now(timezone.utc),
+                                    "expires_at": datetime.now(timezone.utc)
+                                    + timedelta(days=USER_NOTIFIED_TTL_DAYS),
+                                    "otg_id": otg_id,
+                                    "city_id": city_id,
+                                    "house": house,
+                                }
+                            },
+                            upsert=True,
+                        )
 
                 log.info(
-                    "otg=%s city=%s matched_new=%s (addrs=%s)",
+                    "otg=%s city=%s matched_active=%s (addrs=%s active=%s)",
                     otg_id,
                     city_id,
                     len(matched_fps),
                     len(group_pairs),
+                    len(active_outages),
                 )
-                if new_outages and not matched_fps:
+                if active_outages and not matched_fps:
                     sample = []
-                    for o in new_outages[:5]:
+                    for o in active_outages[:5]:
                         st = (o.get("street") or {}).get("name") or "?"
-                        bld = (o.get("buildingNames") or "")[:30]
+                        bld = (o.get("buildingNames") or "")[:40]
                         sample.append(f"{st}|{bld}|type={o.get('typeOff')}")
-                    log.info("no street match; API sample: %s", " || ".join(sample))
+                    log.info("no street/house match; API sample: %s", " || ".join(sample))
                     for user, addr in group_pairs:
                         log.info(
                             "  user street=%r id=%s house=%r",
                             addr.get("street_name") or addr.get("street"),
                             addr.get("street_id") or addr.get("streetId"),
-                            addr.get("house"),
+                            addr.get("house") or addr.get("building"),
                         )
 
             # Кеш завжди оновлюємо (інакше втрачаємо plan_by_addr_day і «не бачимо» продовжень)
@@ -1268,7 +1363,7 @@ def main() -> int:
     finally:
         http.close()
 
-    # --- cleanup: тільки outages + outages_cache; ГПВ/users не чіпаємо ---
+    # --- cleanup: outages + outages_cache + user_outage_notified ---
     try:
         if OUTAGES_RETENTION_HOURS > 0:
             cutoff = datetime.now(timezone.utc) - timedelta(hours=OUTAGES_RETENTION_HOURS)
@@ -1304,6 +1399,15 @@ def main() -> int:
                 "outages_cache cleanup: deleted=%s older_than=%sd",
                 del_cache.deleted_count,
                 OUTAGES_CACHE_RETENTION_DAYS,
+            )
+        # Per-user дедуп: видаляємо прострочені записи (expires_at)
+        if USER_NOTIFIED_TTL_DAYS > 0:
+            del_notified = notified_col.delete_many(
+                {"expires_at": {"$lt": datetime.now(timezone.utc)}}
+            )
+            log.info(
+                "user_outage_notified cleanup: deleted=%s expired",
+                del_notified.deleted_count,
             )
     except Exception as e:
         log.warning("cleanup failed (non-fatal): %s", e)
