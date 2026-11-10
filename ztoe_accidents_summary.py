@@ -5,7 +5,7 @@
 - Тягне всі записи з /pw_accidents
 - Рахує унікальні вулиці / нас. пункти по РЕМ
 - Сортує РЕМ за відсотком уражених вулиць у районі (а не лише за кількістю)
-- Під кожним РЕМ — топ населених пунктів (географія)
+- Під кожним РЕМ — топ населених пунктів: % РЕМ і % вимкнення самого н.п.
 - Завжди зберігає знімок у Mongo (accidents_summary: latest + історія по годині)
 - У Telegram-канал шле ЛИШЕ при рівні CRITICAL
   (антиспам: last_notified_date / last_notified_level у Mongo)
@@ -561,6 +561,117 @@ def rem_coverage_pct(
     return candidates[0]
 
 
+def _is_oblenergo(otg_name: str) -> bool:
+    """АТ «Житомиробленерго» без конкретного РЕМ."""
+    s = (otg_name or "").lower()
+    return "житомиробленерго" in s and "рем" not in s
+
+
+def _ref_id(value: Any) -> int | None:
+    """id з int, з об'єкта API або з IRI виду /api/pw_cities/214."""
+    if isinstance(value, dict):
+        value = value.get("id") if value.get("id") is not None else value.get("@id")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value:
+        tail = value.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            return int(tail)
+        except ValueError:
+            return None
+    return None
+
+
+def _fetch_collection(client: httpx.Client, path: str) -> List[dict]:
+    r = client.get(f"{API_BASE}{path}", params={"pagination": "false"})
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        return data
+    return list(data.get("hydra:member") or [])
+
+
+def fetch_city_street_totals() -> Dict[Tuple[str, str], int]:
+    """
+    (нормалізований РЕМ, назва н.п.) → скільки вулиць у довіднику /pw_streets.
+
+    Частина н.п. (Хорошів, Нова Борова, …) висить на otg АТ «Житомиробленерго»,
+    хоча аварії приходять уже з РЕМ. Такі вулиці клеїмо до РЕМ:
+      1) CITY_TO_REM, якщо назва там є;
+      2) інакше — єдиний РЕМ, де ця назва теж заведена.
+    Дублікати city id з однією назвою в одному РЕМ сумуються.
+    """
+    if not API_BASE:
+        return {}
+
+    headers = {
+        "Accept": "application/ld+json",
+        "User-Agent": "ztoe-accidents-summary/1.3",
+    }
+    try:
+        with httpx.Client(timeout=180, headers=headers) as client:
+            cities = _fetch_collection(client, "/pw_cities")
+            streets = _fetch_collection(client, "/pw_streets")
+    except Exception as e:
+        log_to_buffer(f"⚠️ Довідник вулиць н.п. недоступний: {e}")
+        return {}
+
+    per_city: Dict[int, int] = defaultdict(int)
+    for street in streets:
+        cid = _ref_id(street.get("city"))
+        if cid is None:
+            continue
+        per_city[cid] += 1
+
+    # "" = кошик обленерго (ще не прив'язаний до РЕМ)
+    counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    presence: Dict[str, Set[str]] = defaultdict(set)
+
+    for city in cities:
+        name = (city.get("name") or "").strip()
+        if not name or name.casefold() == "невідомо":
+            continue
+        otg = ((city.get("otg") or {}).get("name") or "").strip()
+        cid = city.get("id")
+        try:
+            cid_i = int(cid) if cid is not None else None
+        except (TypeError, ValueError):
+            cid_i = None
+        if cid_i is None:
+            cid_i = _ref_id(city.get("@id"))
+        n = per_city.get(cid_i, 0) if cid_i is not None else 0
+        if _is_oblenergo(otg):
+            rem_key = ""
+        else:
+            rem_key = _norm_rem_name(otg)
+            if rem_key:
+                presence[name].add(rem_key)
+        if n > 0:
+            counts[name][rem_key] += n
+
+    totals: Dict[Tuple[str, str], int] = {}
+    for name in set(counts) | set(presence):
+        by_rem = dict(counts.get(name) or {})
+        obl_n = int(by_rem.pop("", 0) or 0)
+        if obl_n:
+            mapped = CITY_TO_REM.get(name)
+            target = _norm_rem_name(mapped) if mapped else ""
+            rems_here = presence.get(name) or set()
+            if not target and len(rems_here) == 1:
+                target = next(iter(rems_here))
+            if target:
+                by_rem[target] = int(by_rem.get(target) or 0) + obl_n
+        for rem_key, n in by_rem.items():
+            if rem_key and n > 0:
+                totals[(rem_key, name)] = int(n)
+
+    log_to_buffer(
+        f"Довідник вулиць н.п.: {len(totals)} "
+        f"(cities={len(cities)}, streets={len(streets)})"
+    )
+    return totals
+
+
 # Рівень по кількості населених пунктів (область ~1400 н.п.)
 # 🟢 NORM     < 30
 # 🟡 WARN     30–150
@@ -894,6 +1005,7 @@ def format_message(
     stats: Dict[str, Any],
     as_of: datetime,
     level_meta: Tuple[str, str, str] | None = None,
+    city_street_totals: Dict[Tuple[str, str], int] | None = None,
 ) -> str:
     time_full = as_of.strftime("%d.%m.%Y %H:%M")
     time_short = as_of.strftime("%H:%M %d.%m")
@@ -972,7 +1084,7 @@ def format_message(
             pct_parts.append(f"{cp:.1f}% н.п.")
         if sp is not None:
             # для показу не роздуваємо понад 100% (розбіжність довідника)
-            pct_parts.append(f"{min(sp, 100.0):.1f}% вул.")
+            pct_parts.append(f"{min(sp, 100.0):.1f}% вул. РЕМ")
         if pct_parts:
             block.append(
                 f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
@@ -996,6 +1108,27 @@ def format_message(
                 return 100.0 * cnt_i / rem_total
             return 100.0 * cnt_i / rem_affected
 
+        def _own_pct(cname: str, cnt_i: int) -> float | None:
+            """Частка вимкнених вулиць у самому населеному пункті."""
+            if not city_street_totals or cnt_i <= 0:
+                return None
+            total = city_street_totals.get(
+                (_norm_rem_name(name), (cname or "").strip())
+            )
+            if not total or total <= 0:
+                return None
+            return min(100.0, 100.0 * cnt_i / total)
+
+        def _fmt_np_line(cname: str, cnt_i: int) -> str:
+            bits = [f"{_city_pct(cnt_i):.1f}% РЕМ"]
+            own = _own_pct(cname, cnt_i)
+            if own is not None:
+                bits.append(f"{own:.1f}% нас. пункту")
+            return (
+                f"    · {city_label(cname)} — {cnt_i} вул. "
+                f"({' - '.join(bits)})"
+            )
+
         # окремо — н.п. з ≥ CITY_PCT_MIN % вулиць району; дрібні → «ще N»
         shown: list = []
         rest: list = []
@@ -1007,19 +1140,14 @@ def format_message(
                 rest.append((cname, cnt_i))
 
         for cname, cnt_i in shown:
-            block.append(
-                f"    · {city_label(cname)} — {cnt_i} вул. ({_city_pct(cnt_i):.1f}%)"
-            )
+            block.append(_fmt_np_line(cname, cnt_i))
 
         if rest:
             # < CITY_PCT_MIN: один н.п. → лише назва; кілька → назва + «ще N»
             if len(rest) == 1:
                 cname, cnt_i = rest[0]
                 if cnt_i > 0:
-                    block.append(
-                        f"    · {city_label(cname)} — {cnt_i} вул. "
-                        f"({_city_pct(cnt_i):.1f}%)"
-                    )
+                    block.append(_fmt_np_line(cname, cnt_i))
             else:
                 first_name, _first_cnt = rest[0]
                 more = len(rest) - 1
@@ -1027,7 +1155,7 @@ def format_message(
                 if rest_streets > 0:
                     block.append(
                         f"    · {city_label(first_name)} + ще {more} нас.п. — "
-                        f"{rest_streets} вул. ({_city_pct(rest_streets):.1f}%)"
+                        f"{rest_streets} вул. ({_city_pct(rest_streets):.1f}% РЕМ)"
                     )
 
     if block:
@@ -1039,10 +1167,19 @@ def format_message(
 
     lines.append("")
 
-    # Лише для CRITICAL — заклик після блоку РЕМ, перед лінками
+    # Лише для CRITICAL — заклик після блоку РЕМ, перед легендою
     if _level_code == "CRITICAL":
         lines.append("<i>Будь ласка, не користуйтесь потужними електроприладами.</i>")
         lines.append("")
+
+    lines.append("ℹ️ <b>Як читати відсотки</b>")
+    lines.append("• шапка — частка <b>області</b>: % н.п. (населені пункти) і % вул. (вулиці)")
+    lines.append("• рядок РЕМ — частка <b>цього району</b> (% н.п. / % вул. РЕМ)")
+    lines.append(
+        "• рядок н.п.: <b>% РЕМ</b> — внесок пункту у вулиці району; "
+        "<b>% нас. пункту</b> — яка частка вулиць самого пункту зараз без світла"
+    )
+    lines.append("")
 
     footer_parts: List[str] = []
     if AVARII_ZHOE:
@@ -1202,7 +1339,10 @@ def main() -> int:
 
     stats = aggregate(accidents)
     level, level_emoji, level_label = level_from_cities(stats["total_cities"])
-    msg = format_message(stats, as_of, (level, level_emoji, level_label))
+    city_street_totals = fetch_city_street_totals()
+    msg = format_message(
+        stats, as_of, (level, level_emoji, level_label), city_street_totals
+    )
 
     log_to_buffer(
         f"📊 records={stats['total_records']} "
