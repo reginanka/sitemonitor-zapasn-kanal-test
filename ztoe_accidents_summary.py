@@ -582,6 +582,20 @@ def _ref_id(value: Any) -> int | None:
     return None
 
 
+def _accident_place(accident: dict) -> Tuple[str, str, int | None]:
+    """РЕМ (як у зведенні), назва н.п. і city id з аварії."""
+    city = accident.get("city") or {}
+    otg = accident.get("otg") or {}
+    cname = (city.get("name") or "").strip() or "?"
+    cid = _ref_id(city)
+    oname = (otg.get("name") or "").strip() or "?"
+    # АТ «Житомиробленерго» без конкретного РЕМ — підставляємо РЕМ за назвою н.п.
+    if _is_oblenergo(oname):
+        mapped = CITY_TO_REM.get(cname)
+        oname = mapped if mapped else "Інше (обленерго)"
+    return oname, cname, cid
+
+
 def _fetch_collection(client: httpx.Client, path: str) -> List[dict]:
     r = client.get(f"{API_BASE}{path}", params={"pagination": "false"})
     r.raise_for_status()
@@ -591,17 +605,34 @@ def _fetch_collection(client: httpx.Client, path: str) -> List[dict]:
     return list(data.get("hydra:member") or [])
 
 
-def fetch_city_street_totals() -> Dict[Tuple[str, str], int]:
+def city_street_totals_from(
+    accidents: List[dict], per_city: Dict[int, int]
+) -> Dict[Tuple[str, str], int]:
     """
-    (нормалізований РЕМ, назва н.п.) → скільки вулиць у довіднику /pw_streets.
+    (нормалізований РЕМ, назва н.п.) → скільки вулиць у довіднику.
 
-    Частина н.п. (Хорошів, Нова Борова, …) висить на otg АТ «Житомиробленерго»,
-    хоча аварії приходять уже з РЕМ. Такі вулиці клеїмо до РЕМ:
-      1) CITY_TO_REM, якщо назва там є;
-      2) інакше — єдиний РЕМ, де ця назва теж заведена.
-    Дублікати city id з однією назвою в одному РЕМ сумуються.
+    Беремо city id з самої аварії, а не otg з картки міста: у дублів
+    (Калинівка, Сколобів, Добринь) картка числиться в іншому РЕМ,
+    хоча відключення приходить уже з Хорошівського.
     """
-    if not API_BASE:
+    ids: Dict[Tuple[str, str], Set[int]] = defaultdict(set)
+    for accident in accidents:
+        oname, cname, cid = _accident_place(accident)
+        if not cname or cname == "?" or cid is None:
+            continue
+        ids[(_norm_rem_name(oname), cname)].add(cid)
+
+    totals: Dict[Tuple[str, str], int] = {}
+    for key, cids in ids.items():
+        n = sum(int(per_city.get(cid) or 0) for cid in cids)
+        if n > 0:
+            totals[key] = n
+    return totals
+
+
+def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int]:
+    """Вулиці н.п. з /pw_streets, розкладені по РЕМ так, як аварії у зведенні."""
+    if not API_BASE or not accidents:
         return {}
 
     headers = {
@@ -610,7 +641,6 @@ def fetch_city_street_totals() -> Dict[Tuple[str, str], int]:
     }
     try:
         with httpx.Client(timeout=180, headers=headers) as client:
-            cities = _fetch_collection(client, "/pw_cities")
             streets = _fetch_collection(client, "/pw_streets")
     except Exception as e:
         log_to_buffer(f"⚠️ Довідник вулиць н.п. недоступний: {e}")
@@ -623,51 +653,9 @@ def fetch_city_street_totals() -> Dict[Tuple[str, str], int]:
             continue
         per_city[cid] += 1
 
-    # "" = кошик обленерго (ще не прив'язаний до РЕМ)
-    counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    presence: Dict[str, Set[str]] = defaultdict(set)
-
-    for city in cities:
-        name = (city.get("name") or "").strip()
-        if not name or name.casefold() == "невідомо":
-            continue
-        otg = ((city.get("otg") or {}).get("name") or "").strip()
-        cid = city.get("id")
-        try:
-            cid_i = int(cid) if cid is not None else None
-        except (TypeError, ValueError):
-            cid_i = None
-        if cid_i is None:
-            cid_i = _ref_id(city.get("@id"))
-        n = per_city.get(cid_i, 0) if cid_i is not None else 0
-        if _is_oblenergo(otg):
-            rem_key = ""
-        else:
-            rem_key = _norm_rem_name(otg)
-            if rem_key:
-                presence[name].add(rem_key)
-        if n > 0:
-            counts[name][rem_key] += n
-
-    totals: Dict[Tuple[str, str], int] = {}
-    for name in set(counts) | set(presence):
-        by_rem = dict(counts.get(name) or {})
-        obl_n = int(by_rem.pop("", 0) or 0)
-        if obl_n:
-            mapped = CITY_TO_REM.get(name)
-            target = _norm_rem_name(mapped) if mapped else ""
-            rems_here = presence.get(name) or set()
-            if not target and len(rems_here) == 1:
-                target = next(iter(rems_here))
-            if target:
-                by_rem[target] = int(by_rem.get(target) or 0) + obl_n
-        for rem_key, n in by_rem.items():
-            if rem_key and n > 0:
-                totals[(rem_key, name)] = int(n)
-
+    totals = city_street_totals_from(accidents, per_city)
     log_to_buffer(
-        f"Довідник вулиць н.п.: {len(totals)} "
-        f"(cities={len(cities)}, streets={len(streets)})"
+        f"Довідник вулиць н.п.: {len(totals)} (streets={len(streets)})"
     )
     return totals
 
@@ -933,22 +921,9 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
     )
 
     for a in accidents:
-        city = a.get("city") or {}
         street = a.get("street") or {}
-        otg = a.get("otg") or {}
-
-        cid = city.get("id")
-        cname = (city.get("name") or "").strip() or "?"
+        oname, cname, cid = _accident_place(a)
         sid = street.get("id")
-        oname = (otg.get("name") or "").strip() or "?"
-
-        # АТ «Житомиробленерго» без конкретного РЕМ — пробуємо визначити РЕМ по н.п.
-        if "Житомиробленерго" in oname and "РЕМ" not in oname:
-            mapped = CITY_TO_REM.get(cname)
-            if mapped:
-                oname = mapped
-            else:
-                oname = "Інше (обленерго)"
 
         street_key = sid if sid is not None else (cname, street.get("name"))
         city_key = cid if cid is not None else cname
@@ -1129,6 +1104,23 @@ def format_message(
                 f"({' - '.join(bits)})"
             )
 
+        def _own_pct_many(items: List[Tuple[str, int]]) -> float | None:
+            """Сумарна частка вимкнених вулиць по кількох н.п. разом."""
+            if not city_street_totals or not items:
+                return None
+            total = 0
+            affected = 0
+            rem_key = _norm_rem_name(name)
+            for cname, cnt_i in items:
+                known = city_street_totals.get((rem_key, (cname or "").strip()))
+                if not known or known <= 0:
+                    return None
+                total += int(known)
+                affected += int(cnt_i or 0)
+            if total <= 0 or affected <= 0:
+                return None
+            return min(100.0, 100.0 * affected / total)
+
         # окремо — н.п. з ≥ CITY_PCT_MIN % вулиць району; дрібні → «ще N»
         shown: list = []
         rest: list = []
@@ -1153,9 +1145,13 @@ def format_message(
                 more = len(rest) - 1
                 rest_streets = sum(c for _, c in rest)
                 if rest_streets > 0:
+                    bits = [f"{_city_pct(rest_streets):.1f}% РЕМ"]
+                    own = _own_pct_many(rest)
+                    if own is not None:
+                        bits.append(f"{own:.1f}% нас. пункту")
                     block.append(
                         f"    · {city_label(first_name)} + ще {more} нас.п. — "
-                        f"{rest_streets} вул. ({_city_pct(rest_streets):.1f}% РЕМ)"
+                        f"{rest_streets} вул. ({' - '.join(bits)})"
                     )
 
     if block:
@@ -1339,7 +1335,7 @@ def main() -> int:
 
     stats = aggregate(accidents)
     level, level_emoji, level_label = level_from_cities(stats["total_cities"])
-    city_street_totals = fetch_city_street_totals()
+    city_street_totals = fetch_city_street_totals(accidents)
     msg = format_message(
         stats, as_of, (level, level_emoji, level_label), city_street_totals
     )
