@@ -4,12 +4,13 @@
 
 - Тягне всі записи з /pw_accidents
 - Рахує унікальні вулиці / нас. пункти по РЕМ
-- Сортує РЕМ за відсотком уражених вулиць у районі (а не лише за кількістю)
-- Під кожним РЕМ — топ населених пунктів: % РЕМ і % вимкнення самого н.п.
-- У рядку РЕМ — % району: яка частка вулиць району зараз без світла
-  (знаменник з /pw_streets; село в чужій картці РЕМ не потребує винятку)
-- Запис без РЕМ («АТ Житомиробленерго») клеїться до РЕМ цього ж city id,
-  а не в окреме «Інше» (Нова Борова → Хорошівський)
+- Сортує РЕМ за часткою району без світла (% вулиць), не за старою карткою
+- Під кожним РЕМ — населені пункти: % РЕМ і % вимкнення самого н.п.
+- Село належить РЕМ із відключення, не з картки міста
+  (Коростень → Коростенський, навіть якщо картка каже Хорошівський)
+- У рядку РЕМ лише два відсотки з цієї ж прив'язки: % н.п. і % району
+- Запис без РЕМ («АТ Житомиробленерго») клеїться до РЕМ цього ж city id
+  (Нова Борова → Хорошівський)
 - Завжди зберігає знімок у Mongo (accidents_summary: latest + історія по годині)
 - У Telegram-канал шле ЛИШЕ при рівні CRITICAL
   (антиспам: last_notified_date / last_notified_level у Mongo)
@@ -439,9 +440,9 @@ CITY_PREFIX = {
 }
 
 # Покриття району.
+# % вул. РЕМ — статична таблиця нижче (як у старих звітах).
 # % району — живий знаменник: вулиці /pw_streets, місто віднесене до РЕМ
-# за відключеннями (більшість записів), а не за otg картки. Статична таблиця
-# нижче — лише якщо довідник не відкрився.
+# за відключеннями (більшість записів), а не за otg картки.
 # % н.п. — з довідника addresses_directory (у API pw_cities дублікати, % там кривий).
 REM_TOTAL_STREETS: Dict[str, int] = {
     "Житомирський": 2782,
@@ -526,9 +527,11 @@ def _norm_rem_name(name: str) -> str:
     return s
 
 
-# Живий знаменник вулиць району. None — ще не завантажили, лишається статика.
+# Живий знаменник. None — ще не завантажили, лишається статична таблиця.
 _REM_STREETS_DYNAMIC: Dict[str, int] | None = None
+_REM_CITIES_DYNAMIC: Dict[str, int] | None = None
 _OBLAST_STREETS_DYNAMIC: int | None = None
+_OBLAST_CITIES_DYNAMIC: int | None = None
 # city id → {сира назва РЕМ: скільки записів}, з усіх відключень, включно з ГПВ.
 _CITY_REM_VOTES: Dict[int, Dict[str, int]] = {}
 _CITY_REM_NAMES: Dict[int, str] = {}
@@ -554,9 +557,29 @@ def _oblast_street_total() -> int:
     return OBLAST_TOTAL_STREETS
 
 
+def _rem_city_total(rem_name: str) -> int | None:
+    """Скільки н.п. у районі: та сама прив'язка, що й для вулиць."""
+    key = _norm_rem_name(rem_name)
+    if _REM_CITIES_DYNAMIC is not None:
+        dyn = int(_REM_CITIES_DYNAMIC.get(key) or 0)
+        if dyn > 0:
+            return dyn
+    return REM_TOTAL_CITIES.get(key)
+
+
+def _oblast_city_total() -> int:
+    if _OBLAST_CITIES_DYNAMIC and _OBLAST_CITIES_DYNAMIC > 0:
+        return int(_OBLAST_CITIES_DYNAMIC)
+    if _REM_CITIES_DYNAMIC:
+        summed = sum(int(v or 0) for v in _REM_CITIES_DYNAMIC.values())
+        if summed > 0:
+            return summed
+    return OBLAST_TOTAL_CITIES
+
+
 def rem_streets_pct(rem_name: str, affected_streets: int) -> float | None:
     """
-    % району: уражені вулиці / усі вулиці цього району.
+    % району: уражені вулиці / усі вулиці цього району (живий знаменник).
     Може бути >100%, якщо API дає більше унікальних ключів, ніж є в довіднику.
     """
     total = _rem_street_total(rem_name)
@@ -567,8 +590,8 @@ def rem_streets_pct(rem_name: str, affected_streets: int) -> float | None:
 
 
 def rem_cities_pct(rem_name: str, affected_cities: int) -> float | None:
-    """Відсоток уражених н.п. у РЕМ (надійніший за вулиці)."""
-    total = REM_TOTAL_CITIES.get(_norm_rem_name(rem_name))
+    """Частка н.п. району. Знаменник — ті самі села, що й у % району."""
+    total = _rem_city_total(rem_name)
     if not total or total <= 0:
         return None
     n = max(0, int(affected_cities or 0))
@@ -578,21 +601,11 @@ def rem_cities_pct(rem_name: str, affected_cities: int) -> float | None:
 def rem_coverage_pct(
     rem_name: str, affected_streets: int, affected_cities: int
 ) -> tuple[float | None, str]:
-    """
-    Ключ сортування: max(% н.п., % вул.), щоб район з повним покриттям
-    н.п. не програвав через розбіжність довідника по вулицях.
-    """
+    """Сортування лише за % району: яка частка його вулиць без світла."""
     sp = rem_streets_pct(rem_name, affected_streets)
-    cp = rem_cities_pct(rem_name, affected_cities)
-    candidates = []
-    if cp is not None:
-        candidates.append((cp, "cities"))
-    if sp is not None:
-        candidates.append((min(sp, 100.0), "streets"))  # для сорту не роздуваємо >100
-    if not candidates:
+    if sp is None:
         return None, "streets"
-    candidates.sort(key=lambda x: -x[0])
-    return candidates[0]
+    return min(float(sp), 100.0), "streets"
 
 
 def _is_oblenergo(otg_name: str) -> bool:
@@ -697,8 +710,7 @@ def resolve_city_rem(
     Куди класти вулиці міста в знаменник району.
 
     Є відключення по цьому city id — РЕМ беремо з них, картку ігноруємо.
-    Окремий виняток на село не потрібен: навіть якщо картка в чужому РЕМ,
-    відсоток району рахується за тим РЕМ, який стоїть у відключенні.
+    Окремий виняток на село не потрібен.
     Картка лишається лише для сіл, яких зараз немає в жодному відключенні.
     """
     winner = _prefer_real_rem(votes or {})
@@ -718,13 +730,13 @@ def rem_street_totals_from(
     per_city: Dict[int, int],
     cards: Dict[int, Tuple[str, str]],
     votes: Dict[int, Dict[str, int]],
-) -> Tuple[Dict[str, int], List[Tuple[int, str, str, str]]]:
+) -> Tuple[Dict[str, int], Dict[str, int], List[Tuple[int, str, str, str]]]:
     """
-    Нормалізований РЕМ → усі вулиці району.
-    Друге значення — села, чия картка вказує інший РЕМ, ніж відключення:
-    (вулиць, назва, РЕМ картки, РЕМ відключення).
+    Нормалізований РЕМ → вулиці району і кількість н.п.
+    Третє значення — села, чия картка вказує інший РЕМ, ніж відключення.
     """
     totals: Dict[str, int] = defaultdict(int)
+    city_totals: Dict[str, int] = defaultdict(int)
     moves: List[Tuple[int, str, str, str]] = []
     for cid, nstreets in per_city.items():
         nstreets = int(nstreets or 0)
@@ -736,11 +748,14 @@ def rem_street_totals_from(
         chosen = resolve_city_rem(cotg, cname, votes.get(cid))
         if not chosen:
             continue
-        totals[_norm_rem_name(chosen)] += nstreets
-        if cotg and not _is_oblenergo(cotg) and _norm_rem_name(cotg) != _norm_rem_name(chosen):
+        key = _norm_rem_name(chosen)
+        totals[key] += nstreets
+        if (cname or "").strip() not in ("", "?", "Невідомо"):
+            city_totals[key] += 1
+        if cotg and not _is_oblenergo(cotg) and _norm_rem_name(cotg) != key:
             moves.append((nstreets, cname or str(cid), cotg, chosen))
     moves.sort(key=lambda row: -row[0])
-    return dict(totals), moves
+    return dict(totals), dict(city_totals), moves
 
 
 def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int]:
@@ -749,7 +764,7 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
     Заодно збирає знаменник «% району»: кожне місто — в один РЕМ,
     за відключеннями, а не за карткою.
     """
-    global _REM_STREETS_DYNAMIC, _OBLAST_STREETS_DYNAMIC
+    global _REM_STREETS_DYNAMIC, _REM_CITIES_DYNAMIC, _OBLAST_STREETS_DYNAMIC, _OBLAST_CITIES_DYNAMIC
     if not API_BASE or not accidents:
         return {}
 
@@ -790,10 +805,12 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
             otg = city.get("otg") or {}
             oname = (otg.get("name") or "").strip() if isinstance(otg, dict) else ""
             cards[cid] = ((city.get("name") or "").strip(), oname)
-        rem_totals, moves = rem_street_totals_from(per_city, cards, _CITY_REM_VOTES)
+        rem_totals, city_totals, moves = rem_street_totals_from(per_city, cards, _CITY_REM_VOTES)
         if rem_totals:
             _REM_STREETS_DYNAMIC = rem_totals
+            _REM_CITIES_DYNAMIC = city_totals
             _OBLAST_STREETS_DYNAMIC = sum(int(v or 0) for v in per_city.values())
+            _OBLAST_CITIES_DYNAMIC = sum(int(v or 0) for v in city_totals.values())
             moved_streets = sum(row[0] for row in moves)
             log_to_buffer(
                 f"Довідник районів: {sum(rem_totals.values())} вул. у {len(rem_totals)} РЕМ "
@@ -1136,7 +1153,7 @@ def aggregate(accidents: List[dict]) -> Dict[str, Any]:
             entry["streets_total"] = _rem_street_total(name)
         if cp is not None:
             entry["cities_pct"] = round(cp, 1)
-            entry["cities_total"] = REM_TOTAL_CITIES.get(_norm_rem_name(name))
+            entry["cities_total"] = _rem_city_total(name)
         if cov is not None:
             entry["coverage_pct"] = round(cov, 1)
             entry["coverage_kind"] = cov_kind
@@ -1169,8 +1186,10 @@ def format_message(
 
     cities_pct_obl = None
     streets_pct_obl = None
-    if OBLAST_TOTAL_CITIES > 0:
-        cities_pct_obl = min(100.0, 100.0 * int(total_cities or 0) / OBLAST_TOTAL_CITIES)
+    if _oblast_city_total() > 0:
+        cities_pct_obl = min(
+            100.0, 100.0 * int(total_cities or 0) / _oblast_city_total()
+        )
     if _oblast_street_total() > 0:
         streets_pct_obl = min(
             100.0, 100.0 * int(total_streets or 0) / _oblast_street_total()
@@ -1195,7 +1214,7 @@ def format_message(
     ]
 
     def _rem_sort_key(item: Tuple[str, dict]) -> Tuple[float, int, int, int]:
-        """Спочатку за % покриття району (вулиці або н.п.), далі за кількістю."""
+        """Спочатку за % району (частка вулиць без світла), далі за кількістю."""
         name, st = item
         streets = int(st.get("streets") or 0)
         cities = int(st.get("cities") or 0)
@@ -1235,11 +1254,11 @@ def format_message(
         if cp is not None:
             pct_parts.append(f"{cp:.1f}% н.п.")
         if sp is not None:
-            pct_parts.append(f"{min(sp, 100.0):.1f}% району")
+            pct_parts.append(f"{min(float(sp), 100.0):.1f}% району")
         if pct_parts:
             block.append(
                 f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
-                f"{streets_s} вул. ({' - '.join(pct_parts)})"
+                f"{streets_s} вул. ({' / '.join(pct_parts)})"
             )
         else:
             block.append(
@@ -1348,8 +1367,10 @@ def format_message(
     lines.append("ℹ️ <b>Як читати відсотки</b>")
     lines.append("• шапка — частка <b>області</b>: % н.п. (населені пункти) і % вул. (вулиці)")
     lines.append(
-        "• рядок РЕМ: <b>% н.п.</b> — частка населених пунктів району; "
-        "<b>% району</b> — яка частка вулиць цього району зараз без світла"
+        "• рядок РЕМ: село в тому РЕМ, який стоїть у відключеннях, не в картці "
+        "(Коростень — Коростенський). <b>% н.п.</b> — частка населених пунктів цього РЕМ; "
+        "<b>% району</b> — яка частка його вулиць зараз без світла. "
+        "Порядок — від найбільшого % району"
     )
     lines.append(
         "• рядок н.п.: <b>% РЕМ</b> — внесок пункту у вулиці району; "
@@ -1410,9 +1431,9 @@ def save_to_mongo(
 
         oc_pct = None
         os_pct = None
-        if OBLAST_TOTAL_CITIES > 0:
+        if _oblast_city_total() > 0:
             oc_pct = round(
-                min(100.0, 100.0 * int(stats["total_cities"] or 0) / OBLAST_TOTAL_CITIES),
+                min(100.0, 100.0 * int(stats["total_cities"] or 0) / _oblast_city_total()),
                 1,
             )
         if _oblast_street_total() > 0:
