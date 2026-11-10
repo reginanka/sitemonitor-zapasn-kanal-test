@@ -296,44 +296,22 @@ def soft_fingerprint(outage: dict) -> str:
     return f"{city}|{sid}|{','.join(parts)}|{start}"
 
 
-def _norm_period_ts(s: str) -> str:
-    """YYYY-MM-DDTHH:MM (або порожньо) — стабільний ключ проміжку з API."""
-    s = (s or "").strip().replace(" ", "T")
-    if len(s) >= 16 and s[4] == "-" and s[10] == "T":
-        return s[:16]
-    if len(s) >= 13 and s[4] == "-":
-        return s[:13] + ":00" if len(s) < 16 else s[:16]
-    return s[:16] if s else ""
-
-
 def notify_dedup_key(outage: dict, house: str = "") -> str:
     """
     Ключ для злиття дублів: одна вулиця + будинок користувача + той самий проміжок.
-    Ігнорує різний список buildingNames з API і нестабільний street.id
-    (Шкільна vs ШКІЛЬНА, 1..8 vs 1,15,2,4… — один ключ).
+    Ігнорує різний список buildingNames і нестабільний street.id з API
+    (Шкільна ≡ ШКІЛЬНА, 1..8 vs 1,15,2,4… — один ключ → одне сповіщення).
     """
     street = outage.get("street") or {}
     sname = _norm_street(street.get("name") or "")
-    # якщо назви немає — fallback на id, щоб ключ не зхлопувався
     if not sname:
         sname = str(street.get("id") or "")
     city = (outage.get("city") or {}).get("id") or (outage.get("city") or {}).get("name") or ""
-    start = _norm_period_ts(outage.get("dateEvent") or "")
-    end = _norm_period_ts(outage.get("datePlanIn") or "")
+    # нормалізуємо час: пробіл→T, обрізка до хвилин
+    start = (outage.get("dateEvent") or "").strip().replace(" ", "T")[:16]
+    end = (outage.get("datePlanIn") or "").strip().replace(" ", "T")[:16]
     h = (house or "").strip().lower().lstrip("0") or "0"
     return f"{city}|{sname}|{h}|{start}|{end}"
-
-
-def notify_dedup_key_legacy(outage: dict, house: str = "") -> str:
-    """Старий формат ключа (з street.id) — сумісність з уже записаними в Mongo."""
-    street = outage.get("street") or {}
-    sname = _norm_street(street.get("name") or "")
-    sid = street.get("id") or sname
-    city = (outage.get("city") or {}).get("id") or (outage.get("city") or {}).get("name") or ""
-    start = (outage.get("dateEvent") or "")[:16]
-    end = (outage.get("datePlanIn") or "")[:16]
-    h = (house or "").strip().lower().lstrip("0") or "0"
-    return f"{city}|{sid}|{sname}|{h}|{start}|{end}"
 
 
 def addr_day_key(outage: dict) -> str:
@@ -950,35 +928,17 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
     Верх: список подій з датами.
     Низ: графік на кожен день покриття (від сьогодні / старту до кінця плану).
     """
-    # Фінальний дедуп: одна адреса + той самий проміжок → один блок
-    # (API часто віддає 2 записи з різним buildingNames / street.id)
-    deduped: List[Tuple[dict, dict]] = []
-    seen_item_keys: set = set()
-    for outage, addr in items:
-        user_house = str(addr.get("house") or addr.get("building") or "").strip()
-        dkey = notify_dedup_key(outage, user_house)
-        if dkey in seen_item_keys:
-            continue
-        period_key = (
-            _norm_period_ts(outage.get("dateEvent") or ""),
-            _norm_period_ts(outage.get("datePlanIn") or ""),
-            user_house.strip().lower().lstrip("0") or "0",
-            _norm_street((outage.get("street") or {}).get("name") or ""),
-            str((outage.get("city") or {}).get("id") or (addr.get("city_name") or "")),
-        )
-        if period_key in seen_item_keys and period_key[0]:
-            continue
-        seen_item_keys.add(dkey)
-        if period_key[0]:
-            seen_item_keys.add(period_key)
-        deduped.append((outage, addr))
-
     lines = ["⚠️ <b>Нові відключення по твоїх адресах:</b>", ""]
     seen_sched: set = set()
+    seen_dkey: set = set()
     # «сьогодні» по Києву (UTC+2 зимою; для відсікання минулих днів достатньо)
     today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
-    for outage, addr in deduped[:10]:
+    for outage, addr in items[:10]:
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
+        dkey = notify_dedup_key(outage, user_house)
+        if dkey in seen_dkey:
+            continue
+        seen_dkey.add(dkey)
         lines.append(format_outage(outage, user_house=user_house))
         lines.append("")
         ymds = _outage_span_ymds(outage, from_ymd=today_ymd)
@@ -1423,23 +1383,11 @@ def main() -> int:
                             continue
 
                         dkey = notify_dedup_key(outage, house)
-                        dkey_legacy = notify_dedup_key_legacy(outage, house)
-                        # вже слали цій людині (новий або старий формат ключа)
-                        if dkey in already_keys or dkey_legacy in already_keys:
+                        if dkey in already_keys:
                             continue
 
-                        # внутрішній дедуп у межах одного прогону:
-                        # той самий fingerprint / dedup_key / будинок+проміжок
-                        # (API часто дає 2 записи з різним buildingNames / street.id)
+                        # внутрішній дедуп у межах одного прогону
                         fp = content_fingerprint(outage)
-                        period_key = (
-                            _norm_period_ts(outage.get("dateEvent") or ""),
-                            _norm_period_ts(outage.get("datePlanIn") or ""),
-                            (house or "").strip().lower().lstrip("0") or "0",
-                            _norm_street(
-                                (outage.get("street") or {}).get("name") or ""
-                            ),
-                        )
                         already_run = False
                         for x in notified.get(tid, []):
                             prev_o = x[0] if isinstance(x, tuple) else x
@@ -1449,33 +1397,35 @@ def main() -> int:
                             if notify_dedup_key(prev_o, house) == dkey:
                                 already_run = True
                                 break
-                            prev_period = (
-                                _norm_period_ts(prev_o.get("dateEvent") or ""),
-                                _norm_period_ts(prev_o.get("datePlanIn") or ""),
-                                (house or "").strip().lower().lstrip("0") or "0",
-                                _norm_street(
-                                    (prev_o.get("street") or {}).get("name") or ""
-                                ),
-                            )
-                            if period_key == prev_period and period_key[0]:
-                                already_run = True
-                                break
                         if already_run:
                             continue
 
                         outage_copy = dict(outage)
                         if uqk:
                             outage_copy["_user_queue"] = uqk
-                        # метадані для запису в user_outage_notified ПІСЛЯ успішної відправки
-                        outage_copy["_notify_dkey"] = dkey
-                        outage_copy["_notify_house"] = house
-                        outage_copy["_notify_otg"] = otg_id
-                        outage_copy["_notify_city"] = city_id
 
                         notified.setdefault(tid, []).append((outage_copy, addr))
                         matched_fps.add(fp)
                         already_keys.add(dkey)
-                        already_keys.add(dkey_legacy)
+
+                        # фіксуємо, що цій людині вже слали
+                        notify_id = f"{int(tid)}:{dkey}"
+                        notified_col.update_one(
+                            {"_id": notify_id},
+                            {
+                                "$set": {
+                                    "telegram_id": int(tid),
+                                    "dedup_key": dkey,
+                                    "notified_at": datetime.now(timezone.utc),
+                                    "expires_at": datetime.now(timezone.utc)
+                                    + timedelta(days=USER_NOTIFIED_TTL_DAYS),
+                                    "otg_id": otg_id,
+                                    "city_id": city_id,
+                                    "house": house,
+                                }
+                            },
+                            upsert=True,
+                        )
 
                 log.info(
                     "otg=%s city=%s matched_active=%s (addrs=%s active=%s)",
@@ -1623,37 +1573,6 @@ def main() -> int:
             else:
                 sent_sound += 1
             log.info("Надіслано %s (outages=%s silent=%s)", tid, len(item_list), silent)
-            # фіксуємо дедуп лише ПІСЛЯ успішної відправки —
-            # інакше при збої send користувач «вже сповіщений» і більше не отримає
-            for outage, _addr in item_list:
-                dkey = outage.get("_notify_dkey") or notify_dedup_key(
-                    outage, str((_addr.get("house") or _addr.get("building") or ""))
-                )
-                if not dkey:
-                    continue
-                notify_id = f"{int(tid)}:{dkey}"
-                try:
-                    notified_col.update_one(
-                        {"_id": notify_id},
-                        {
-                            "$set": {
-                                "telegram_id": int(tid),
-                                "dedup_key": dkey,
-                                "notified_at": datetime.now(timezone.utc),
-                                "expires_at": datetime.now(timezone.utc)
-                                + timedelta(days=USER_NOTIFIED_TTL_DAYS),
-                                "otg_id": outage.get("_notify_otg"),
-                                "city_id": outage.get("_notify_city"),
-                                "house": outage.get("_notify_house")
-                                or str(
-                                    (_addr.get("house") or _addr.get("building") or "")
-                                ),
-                            }
-                        },
-                        upsert=True,
-                    )
-                except Exception as e_db:
-                    log.warning("notified_col write fail tid=%s: %s", tid, e_db)
             time.sleep(0.4)
         except Exception as e:
             log.error("Send fail %s: %s", tid, e)
