@@ -962,6 +962,149 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
     return "\n".join(lines).strip()
 
 
+TG_TEXT_LIMIT = 4000
+
+
+def _split_text(text: str, limit: int) -> list[str]:
+    """Ріже текст по рядках, не посеред рядка, поки рядок сам не довший за limit."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    out: list[str] = []
+    buf = ""
+    for ln in text.split("\n"):
+        while len(ln) > limit:
+            if buf:
+                out.append(buf)
+                buf = ""
+            out.append(ln[:limit])
+            ln = ln[limit:]
+        nxt = ln if not buf else buf + "\n" + ln
+        if len(nxt) > limit:
+            if buf:
+                out.append(buf)
+            buf = ln
+        else:
+            buf = nxt
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _notify_event_text(db, outage: dict, addr: dict, seen_sched: set) -> str:
+    user_house = str(addr.get("house") or addr.get("building") or "").strip()
+    lines = [format_outage(outage, user_house=user_house), ""]
+    today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
+    ymds = _outage_span_ymds(outage, from_ymd=today_ymd)
+    if not ymds:
+        ymds = [_outage_day_ymd(outage)]
+    lab = user_queue_key(addr) or ""
+    city = (addr.get("city_name") or "")
+    street = (addr.get("street_name") or "")
+    for ymd in ymds:
+        key = f"{lab}|{ymd}|{city}|{street}"
+        if key in seen_sched:
+            continue
+        seen_sched.add(key)
+        try:
+            block = format_schedule_block_for_notify(db, addr, outage, ymd=ymd)
+            if block:
+                lines.append(block)
+                lines.append("")
+        except Exception as e:
+            log.warning("schedule block: %s", e)
+    return "\n".join(lines).strip()
+
+
+def build_notify_parts(db, items: list) -> list[tuple[str, list]]:
+    """
+    items: [(outage, addr, meta), ...]
+    Повертає [(текст повідомлення, metas які повністю ввійшли саме в нього)].
+    Довгий список адрес ділиться на кілька повідомлень у межах TG_TEXT_LIMIT.
+    """
+    header = "⚠️ <b>Нові відключення по твоїх адресах:</b>\n\n"
+    cont = "⚠️ <b>Продовження відключень:</b>\n\n"
+    reserve = max(len(header), len(cont))
+    piece_limit = TG_TEXT_LIMIT - reserve
+
+    pieces: list[tuple[str, Optional[dict]]] = []
+    seen_dkey: set = set()
+    seen_sched: set = set()
+    for item in items:
+        outage, addr = item[0], item[1]
+        meta = item[2] if len(item) > 2 else None
+        user_house = str(addr.get("house") or addr.get("building") or "").strip()
+        dkey = (meta or {}).get("dedup_key") or notify_dedup_key(outage, user_house)
+        if dkey in seen_dkey:
+            continue
+        seen_dkey.add(dkey)
+        ev = _notify_event_text(db, outage, addr, seen_sched)
+        if not ev:
+            continue
+        chunks = _split_text(ev, piece_limit)
+        for i, ch in enumerate(chunks):
+            last = i == len(chunks) - 1
+            pieces.append((ch, meta if last else None))
+
+    if not pieces:
+        return []
+
+    messages: list[tuple[str, list]] = []
+    buf = ""
+    metas: list = []
+    for text, meta in pieces:
+        sep = "\n\n" if buf else ""
+        if buf and len(buf) + len(sep) + len(text) > piece_limit:
+            messages.append((buf, metas))
+            buf = text
+            metas = [meta] if meta else []
+        else:
+            buf = text if not buf else buf + sep + text
+            if meta:
+                metas.append(meta)
+    if buf:
+        messages.append((buf, metas))
+
+    out: list[tuple[str, list]] = []
+    for i, (body, ms) in enumerate(messages):
+        prefix = header if i == 0 else cont
+        out.append((prefix + body, ms))
+    return out
+
+
+def _mark_notified(notified_col, tid, metas: list) -> None:
+    if not metas:
+        return
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(days=USER_NOTIFIED_TTL_DAYS)
+    ops = []
+    for m in metas:
+        dkey = m.get("dedup_key")
+        if not dkey:
+            continue
+        ops.append(
+            UpdateOne(
+                {"_id": f"{int(tid)}:{dkey}"},
+                {
+                    "$set": {
+                        "telegram_id": int(tid),
+                        "dedup_key": dkey,
+                        "notified_at": now,
+                        "expires_at": exp,
+                        "otg_id": m.get("otg_id"),
+                        "city_id": m.get("city_id"),
+                        "house": m.get("house") or "",
+                    }
+                },
+                upsert=True,
+            )
+        )
+    if ops:
+        notified_col.bulk_write(ops, ordered=False)
+
+
 def _norm_street(name: str) -> str:
     s = (name or "").strip().lower()
     # прибрати префікси типу вулиці
@@ -1404,28 +1547,20 @@ def main() -> int:
                         if uqk:
                             outage_copy["_user_queue"] = uqk
 
-                        notified.setdefault(tid, []).append((outage_copy, addr))
-                        matched_fps.add(fp)
-                        already_keys.add(dkey)
-
-                        # фіксуємо, що цій людині вже слали
-                        notify_id = f"{int(tid)}:{dkey}"
-                        notified_col.update_one(
-                            {"_id": notify_id},
-                            {
-                                "$set": {
-                                    "telegram_id": int(tid),
+                        notified.setdefault(tid, []).append(
+                            (
+                                outage_copy,
+                                addr,
+                                {
                                     "dedup_key": dkey,
-                                    "notified_at": datetime.now(timezone.utc),
-                                    "expires_at": datetime.now(timezone.utc)
-                                    + timedelta(days=USER_NOTIFIED_TTL_DAYS),
+                                    "house": house,
                                     "otg_id": otg_id,
                                     "city_id": city_id,
-                                    "house": house,
-                                }
-                            },
-                            upsert=True,
+                                },
+                            )
                         )
+                        matched_fps.add(fp)
+                        already_keys.add(dkey)
 
                 log.info(
                     "otg=%s city=%s matched_active=%s (addrs=%s active=%s)",
@@ -1538,6 +1673,7 @@ def main() -> int:
     sent = 0
     sent_quiet = 0
     sent_sound = 0
+    sent_msgs = 0
     try:
         from bot_notify import is_quiet_now
     except Exception:
@@ -1552,30 +1688,64 @@ def main() -> int:
                 _user_by_tid[int(tid_u)] = _u
 
     for tid, item_list in notified.items():
-        # [(outage, addr), ...]
-        text = build_notify_message(db, item_list)
+        # [(outage, addr, meta), ...]
+        parts = build_notify_parts(db, item_list)
+        if not parts:
+            continue
         silent = is_quiet_now(_user_by_tid.get(int(tid)))
+        delivered = 0
 
-        async def _send(chat_id=tid, body=text, silent=silent):
+        async def _send_one(chat_id, body, silent_flag):
             await bot.send_message(
                 chat_id=chat_id,
-                text=body[:4096],
+                text=body,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
-                disable_notification=silent,
+                disable_notification=silent_flag,
             )
 
-        try:
-            asyncio.run(_send())
+        for text, metas in parts:
+            try:
+                asyncio.run(_send_one(int(tid), text, silent))
+            except Exception as e:
+                log.error(
+                    "Send fail %s part=%s/%s: %s",
+                    tid,
+                    delivered + 1,
+                    len(parts),
+                    e,
+                )
+                break
+            delivered += 1
+            sent_msgs += 1
+            # позначаємо лише те, що реально пішло в це повідомлення
+            try:
+                _mark_notified(notified_col, tid, metas)
+            except Exception as e:
+                log.error("mark notified fail %s: %s", tid, e)
+            time.sleep(0.35)
+
+        if delivered:
             sent += 1
             if silent:
                 sent_quiet += 1
             else:
                 sent_sound += 1
-            log.info("Надіслано %s (outages=%s silent=%s)", tid, len(item_list), silent)
-            time.sleep(0.4)
-        except Exception as e:
-            log.error("Send fail %s: %s", tid, e)
+            log.info(
+                "Надіслано %s (parts=%s/%s outages=%s silent=%s)",
+                tid,
+                delivered,
+                len(parts),
+                len(item_list),
+                silent,
+            )
+        if delivered < len(parts):
+            log.warning(
+                "tid=%s доставлено %s з %s — решту не позначено, піде наступним прогоном",
+                tid,
+                delivered,
+                len(parts),
+            )
 
     n_events = sum(len(v) for v in notified.values())
     summary = (
@@ -1583,7 +1753,7 @@ def main() -> int:
         f"Підписників: {len(users)}\n"
         f"Локацій: {groups_checked}\n"
         f"Подій для розсилки: {n_events}\n"
-        f"Сповіщень: {sent} (🔊={sent_sound} 🔇={sent_quiet})"
+        f"Сповіщень: {sent} (повідомлень={sent_msgs} 🔊={sent_sound} 🔇={sent_quiet})"
     )
     log.info("%s", summary.replace("\n", " | "))
 
