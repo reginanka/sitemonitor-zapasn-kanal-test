@@ -321,7 +321,19 @@ def format_forecast_period(date_event: str, date_plan: str) -> str:
     return ""
 
 
-def format_outage(outage: dict) -> str:
+def format_outage(outage: dict, user_house: str = "") -> str:
+    """
+    Формує текст однієї події.
+
+    Видима частина:
+      🔴 Місто, вул. X, 33
+      📅 Прогнозований період: ...
+
+    Під expandable-цитатою (якщо є що ховати):
+      💬 koment
+      📌 Тип
+      🔔 для будинків: ...
+    """
     city = (outage.get("city") or {}).get("name", "?")
     street = (outage.get("street") or {}).get("name", "?")
     buildings = (outage.get("buildingNames") or "").strip()
@@ -329,13 +341,16 @@ def format_outage(outage: dict) -> str:
     date_plan_raw = outage.get("datePlanIn") or ""
     date_plan = (date_plan_raw or "")[:16].replace("T", " ")
     icon, type_name, type_desc = outage_notify_label(outage)
+    koment = (outage.get("koment") or "").strip()
+
+    house = (user_house or "").strip()
+    addr_line = f"{city}, {street}"
+    if house:
+        addr_line += f", {house}"
+
+    # --- видима шапка ---
     if outage.get("_plan_updated"):
-        text = f"⏱ <b>Оновлення:</b> {city}, {street}"
-        if buildings:
-            text += f"\n🏘 будинки: {buildings}"
-        text += f"\n📌 {type_name}"
-        if type_desc:
-            text += f" — {type_desc}"
+        text = f"⏱ <b>Оновлення:</b> {addr_line}"
         was = (outage.get("_plan_was") or "")[:16].replace("T", " ")
         period = format_forecast_period(date_event_raw, date_plan_raw)
         if was and date_plan and was != date_plan:
@@ -345,18 +360,34 @@ def format_outage(outage: dict) -> str:
         elif period:
             text += f"\n📅 {period}"
     else:
-        text = f"{icon} <b>{city}, {street}</b>"
-        if buildings:
-            text += f"\n🏘 будинки: {buildings}"
-        text += f"\n📌 {type_name}"
-        if type_desc:
-            text += f" — {type_desc}"
+        text = f"{icon} <b>{addr_line}</b>"
         period = format_forecast_period(date_event_raw, date_plan_raw)
         if period:
             text += f"\n📅 {period}"
-    koment = (outage.get("koment") or "").strip()
+
+    # --- деталі (тип, koment, список будинків) ---
+    details: list[str] = []
     if koment:
-        text += f"\n💬 {koment}"
+        details.append(f"💬 {koment}")
+    type_line = f"📌 {type_name}"
+    if type_desc:
+        type_line += f" — {type_desc}"
+    details.append(type_line)
+    if buildings:
+        details.append(f"🔔 для будинків: {buildings}")
+
+    if not details:
+        return text
+
+    # довгий список будинків → ховаємо все під expandable blockquote
+    LONG_BUILDINGS = 60
+    use_spoiler = bool(buildings) and len(buildings) > LONG_BUILDINGS
+
+    if use_spoiler:
+        inner = "\n".join(details)
+        text += f"\n<blockquote expandable>{inner}</blockquote>"
+    else:
+        text += "\n" + "\n".join(details)
     return text
 
 
@@ -844,7 +875,8 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
     # «сьогодні» по Києву (UTC+2 зимою; для відсікання минулих днів достатньо)
     today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
     for outage, addr in items[:10]:
-        lines.append(format_outage(outage))
+        user_house = str(addr.get("house") or addr.get("building") or "").strip()
+        lines.append(format_outage(outage, user_house=user_house))
         lines.append("")
         ymds = _outage_span_ymds(outage, from_ymd=today_ymd)
         if not ymds:
