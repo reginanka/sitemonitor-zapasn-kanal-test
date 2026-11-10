@@ -299,19 +299,16 @@ def soft_fingerprint(outage: dict) -> str:
 def notify_dedup_key(outage: dict, house: str = "") -> str:
     """
     Ключ для злиття дублів: одна вулиця + будинок користувача + той самий проміжок.
-    Ігнорує різний список buildingNames і нестабільний street.id з API
-    (Шкільна ≡ ШКІЛЬНА, 1..8 vs 1,15,2,4… — один ключ → одне сповіщення).
+    Ігнорує різний список buildingNames з API (Шкільна vs ШКІЛЬНА, 1..8 vs 1,15,2,4…).
     """
     street = outage.get("street") or {}
     sname = _norm_street(street.get("name") or "")
-    if not sname:
-        sname = str(street.get("id") or "")
+    sid = street.get("id") or sname
     city = (outage.get("city") or {}).get("id") or (outage.get("city") or {}).get("name") or ""
-    # нормалізуємо час: пробіл→T, обрізка до хвилин
-    start = (outage.get("dateEvent") or "").strip().replace(" ", "T")[:16]
-    end = (outage.get("datePlanIn") or "").strip().replace(" ", "T")[:16]
+    start = (outage.get("dateEvent") or "")[:16]
+    end = (outage.get("datePlanIn") or "")[:16]
     h = (house or "").strip().lower().lstrip("0") or "0"
-    return f"{city}|{sname}|{h}|{start}|{end}"
+    return f"{city}|{sid}|{sname}|{h}|{start}|{end}"
 
 
 def addr_day_key(outage: dict) -> str:
@@ -930,15 +927,10 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
     """
     lines = ["⚠️ <b>Нові відключення по твоїх адресах:</b>", ""]
     seen_sched: set = set()
-    seen_dkey: set = set()
     # «сьогодні» по Києву (UTC+2 зимою; для відсікання минулих днів достатньо)
     today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
     for outage, addr in items[:10]:
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
-        dkey = notify_dedup_key(outage, user_house)
-        if dkey in seen_dkey:
-            continue
-        seen_dkey.add(dkey)
         lines.append(format_outage(outage, user_house=user_house))
         lines.append("")
         ymds = _outage_span_ymds(outage, from_ymd=today_ymd)
