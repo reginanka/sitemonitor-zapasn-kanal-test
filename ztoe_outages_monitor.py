@@ -318,11 +318,12 @@ def format_outage(outage: dict) -> str:
     date_plan = (date_plan_raw or "")[:16].replace("T", " ")
     icon, type_name, type_desc = outage_notify_label(outage)
     if outage.get("_plan_updated"):
-        text = f"⏱ <b>Оновлення:</b> {city}, {street}\n📌 {type_name}"
+        text = f"⏱ <b>Оновлення:</b> {city}, {street}"
+        if buildings:
+            text += f"\n🏘 будинки: {buildings}"
+        text += f"\n📌 {type_name}"
         if type_desc:
             text += f" — {type_desc}"
-        if buildings:
-            text += f"\n🏘 Будинки: {buildings}"
         was = (outage.get("_plan_was") or "")[:16].replace("T", " ")
         period = format_forecast_period(date_event_raw, date_plan_raw)
         if was and date_plan and was != date_plan:
@@ -332,11 +333,12 @@ def format_outage(outage: dict) -> str:
         elif period:
             text += f"\n📅 {period}"
     else:
-        text = f"{icon} <b>{city}, {street}</b>\n📌 {type_name}"
+        text = f"{icon} <b>{city}, {street}</b>"
+        if buildings:
+            text += f"\n🏘 будинки: {buildings}"
+        text += f"\n📌 {type_name}"
         if type_desc:
             text += f" — {type_desc}"
-        if buildings:
-            text += f"\n🏘 Будинки: {buildings}"
         period = format_forecast_period(date_event_raw, date_plan_raw)
         if period:
             text += f"\n📅 {period}"
@@ -1058,42 +1060,62 @@ def main() -> int:
             new_outages = filtered
 
             # --- продовження / зміна часу по тій самій адресі+дню (навіть при новому id) ---
+            # Порівнюємо саме агрегований max(datePlanIn) на addr_day, а не кожен
+            # окремий запис. Якщо на сайті одночасно є кілька інтервалів (напр.
+            # 10:15→17:00 і 10:31→13:00), max лишається 17:00 — не шлемо
+            # «час став менший».
             prev_plans_addr = {
                 str(k): str(v)[:16]
                 for k, v in (cache.get("plan_by_addr_day") or {}).items()
             }
-            plan_updates: list = []
-            seen_plan_oids: set = set()
-            new_fp_set = {content_fingerprint(o) for o in new_outages}
-
+            # поточний max plan на addr_day + представник (запис з цим max)
+            cur_max_plan: Dict[str, str] = {}
+            cur_rep: Dict[str, dict] = {}
             for o in outages:
                 if not should_notify_outage(o):
                     continue
                 adk = addr_day_key(o)
                 if not adk:
                     continue
-                new_plan = (o.get("datePlanIn") or "")[:16]
+                plan = (o.get("datePlanIn") or "")[:16]
+                if not plan:
+                    continue
+                prev = cur_max_plan.get(adk, "")
+                if not prev or plan > prev:
+                    cur_max_plan[adk] = plan
+                    cur_rep[adk] = o
+
+            plan_updates: list = []
+            seen_plan_adk: set = set()
+            new_fp_set = {content_fingerprint(o) for o in new_outages}
+
+            for adk, new_plan in cur_max_plan.items():
                 old_plan = (prev_plans_addr.get(adk) or "")[:16]
-                if not old_plan or not new_plan or old_plan == new_plan:
+                if not old_plan or old_plan == new_plan:
+                    continue
+                o = cur_rep.get(adk)
+                if not o:
                     continue
                 # уже піде як «нова» — не дублюємо
                 if content_fingerprint(o) in new_fp_set:
                     continue
-                oid = make_outage_key(o)
-                if oid in seen_plan_oids:
+                if adk in seen_plan_adk:
                     continue
                 oo = dict(o)
                 oo["_plan_updated"] = True
                 oo["_plan_was"] = old_plan
                 oo["_plan_reason"] = "addr_day"
+                # для форматування — показуємо саме агрегований новий план
+                oo["datePlanIn"] = new_plan if len(new_plan) == 16 else (o.get("datePlanIn") or new_plan)
                 plan_updates.append(oo)
-                seen_plan_oids.add(oid)
+                seen_plan_adk.add(adk)
                 log.info(
-                    "otg=%s city=%s plan change (addr_day): %s → %s id=%s",
+                    "otg=%s city=%s plan change (addr_day max): %s → %s adk=%s id=%s",
                     otg_id,
                     city_id,
                     old_plan,
                     new_plan,
+                    adk,
                     o.get("id"),
                 )
 
