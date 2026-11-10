@@ -833,20 +833,31 @@ def format_schedule_block_for_notify(
     scheduled = _slots_from_sched(sched, day=day_idx)
     buckets = _buckets_for_addr_day(db, addr, ymd)
     emerg = list(buckets.get("emergency") or [])
-    # Завжди додаємо інтервал САМОЇ події зі сповіщення (навіть якщо Mongo
-    # ще не встиг / classification пропустив). Інакше при відсутності ГПВ
-    # виходить «🔄 Дані очікуємо» хоча аварія вже в повідомленні.
+    repair = list(buckets.get("repair") or [])
+    other = list(buckets.get("other") or [])
+    # Додаємо інтервал САМОЇ події зі сповіщення в правильний бакет
+    # (раніше завжди йшло в «Аварія» — через це ремонт показувався як аварія).
     de = str(outage.get("dateEvent") or outage.get("date_from") or "")
     dp = str(outage.get("datePlanIn") or outage.get("date_to") or "")
     self_piece = _interval_on_day(de, dp, ymd)
     if self_piece:
-        emerg.append(self_piece)
+        # outage з API / notify може не мати тих самих ключів, що mongo-doc
+        kind = _classify_mongo_outage(outage)
+        if kind is None:
+            # ГПВ не додаємо сюди — вони вже в scheduled
+            pass
+        elif kind == "emergency":
+            emerg.append(self_piece)
+        elif kind == "repair":
+            repair.append(self_piece)
+        else:
+            other.append(self_piece)
     emerg = _subtract_intervals(_merge_intervals(emerg), scheduled)
     repair = _subtract_intervals(
-        buckets.get("repair") or [], scheduled + emerg
+        _merge_intervals(repair), scheduled + emerg
     )
     other = _subtract_intervals(
-        buckets.get("other") or [], scheduled + emerg + repair
+        _merge_intervals(other), scheduled + emerg + repair
     )
     all_merged = _merge_intervals(scheduled + emerg + repair + other)
 
