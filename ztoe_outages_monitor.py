@@ -296,19 +296,30 @@ def soft_fingerprint(outage: dict) -> str:
     return f"{city}|{sid}|{','.join(parts)}|{start}"
 
 
+def _norm_period_ts(s: str) -> str:
+    """YYYY-MM-DDTHH:MM (або порожньо) — стабільний ключ проміжку з API."""
+    s = (s or "").strip().replace(" ", "T")
+    if len(s) >= 16 and s[4] == "-" and s[10] == "T":
+        return s[:16]
+    if len(s) >= 13 and s[4] == "-":
+        return s[:13] + ":00" if len(s) < 16 else s[:16]
+    return s[:16] if s else ""
+
+
 def notify_dedup_key(outage: dict, house: str = "") -> str:
     """
     Ключ для злиття дублів: одна вулиця + будинок користувача + той самий проміжок.
-    Ігнорує різний список buildingNames з API (Шкільна vs ШКІЛЬНА, 1..8 vs 1,15,2,4…).
+    Ігнорує різний список buildingNames з API і нестабільний street.id
+    (Шкільна vs ШКІЛЬНА, 1..8 vs 1,15,2,4… — один ключ).
     """
     street = outage.get("street") or {}
     sname = _norm_street(street.get("name") or "")
-    sid = street.get("id") or sname
+    # лише нормалізована назва: id у ЖОЕ часто різний для «тих самих» записів
     city = (outage.get("city") or {}).get("id") or (outage.get("city") or {}).get("name") or ""
-    start = (outage.get("dateEvent") or "")[:16]
-    end = (outage.get("datePlanIn") or "")[:16]
+    start = _norm_period_ts(outage.get("dateEvent") or "")
+    end = _norm_period_ts(outage.get("datePlanIn") or "")
     h = (house or "").strip().lower().lstrip("0") or "0"
-    return f"{city}|{sid}|{sname}|{h}|{start}|{end}"
+    return f"{city}|{sname}|{h}|{start}|{end}"
 
 
 def addr_day_key(outage: dict) -> str:
@@ -925,11 +936,34 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
     Верх: список подій з датами.
     Низ: графік на кожен день покриття (від сьогодні / старту до кінця плану).
     """
+    # Фінальний дедуп: одна адреса + той самий проміжок → один блок
+    # (API часто віддає 2 записи з різним buildingNames / street.id)
+    deduped: List[Tuple[dict, dict]] = []
+    seen_item_keys: set = set()
+    for outage, addr in items:
+        user_house = str(addr.get("house") or addr.get("building") or "").strip()
+        dkey = notify_dedup_key(outage, user_house)
+        if dkey in seen_item_keys:
+            continue
+        period_key = (
+            _norm_period_ts(outage.get("dateEvent") or ""),
+            _norm_period_ts(outage.get("datePlanIn") or ""),
+            user_house.strip().lower().lstrip("0") or "0",
+            _norm_street((outage.get("street") or {}).get("name") or ""),
+            str((outage.get("city") or {}).get("id") or (addr.get("city_name") or "")),
+        )
+        if period_key in seen_item_keys and period_key[0]:
+            continue
+        seen_item_keys.add(dkey)
+        if period_key[0]:
+            seen_item_keys.add(period_key)
+        deduped.append((outage, addr))
+
     lines = ["⚠️ <b>Нові відключення по твоїх адресах:</b>", ""]
     seen_sched: set = set()
     # «сьогодні» по Києву (UTC+2 зимою; для відсікання минулих днів достатньо)
     today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
-    for outage, addr in items[:10]:
+    for outage, addr in deduped[:10]:
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
         lines.append(format_outage(outage, user_house=user_house))
         lines.append("")
@@ -1378,8 +1412,18 @@ def main() -> int:
                         if dkey in already_keys:
                             continue
 
-                        # внутрішній дедуп у межах одного прогону
+                        # внутрішній дедуп у межах одного прогону:
+                        # той самий fingerprint, той самий dedup_key, або
+                        # той самий будинок + той самий проміжок (різні buildingNames / street.id з API)
                         fp = content_fingerprint(outage)
+                        period_key = (
+                            _norm_period_ts(outage.get("dateEvent") or ""),
+                            _norm_period_ts(outage.get("datePlanIn") or ""),
+                            (house or "").strip().lower().lstrip("0") or "0",
+                            _norm_street(
+                                (outage.get("street") or {}).get("name") or ""
+                            ),
+                        )
                         already_run = False
                         for x in notified.get(tid, []):
                             prev_o = x[0] if isinstance(x, tuple) else x
@@ -1387,6 +1431,17 @@ def main() -> int:
                                 already_run = True
                                 break
                             if notify_dedup_key(prev_o, house) == dkey:
+                                already_run = True
+                                break
+                            prev_period = (
+                                _norm_period_ts(prev_o.get("dateEvent") or ""),
+                                _norm_period_ts(prev_o.get("datePlanIn") or ""),
+                                (house or "").strip().lower().lstrip("0") or "0",
+                                _norm_street(
+                                    (prev_o.get("street") or {}).get("name") or ""
+                                ),
+                            )
+                            if period_key == prev_period and period_key[0]:
                                 already_run = True
                                 break
                         if already_run:
