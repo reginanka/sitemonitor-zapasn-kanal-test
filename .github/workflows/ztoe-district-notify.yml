@@ -1,0 +1,97 @@
+# Крон: критичні сповіщення по обраних районах (РЕМ)
+# Запускати ПІСЛЯ ztoe-accidents-summary (щоб latest уже був свіжий).
+#
+# Secrets / Variables:
+#   MONGO_URI              — обов'язково
+#   MONGO_DB               — за замовч. vidkluchennya (можна Variables)
+#   ZTOE_BOT_TOKEN         — токен бота для DM
+#   TELEGRAM_LOG_CHANNEL_ID — опційно, лог у канал
+#   DISTRICT_CRITICAL_PCT  — опційно, поріг % (default 30)
+#
+# Ручний прогін з FORCE:
+#   Actions → Run workflow → force_notify = true
+
+name: ZTOE District Notify
+
+on:
+  schedule:
+    # кожні 15 хв, зі зсувом +3 хв після типового accidents-summary (:00/:15/:30/:45)
+    - cron: "3,18,33,48 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_notify:
+        description: "FORCE_DISTRICT_NOTIFY=1 (ігнорувати антиспам на день)"
+        required: false
+        type: boolean
+        default: false
+      critical_pct:
+        description: "Поріг % району для критичного (порожньо = 30)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: ztoe-district-notify
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx pymongo pytz
+          # якщо в репо є requirements.txt зі скриптом — можна:
+          # pip install -r requirements.txt
+
+      - name: Run district notify
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          MONGO_DB: ${{ vars.MONGO_DB || secrets.MONGO_DB || 'vidkluchennya' }}
+          ZTOE_BOT_TOKEN: ${{ secrets.ZTOE_BOT_TOKEN }}
+          TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
+          DISTRICT_CRITICAL_PCT: ${{ inputs.critical_pct || vars.DISTRICT_CRITICAL_PCT || '30' }}
+          FORCE_DISTRICT_NOTIFY: ${{ inputs.force_notify && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MONGO_URI:-}" ]; then
+            echo "❌ MONGO_URI secret не задано"
+            exit 1
+          fi
+          if [ -z "${ZTOE_BOT_TOKEN:-}" ]; then
+            echo "❌ ZTOE_BOT_TOKEN secret не задано"
+            exit 1
+          fi
+          # шлях до скрипта в репо — підправ за потреби
+          SCRIPT=""
+          for p in \
+            bot/ztoe_district_notify.py \
+            scripts/ztoe_district_notify.py \
+            ztoe_district_notify.py \
+            sitemonitor/ztoe_district_notify.py
+          do
+            if [ -f "$p" ]; then
+              SCRIPT="$p"
+              break
+            fi
+          done
+          if [ -z "$SCRIPT" ]; then
+            echo "❌ Не знайдено ztoe_district_notify.py"
+            find . -name 'ztoe_district_notify.py' 2>/dev/null || true
+            exit 1
+          fi
+          echo "▶ python $SCRIPT"
+          echo "  MONGO_DB=$MONGO_DB CRITICAL_PCT=$DISTRICT_CRITICAL_PCT FORCE=$FORCE_DISTRICT_NOTIFY"
+          python "$SCRIPT"
