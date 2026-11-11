@@ -23,8 +23,8 @@ jobs:
         id: playwright-cache
         uses: actions/cache@v4
         with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+          path: \~/.cache/ms-playwright
+          key: \( {{ runner.os }}-playwright- \){{ hashFiles('requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-playwright-
 
@@ -35,13 +35,10 @@ jobs:
 
       - name: Install Playwright (browser + system deps)
         run: |
-          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" = "true" ]; then
-            echo "Playwright browser cache HIT — only system deps"
-            python -m playwright install-deps chromium
-          else
-            echo "Playwright browser cache MISS — full install"
-            python -m playwright install chromium --with-deps
-          fi
+          echo "Playwright cache hit: ${{ steps.playwright-cache.outputs.cache-hit }}"
+          python -m playwright --version
+          # Завжди ставимо браузер. Якщо він уже є в кеші — встановлення майже миттєве.
+          python -m playwright install chromium --with-deps
 
       - name: Run monitoring script
         env:
