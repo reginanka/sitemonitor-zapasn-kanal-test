@@ -128,33 +128,82 @@ def _severity_emoji(pct: float | None, streets: int) -> str:
     return "⚪"
 
 
+def _locative(short: str) -> str:
+    s = (short or "").strip()
+    if s.endswith("ий"):
+        return s[:-2] + "ому"
+    if s.endswith("ій"):
+        return s[:-2] + "ьому"
+    return s
+
+
 def format_critical_rem(name: str, st: dict, as_of: str) -> str:
+    """Формат як у зведенні / format_district_status (критичний район)."""
     short = _norm_rem(name)
+    loc = _locative(short)
     streets = int(st.get("streets") or 0)
     cities = int(st.get("cities") or 0)
     pct = _coverage(st)
-    emoji = _severity_emoji(pct, streets)
+    emoji = "🔴"
     streets_s = f"{streets:,}".replace(",", " ")
-    pct_s = f"{pct:.1f}% району" if pct is not None else "—"
+    cp = st.get("cities_pct")
+    sp = st.get("streets_pct")
+    pct_bits = []
+    try:
+        if cp is not None:
+            pct_bits.append(f"{float(cp):.1f}% н.п.")
+    except (TypeError, ValueError):
+        pass
+    try:
+        if sp is not None:
+            pct_bits.append(f"{min(float(sp), 100.0):.1f}% району")
+        elif pct is not None:
+            pct_bits.append(f"{min(pct, 100.0):.1f}% району")
+    except (TypeError, ValueError):
+        pass
+
     lines = [
-        f"{emoji} <b>КРИТИЧНИЙ стан: {short}</b>",
+        f"{emoji} <b>КРИТИЧНИЙ</b> стан електромереж у {loc} районі",
         "",
-        f"Зараз без світла: <b>{cities}</b> нас.п. / <b>{streets_s}</b> вул. "
-        f"(<b>{pct_s}</b>).",
+        (
+            f"Аварійні відключення зараз у <b>{cities}</b> нас. п. "
+            f"(<b>{streets_s}</b> вул."
+            + (f" — {' / '.join(pct_bits)}" if pct_bits else "")
+            + ")"
+        ),
         "",
-        "<i>Будь ласка, не користуйтесь потужними електроприладами.</i>",
-        "",
-        f"🕐 {as_of}",
     ]
+
     city_streets = st.get("city_streets") or {}
     if isinstance(city_streets, dict) and city_streets:
-        top = sorted(city_streets.items(), key=lambda x: -int(x[1] or 0))[:8]
-        if top:
-            lines.insert(-2, "Найбільше зачеплені:")
-            for cname, cnt in top:
-                lines.insert(-2, f"  · {cname} — {cnt} вул.")
-            lines.insert(-2, "")
+        rem_total = st.get("streets_total")
+        try:
+            rem_total_f = float(rem_total) if rem_total else 0.0
+        except (TypeError, ValueError):
+            rem_total_f = 0.0
+        rem_affected = streets or 1
+        items = sorted(
+            ((str(c), int(n or 0)) for c, n in city_streets.items()),
+            key=lambda x: -x[1],
+        )
+        items = [(c, n) for c, n in items if n > 0]
+        block = ["⚠️ <b>Ситуація по нас.пунктах</b> (від найбільш проблемних):"]
+        for cname, cnt_i in items:
+            if rem_total_f > 0:
+                rem_pct = 100.0 * cnt_i / rem_total_f
+            else:
+                rem_pct = 100.0 * cnt_i / rem_affected
+            block.append(f"    · {cname} — {cnt_i} вул. ({rem_pct:.1f}% РЕМ)")
+        lines.append("<blockquote expandable>")
+        lines.extend(block)
+        lines.append("</blockquote>")
+        lines.append("")
+
+    lines.append("<i>Будь ласка, не користуйтесь потужними електроприладами.</i>")
+    lines.append("")
+    lines.append(f"🕐 {as_of}")
     return "\n".join(lines)
+
 
 
 def send_log(title: str = "📊 ЛОГ · РАЙОНИ") -> None:
