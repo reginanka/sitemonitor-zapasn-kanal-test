@@ -846,7 +846,7 @@ def level_from_cities(total_cities: int) -> Tuple[str, str, str]:
     if n >= 150:
         return "HIGH", "🟠", "СКЛАДНИЙ"
     if n >= 30:
-        return "WARN", "🟡", "Погіршення"
+        return "WARN", "🟡", "Погіршений"
     return "NORM", "🟢", "Стабільний"
 
 
