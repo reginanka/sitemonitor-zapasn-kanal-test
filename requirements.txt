@@ -1,7 +1,7 @@
 requests
 python-telegram-bot==20.8
 beautifulsoup4
-playwright
+playwright>=1.65.0
 pytz
 Pillow
 pymongo>=4.6
