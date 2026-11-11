@@ -14,9 +14,6 @@
 name: ZTOE District Notify
 
 on:
-  schedule:
-    # кожні 15 хв, зі зсувом +3 хв після типового accidents-summary (:00/:15/:30/:45)
-    - cron: "3,18,33,48 * * * *"
   workflow_dispatch:
     inputs:
       force_notify:
