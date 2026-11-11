@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 import re
@@ -900,13 +901,63 @@ def _accident_place(accident: dict) -> Tuple[str, str, int | None]:
     return oname, cname, cid
 
 
-def _fetch_collection(client: httpx.Client, path: str) -> List[dict]:
-    r = client.get(f"{API_BASE}{path}", params={"pagination": "false"})
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, list):
-        return data
-    return list(data.get("hydra:member") or [])
+def _get_json(url: str, params: dict, headers: dict, attempts: int = 4) -> dict | list:
+    """Окремий Client на кожну спробу: без gzip, Connection: close, retry на обрив chunked."""
+    last: Exception | None = None
+    hdrs = {
+        **headers,
+        "Accept-Encoding": "identity",  # без gzip: інакше chunked часто рветься
+        "Connection": "close",
+    }
+    timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0)
+    for i in range(attempts):
+        try:
+            with httpx.Client(
+                timeout=timeout,
+                headers=hdrs,
+                follow_redirects=True,
+                http2=False,
+                limits=httpx.Limits(max_keepalive_connections=0, max_connections=5),
+            ) as client:
+                r = client.get(url, params=params)
+                r.raise_for_status()
+                return r.json()
+        except (
+            httpx.RemoteProtocolError,
+            httpx.ReadError,
+            httpx.ConnectError,
+            httpx.TimeoutException,
+            httpx.HTTPStatusError,
+        ) as e:
+            last = e
+            log_to_buffer(f"⚠️ GET {params} спроба {i + 1}/{attempts}: {e}")
+            time.sleep(2 * (i + 1))
+    raise last  # type: ignore[misc]
+
+
+def _fetch_collection(path: str) -> List[dict]:
+    """Тягне всю колекцію по сторінках (pagination=false не використовуємо — рветься)."""
+    headers = {
+        "Accept": "application/ld+json",
+        "User-Agent": "ztoe-accidents-summary/1.3",
+    }
+    items: List[dict] = []
+    page = 1
+    while page <= 200:
+        data = _get_json(
+            f"{API_BASE}{path}",
+            {"page": page, "itemsPerPage": 50},
+            headers,
+        )
+        if isinstance(data, list):
+            items.extend(data)
+            break
+        batch = data.get("hydra:member") or []
+        items.extend(batch)
+        if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
+            break
+        page += 1
+    return items
 
 
 def city_street_totals_from(
@@ -1021,18 +1072,13 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
     if not API_BASE or not accidents:
         return {}
 
-    headers = {
-        "Accept": "application/ld+json",
-        "User-Agent": "ztoe-accidents-summary/1.3",
-    }
     cities: List[dict] = []
     try:
-        with httpx.Client(timeout=180, headers=headers) as client:
-            streets = _fetch_collection(client, "/pw_streets")
-            try:
-                cities = _fetch_collection(client, "/pw_cities")
-            except Exception as e:
-                log_to_buffer(f"⚠️ Довідник міст недоступний, % району зі статичного: {e}")
+        streets = _fetch_collection("/pw_streets")
+        try:
+            cities = _fetch_collection("/pw_cities")
+        except Exception as e:
+            log_to_buffer(f"⚠️ Довідник міст недоступний, % району зі статичного: {e}")
     except Exception as e:
         log_to_buffer(f"⚠️ Довідник вулиць н.п. недоступний: {e}")
         return {}
@@ -1277,72 +1323,36 @@ def _note_city_rems(accidents: List[dict]) -> None:
 
 
 def fetch_all_accidents() -> List[dict]:
-
     if not API_BASE:
         raise SystemExit("Немає ZTOE_API_BASE")
-
     headers = {
         "Accept": "application/ld+json",
         "User-Agent": "ztoe-accidents-summary/1.3",
     }
-    items: List[dict] = []
-
-    with httpx.Client(timeout=60, headers=headers) as client:
-        try:
-            r = client.get(
-                f"{API_BASE}/pw_accidents",
-                params={"pagination": "false"},
-            )
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, list):
-                log_to_buffer(f"API: list → {len(data)} записів")
-                _note_city_rems(data)
-                filtered = [x for x in data if is_real_accident(x)]
-                log_to_buffer(
-                    f"Фільтр аварій: {len(data)} → {len(filtered)} "
-                    f"(відкинуто ГПВ/не-аварії: {len(data) - len(filtered)})"
-                )
-                return filtered
-            batch = data.get("hydra:member") or []
-            if batch:
-                log_to_buffer(f"API: pagination=false → {len(batch)} записів")
-                _note_city_rems(batch)
-                filtered = [x for x in batch if is_real_accident(x)]
-                log_to_buffer(
-                    f"Фільтр аварій: {len(batch)} → {len(filtered)} "
-                    f"(відкинуто ГПВ/не-аварії: {len(batch) - len(filtered)})"
-                )
-                return filtered
-        except Exception as e:
-            log_to_buffer(f"⚠️ pagination=false failed: {e} — сторінки")
-
-        page = 1
-        while page <= 100:
-            r = client.get(
-                f"{API_BASE}/pw_accidents",
-                params={"page": page, "itemsPerPage": 100},
-            )
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, list):
-                items.extend(data)
-                break
-            batch = data.get("hydra:member") or []
-            items.extend(batch)
-            if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
-                break
-            page += 1
-        log_to_buffer(f"API: по сторінках → {len(items)} записів (сторінок: {page})")
-
+    items: list = []
+    page = 1
+    while page <= 100:
+        data = _get_json(
+            f"{API_BASE}/pw_accidents",
+            {"page": page, "itemsPerPage": 30},  # менше за 100: сторінка легше доходить
+            headers,
+        )
+        if isinstance(data, list):
+            items.extend(data)
+            break
+        batch = data.get("hydra:member") or []
+        items.extend(batch)
+        if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
+            break
+        page += 1
+    log_to_buffer(f"API: по сторінках → {len(items)} записів (сторінок: {page})")
     _note_city_rems(items)
-    raw_n = len(items)
-    items = [a for a in items if is_real_accident(a)]
+    filtered = [a for a in items if is_real_accident(a)]
     log_to_buffer(
-        f"Фільтр аварій: {raw_n} → {len(items)} "
-        f"(відкинуто ГПВ/не-аварії: {raw_n - len(items)})"
+        f"Фільтр аварій: {len(items)} → {len(filtered)} "
+        f"(відкинуто ГПВ/не-аварії: {len(items) - len(filtered)})"
     )
-    return items
+    return filtered
 
 
 def aggregate(
