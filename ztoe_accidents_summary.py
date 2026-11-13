@@ -5,21 +5,16 @@
 - Тягне всі записи з /pw_accidents
 - Рахує унікальні вулиці / нас. пункти по РЕМ
 - Сортує РЕМ за часткою району без світла (% вулиць), не за старою карткою
-- Під кожним РЕМ — населені пункти: скільки вулиць цього пункту без світла
+- Під кожним РЕМ — населені пункти: % РЕМ і % вимкнення самого н.п.
 - Село належить РЕМ із відключення, не з картки міста
   (Коростень → Коростенський, навіть якщо картка каже Хорошівський)
-- У рядку РЕМ: скільки н.п. без світла з довідника і скільки вулиць району
+- У рядку РЕМ лише два відсотки з цієї ж прив'язки: % н.п. і % району
 - Запис без РЕМ («АТ Житомиробленерго») клеїться до РЕМ цього ж city id
   (Нова Борова → Хорошівський)
 - Завжди зберігає знімок у Mongo (accidents_summary: latest + історія по годині)
-- У Telegram-канал і в DM «Стан області» шле ЛИШЕ при рівні CRITICAL
+- У Telegram-канал шле ЛИШЕ при рівні CRITICAL
   (антиспам: last_notified_date / last_notified_level у Mongo)
-- Окремо шле DM «Стан району», якщо обраний РЕМ ≥ DISTRICT_CRITICAL_PCT
-  (за замовч. 30%). Не залежить від рівня області. Антиспам — раз на день
-  на район (users.last_district_notified). За замовч. вимкнено, поки
-  користувач не обрав район (notify_prefs.district).
-- FORCE_NOTIFY=1 — примусово в канал і в DM області
-- FORCE_DISTRICT_NOTIFY=1 — ігнорувати денний антиспам району
+- FORCE_NOTIFY=1 — примусово в канал
 - Лог у TELEGRAM_LOG_CHANNEL_ID
 
 Рівні (за кількістю н.п.):
@@ -31,7 +26,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import time
 from collections import defaultdict
 from datetime import datetime, timezone
 import re
@@ -351,247 +345,6 @@ def send_region_dms(message: str) -> tuple[int, int]:
     return sent, failed
 
 
-DISTRICT_CRITICAL_PCT = float(os.getenv("DISTRICT_CRITICAL_PCT") or "30")
-
-
-def _district_coverage(st: dict) -> float | None:
-    for key in ("coverage_pct", "streets_pct"):
-        v = st.get(key)
-        if v is None:
-            continue
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _district_locative(short: str) -> str:
-    s = (short or "").strip()
-    if s.endswith("ий"):
-        return s[:-2] + "ому"
-    if s.endswith("ій"):
-        return s[:-2] + "ьому"
-    return s
-
-
-def format_critical_district(name: str, st: dict, as_of_s: str) -> str:
-    """Окреме DM по критичному району. Не плутати зі зведенням області."""
-    short = _norm_rem_name(name)
-    loc = _district_locative(short)
-    streets = int(st.get("streets") or 0)
-    cities = int(st.get("cities") or 0)
-    pct = _district_coverage(st)
-    cp = st.get("cities_pct")
-    sp = st.get("streets_pct")
-
-    def _as_int(v) -> int:
-        try:
-            return int(v) if v else 0
-        except (TypeError, ValueError):
-            return 0
-
-    cities_total_i = _as_int(st.get("cities_total"))
-    streets_total_i = _as_int(st.get("streets_total"))
-
-    def _share(affected: int, total: int, unit: str, raw_pct) -> str:
-        aff_s = f"{affected:,}".replace(",", " ")
-        if total > 0:
-            try:
-                p = float(raw_pct) if raw_pct is not None else 100.0 * affected / total
-            except (TypeError, ValueError):
-                p = 100.0 * affected / total
-            tot_s = f"{total:,}".replace(",", " ")
-            return (
-                f"<b>{aff_s}</b> з <b>{tot_s}</b> {unit} "
-                f"(<b>{min(p, 100.0):.1f}%</b>)"
-            )
-        return f"<b>{aff_s}</b> {unit}"
-
-    lines = [
-        f"🔴 <b>КРИТИЧНИЙ</b> стан електромереж у {loc} районі",
-        "",
-        "Без світла "
-        + _share(cities, cities_total_i, "населених пунктів", cp)
-        + " і "
-        + _share(streets, streets_total_i, "вулиць", sp if sp is not None else pct)
-        + ".",
-        "",
-    ]
-
-    city_streets = st.get("city_streets") or {}
-    if isinstance(city_streets, dict) and city_streets:
-        items = sorted(
-            ((str(c), int(n or 0)) for c, n in city_streets.items()),
-            key=lambda x: -x[1],
-        )
-        items = [(c, n) for c, n in items if n > 0]
-        ct = st.get("city_totals") or {}
-        if not isinstance(ct, dict):
-            ct = {}
-        block = ["⚠️ <b>Населені пункти без світла</b>:"]
-        for cname, cnt_i in items:
-            tot = ct.get(cname) or ct.get(str(cname).strip())
-            tot_i = _as_int(tot)
-            if tot_i > 0:
-                own = min(100.0, 100.0 * cnt_i / tot_i)
-                block.append(
-                    f"    · {city_label(cname)} — {cnt_i} з {tot_i} вул. ({own:.1f}%)"
-                )
-            else:
-                block.append(f"    · {city_label(cname)} — {cnt_i} вул.")
-        lines.append("<blockquote expandable>")
-        lines.extend(block)
-        lines.append("</blockquote>")
-        lines.append("")
-
-    lines.append("<i>Будь ласка, не користуйтесь потужними електроприладами.</i>")
-    lines.append("")
-    lines.append(f"🕐 {as_of_s}")
-    return "\n".join(lines)
-
-
-def send_district_dms(rem: dict, as_of: datetime) -> bool:
-    """
-    Критичні DM по обраних РЕМ. Викликається завжди після запису знімка,
-    навіть якщо область не CRITICAL.
-
-    Повертає True, якщо частина відправок впала.
-    """
-    token = (os.getenv("ZTOE_BOT_TOKEN") or "").strip()
-    if not token:
-        log_to_buffer("⚠️ ZTOE_BOT_TOKEN немає — district DM пропуск")
-        return False
-    if not isinstance(rem, dict) or not rem:
-        log_to_buffer(f"ℹ️ district DM: немає РЕМ з coverage ≥ {DISTRICT_CRITICAL_PCT}%")
-        return False
-
-    force = (os.getenv("FORCE_DISTRICT_NOTIFY") or "").strip().lower() in (
-        "1", "true", "yes",
-    )
-    if force:
-        log_to_buffer("FORCE_DISTRICT_NOTIFY=1")
-
-    critical: dict[str, dict] = {}
-    for name, st in rem.items():
-        if not isinstance(st, dict):
-            continue
-        pct = _district_coverage(st)
-        streets = int(st.get("streets") or 0)
-        is_crit = (pct is not None and pct >= DISTRICT_CRITICAL_PCT) or (
-            pct is None and streets >= 400
-        )
-        if is_crit:
-            critical[_norm_rem_name(name)] = st
-    if not critical:
-        log_to_buffer(f"ℹ️ district DM: немає РЕМ з coverage ≥ {DISTRICT_CRITICAL_PCT}%")
-        return False
-
-    log_to_buffer(f"🔴 Критичні РЕМ: {', '.join(sorted(critical.keys()))}")
-
-    uri = (os.getenv("MONGO_URI") or "").strip()
-    db_name = (os.getenv("MONGO_DB") or "").strip() or "vidkluchennya"
-    if not uri:
-        log_to_buffer("⚠️ MONGO_URI немає — district DM пропуск")
-        return False
-    try:
-        from pymongo import MongoClient
-        client = MongoClient(uri, serverSelectionTimeoutMS=8000)
-        db = client[db_name]
-        users = list(
-            db["users"].find(
-                {
-                    "notify": {"$ne": False},
-                    "notify_prefs.district": True,
-                    "telegram_id": {"$exists": True},
-                }
-            )
-        )
-    except Exception as e:
-        log_to_buffer(f"❌ district DM users: {e}")
-        return True
-
-    log_to_buffer(f"📬 district DM candidates: {len(users)}")
-    as_of_s = as_of.strftime("%H:%M %d.%m")
-    today = as_of.strftime("%Y-%m-%d")
-    sent = failed = skipped = 0
-
-    for u in users:
-        raw_prefs = u.get("notify_prefs")
-        if u.get("notify", True) is False:
-            continue
-        if not (isinstance(raw_prefs, dict) and raw_prefs.get("district")):
-            continue
-        tid = u.get("telegram_id")
-        if not tid:
-            continue
-        wanted = set()
-        for x in u.get("notify_districts") or []:
-            n = _norm_rem_name(str(x or ""))
-            if n:
-                wanted.add(n)
-        if not wanted:
-            continue
-        hit = {k: v for k, v in critical.items() if k in wanted}
-        if not hit:
-            continue
-        last_map = u.get("last_district_notified") or {}
-        if not isinstance(last_map, dict):
-            last_map = {}
-        to_send = []
-        for k, st in hit.items():
-            if not force and str(last_map.get(k) or "")[:10] == today:
-                continue
-            to_send.append((k, st))
-        if not to_send:
-            skipped += 1
-            continue
-
-        silent = _is_quiet_now(u)
-        user_ok = True
-        for name, st in to_send:
-            text = format_critical_district(name, st, as_of_s)
-            try:
-                r = httpx.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    data={
-                        "chat_id": str(tid),
-                        "text": text[:TG_MSG_LIMIT],
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": "true",
-                        "disable_notification": "true" if silent else "false",
-                    },
-                    timeout=30,
-                )
-                if not (r.status_code == 200 and (r.json() or {}).get("ok")):
-                    user_ok = False
-                    log_to_buffer(f"❌ district DM tid={tid} {name}: HTTP {r.status_code}")
-                    break
-            except Exception as e:
-                user_ok = False
-                log_to_buffer(f"❌ district DM tid={tid} {name}: {e}")
-                break
-        if user_ok:
-            sent += 1
-            new_map = dict(last_map)
-            for name, _st in to_send:
-                new_map[name] = today
-            try:
-                db["users"].update_one(
-                    {"_id": u["_id"]},
-                    {"$set": {"last_district_notified": new_map}},
-                )
-            except Exception as e:
-                log_to_buffer(f"⚠️ update last_district_notified: {e}")
-        else:
-            failed += 1
-
-    log_to_buffer(
-        f"📬 district DM: sent={sent} failed={failed} skipped_today={skipped}"
-    )
-    return failed > 0
-
-
 # --- logging buffer (сумісно з log_utils + fallback) ---
 _log_lines: list[str] = []
 
@@ -805,30 +558,23 @@ def _oblast_street_total() -> int:
 
 
 def _rem_city_total(rem_name: str) -> int | None:
-    """Скільки н.п. у районі.
-
-    Знаменник — статична таблиця з addresses_directory.
-    /pw_cities має дублікати, живий підрахунок робить % н.п. кривим.
-    """
+    """Скільки н.п. у районі: та сама прив'язка, що й для вулиць."""
     key = _norm_rem_name(rem_name)
-    static = REM_TOTAL_CITIES.get(key)
-    if static and int(static) > 0:
-        return int(static)
     if _REM_CITIES_DYNAMIC is not None:
         dyn = int(_REM_CITIES_DYNAMIC.get(key) or 0)
         if dyn > 0:
             return dyn
-    return None
+    return REM_TOTAL_CITIES.get(key)
 
 
 def _oblast_city_total() -> int:
-    if OBLAST_TOTAL_CITIES > 0:
-        return int(OBLAST_TOTAL_CITIES)
+    if _OBLAST_CITIES_DYNAMIC and _OBLAST_CITIES_DYNAMIC > 0:
+        return int(_OBLAST_CITIES_DYNAMIC)
     if _REM_CITIES_DYNAMIC:
         summed = sum(int(v or 0) for v in _REM_CITIES_DYNAMIC.values())
         if summed > 0:
             return summed
-    return 0
+    return OBLAST_TOTAL_CITIES
 
 
 def rem_streets_pct(rem_name: str, affected_streets: int) -> float | None:
@@ -901,63 +647,13 @@ def _accident_place(accident: dict) -> Tuple[str, str, int | None]:
     return oname, cname, cid
 
 
-def _get_json(url: str, params: dict, headers: dict, attempts: int = 4) -> dict | list:
-    """Окремий Client на кожну спробу: без gzip, Connection: close, retry на обрив chunked."""
-    last: Exception | None = None
-    hdrs = {
-        **headers,
-        "Accept-Encoding": "identity",  # без gzip: інакше chunked часто рветься
-        "Connection": "close",
-    }
-    timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0)
-    for i in range(attempts):
-        try:
-            with httpx.Client(
-                timeout=timeout,
-                headers=hdrs,
-                follow_redirects=True,
-                http2=False,
-                limits=httpx.Limits(max_keepalive_connections=0, max_connections=5),
-            ) as client:
-                r = client.get(url, params=params)
-                r.raise_for_status()
-                return r.json()
-        except (
-            httpx.RemoteProtocolError,
-            httpx.ReadError,
-            httpx.ConnectError,
-            httpx.TimeoutException,
-            httpx.HTTPStatusError,
-        ) as e:
-            last = e
-            log_to_buffer(f"⚠️ GET {params} спроба {i + 1}/{attempts}: {e}")
-            time.sleep(2 * (i + 1))
-    raise last  # type: ignore[misc]
-
-
-def _fetch_collection(path: str) -> List[dict]:
-    """Тягне всю колекцію по сторінках (pagination=false не використовуємо — рветься)."""
-    headers = {
-        "Accept": "application/ld+json",
-        "User-Agent": "ztoe-accidents-summary/1.3",
-    }
-    items: List[dict] = []
-    page = 1
-    while page <= 200:
-        data = _get_json(
-            f"{API_BASE}{path}",
-            {"page": page, "itemsPerPage": 50},
-            headers,
-        )
-        if isinstance(data, list):
-            items.extend(data)
-            break
-        batch = data.get("hydra:member") or []
-        items.extend(batch)
-        if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
-            break
-        page += 1
-    return items
+def _fetch_collection(client: httpx.Client, path: str) -> List[dict]:
+    r = client.get(f"{API_BASE}{path}", params={"pagination": "false"})
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        return data
+    return list(data.get("hydra:member") or [])
 
 
 def city_street_totals_from(
@@ -1072,13 +768,18 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
     if not API_BASE or not accidents:
         return {}
 
+    headers = {
+        "Accept": "application/ld+json",
+        "User-Agent": "ztoe-accidents-summary/1.3",
+    }
     cities: List[dict] = []
     try:
-        streets = _fetch_collection("/pw_streets")
-        try:
-            cities = _fetch_collection("/pw_cities")
-        except Exception as e:
-            log_to_buffer(f"⚠️ Довідник міст недоступний, % району зі статичного: {e}")
+        with httpx.Client(timeout=180, headers=headers) as client:
+            streets = _fetch_collection(client, "/pw_streets")
+            try:
+                cities = _fetch_collection(client, "/pw_cities")
+            except Exception as e:
+                log_to_buffer(f"⚠️ Довідник міст недоступний, % району зі статичного: {e}")
     except Exception as e:
         log_to_buffer(f"⚠️ Довідник вулиць н.п. недоступний: {e}")
         return {}
@@ -1323,36 +1024,72 @@ def _note_city_rems(accidents: List[dict]) -> None:
 
 
 def fetch_all_accidents() -> List[dict]:
+
     if not API_BASE:
         raise SystemExit("Немає ZTOE_API_BASE")
+
     headers = {
         "Accept": "application/ld+json",
         "User-Agent": "ztoe-accidents-summary/1.3",
     }
-    items: list = []
-    page = 1
-    while page <= 100:
-        data = _get_json(
-            f"{API_BASE}/pw_accidents",
-            {"page": page, "itemsPerPage": 30},  # менше за 100: сторінка легше доходить
-            headers,
-        )
-        if isinstance(data, list):
-            items.extend(data)
-            break
-        batch = data.get("hydra:member") or []
-        items.extend(batch)
-        if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
-            break
-        page += 1
-    log_to_buffer(f"API: по сторінках → {len(items)} записів (сторінок: {page})")
+    items: List[dict] = []
+
+    with httpx.Client(timeout=60, headers=headers) as client:
+        try:
+            r = client.get(
+                f"{API_BASE}/pw_accidents",
+                params={"pagination": "false"},
+            )
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                log_to_buffer(f"API: list → {len(data)} записів")
+                _note_city_rems(data)
+                filtered = [x for x in data if is_real_accident(x)]
+                log_to_buffer(
+                    f"Фільтр аварій: {len(data)} → {len(filtered)} "
+                    f"(відкинуто ГПВ/не-аварії: {len(data) - len(filtered)})"
+                )
+                return filtered
+            batch = data.get("hydra:member") or []
+            if batch:
+                log_to_buffer(f"API: pagination=false → {len(batch)} записів")
+                _note_city_rems(batch)
+                filtered = [x for x in batch if is_real_accident(x)]
+                log_to_buffer(
+                    f"Фільтр аварій: {len(batch)} → {len(filtered)} "
+                    f"(відкинуто ГПВ/не-аварії: {len(batch) - len(filtered)})"
+                )
+                return filtered
+        except Exception as e:
+            log_to_buffer(f"⚠️ pagination=false failed: {e} — сторінки")
+
+        page = 1
+        while page <= 100:
+            r = client.get(
+                f"{API_BASE}/pw_accidents",
+                params={"page": page, "itemsPerPage": 100},
+            )
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                items.extend(data)
+                break
+            batch = data.get("hydra:member") or []
+            items.extend(batch)
+            if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
+                break
+            page += 1
+        log_to_buffer(f"API: по сторінках → {len(items)} записів (сторінок: {page})")
+
     _note_city_rems(items)
-    filtered = [a for a in items if is_real_accident(a)]
+    raw_n = len(items)
+    items = [a for a in items if is_real_accident(a)]
     log_to_buffer(
-        f"Фільтр аварій: {len(items)} → {len(filtered)} "
-        f"(відкинуто ГПВ/не-аварії: {len(items) - len(filtered)})"
+        f"Фільтр аварій: {raw_n} → {len(items)} "
+        f"(відкинуто ГПВ/не-аварії: {raw_n - len(items)})"
     )
-    return filtered
+    return items
 
 
 def aggregate(
@@ -1423,6 +1160,7 @@ def aggregate(
         if cov is not None:
             entry["coverage_pct"] = round(cov, 1)
             entry["coverage_kind"] = cov_kind
+        # для /district: % нас. пункту
         if city_street_totals:
             rem_key = _norm_rem_name(name)
             ct = {
@@ -1470,24 +1208,15 @@ def format_message(
             100.0, 100.0 * int(total_streets or 0) / _oblast_street_total()
         )
 
-    def _pair(affected: int, total: int, pct: float | None, unit: str) -> str:
-        aff_s = f"{int(affected):,}".replace(",", " ")
-        if total and int(total) > 0:
-            p = float(pct) if pct is not None else 100.0 * int(affected) / float(total)
-            tot_s = f"{int(total):,}".replace(",", " ")
-            return (
-                f"<b>{aff_s}</b> з <b>{tot_s}</b> {unit} "
-                f"(<b>{min(p, 100.0):.1f}%</b>)"
-            )
-        return f"<b>{aff_s}</b> {unit}"
-
     header_counts = (
-        "Без світла "
-        + _pair(int(total_cities or 0), _oblast_city_total(), cities_pct_obl, "населених пунктів")
-        + " і "
-        + _pair(int(total_streets or 0), _oblast_street_total(), streets_pct_obl, "вулиць")
-        + "."
-    )
+        f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
+        f"(загалом <b>{total_streets:,}</b> вулиць)"
+    ).replace(",", " ")
+    if cities_pct_obl is not None and streets_pct_obl is not None:
+        header_counts += (
+            f" — <b>{cities_pct_obl:.1f}%</b> н.п. / <b>{streets_pct_obl:.1f}%</b> вул. області"
+        )
+    header_counts += "."
 
     lines: List[str] = [
         f"{level_emoji}<b>{level_label}</b> стан електромереж у Житомирській області",
@@ -1534,25 +1263,21 @@ def format_message(
             cov, _ = rem_coverage_pct(name, st["streets"], st["cities"])
         emoji = severity_emoji(st["streets"], coverage_pct=cov)
 
-        cities_total = st.get("cities_total") or _rem_city_total(name)
-        streets_total = st.get("streets_total") or _rem_street_total(name)
-        if cities_total:
-            cp_v = float(cp) if cp is not None else 100.0 * int(st["cities"]) / float(cities_total)
-            np_share = (
-                f"{int(st['cities'])} з {int(cities_total)} "
-                f"({min(cp_v, 100.0):.1f}%)"
+        pct_parts: List[str] = []
+        if cp is not None:
+            pct_parts.append(f"{cp:.1f}% н.п.")
+        if sp is not None:
+            pct_parts.append(f"{min(float(sp), 100.0):.1f}% району")
+        if pct_parts:
+            block.append(
+                f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
+                f"{streets_s} вул. ({' / '.join(pct_parts)})"
             )
         else:
-            np_share = str(int(st["cities"]))
-        if streets_total:
-            sp_v = float(sp) if sp is not None else 100.0 * int(st["streets"]) / float(streets_total)
-            tot_s = f"{int(streets_total):,}".replace(",", " ")
-            st_share = f"{streets_s} з {tot_s} ({min(sp_v, 100.0):.1f}%)"
-        else:
-            st_share = streets_s
-        block.append(
-            f"{emoji} <b>{short}</b> — без світла {np_share} н.п., {st_share} вул."
-        )
+            block.append(
+                f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
+                f"{streets_s} вул."
+            )
 
         city_items = sorted(
             st.get("city_streets", {}).items(),
@@ -1566,19 +1291,43 @@ def format_message(
                 return 100.0 * cnt_i / rem_total
             return 100.0 * cnt_i / rem_affected
 
+        def _own_pct(cname: str, cnt_i: int) -> float | None:
+            """Частка вимкнених вулиць у самому населеному пункті."""
+            if not city_street_totals or cnt_i <= 0:
+                return None
+            total = city_street_totals.get(
+                (_norm_rem_name(name), (cname or "").strip())
+            )
+            if not total or total <= 0:
+                return None
+            return min(100.0, 100.0 * cnt_i / total)
+
         def _fmt_np_line(cname: str, cnt_i: int) -> str:
-            label = city_label(cname)
-            total = None
-            if city_street_totals and cnt_i > 0:
-                total = city_street_totals.get(
-                    (_norm_rem_name(name), (cname or "").strip())
-                )
-            if total and int(total) > 0:
-                own = min(100.0, 100.0 * cnt_i / int(total))
-                return (
-                    f"    · {label} — {cnt_i} з {int(total)} вул. ({own:.1f}%)"
-                )
-            return f"    · {label} — {cnt_i} вул."
+            bits = [f"{_city_pct(cnt_i):.1f}% РЕМ"]
+            own = _own_pct(cname, cnt_i)
+            if own is not None:
+                bits.append(f"{own:.1f}% нас. пункту")
+            return (
+                f"    · {city_label(cname)} — {cnt_i} вул. "
+                f"({' - '.join(bits)})"
+            )
+
+        def _own_pct_many(items: List[Tuple[str, int]]) -> float | None:
+            """Сумарна частка вимкнених вулиць по кількох н.п. разом."""
+            if not city_street_totals or not items:
+                return None
+            total = 0
+            affected = 0
+            rem_key = _norm_rem_name(name)
+            for cname, cnt_i in items:
+                known = city_street_totals.get((rem_key, (cname or "").strip()))
+                if not known or known <= 0:
+                    return None
+                total += int(known)
+                affected += int(cnt_i or 0)
+            if total <= 0 or affected <= 0:
+                return None
+            return min(100.0, 100.0 * affected / total)
 
         # окремо — н.п. з ≥ CITY_PCT_MIN % вулиць району; дрібні → «ще N»
         shown: list = []
@@ -1604,9 +1353,13 @@ def format_message(
                 more = len(rest) - 1
                 rest_streets = sum(c for _, c in rest)
                 if rest_streets > 0:
+                    bits = [f"{_city_pct(rest_streets):.1f}% РЕМ"]
+                    own = _own_pct_many(rest)
+                    if own is not None:
+                        bits.append(f"{own:.1f}% нас. пункту")
                     block.append(
                         f"    · {city_label(first_name)} + ще {more} нас.п. — "
-                        f"{rest_streets} вул."
+                        f"{rest_streets} вул. ({' - '.join(bits)})"
                     )
 
     if block:
@@ -1618,10 +1371,26 @@ def format_message(
 
     lines.append("")
 
-    # Лише для CRITICAL — короткий заклик, без легенди про відсотки.
+    # Лише для CRITICAL — заклик після блоку РЕМ, перед легендою
     if _level_code == "CRITICAL":
         lines.append("<i>Будь ласка, не користуйтесь потужними електроприладами.</i>")
         lines.append("")
+
+    lines.append("<blockquote expandable>")
+    lines.append("ℹ️ <b>Як читати відсотки</b>")
+    lines.append("• шапка — частка <b>області</b>: % н.п. (населені пункти) і % вул. (вулиці)")
+    lines.append(
+        "• рядок РЕМ: село в тому РЕМ, який стоїть у відключеннях, не в картці "
+        "(Коростень — Коростенський). <b>% н.п.</b> — частка населених пунктів цього РЕМ; "
+        "<b>% району</b> — яка частка його вулиць зараз без світла. "
+        "Порядок — від найбільшого % району"
+    )
+    lines.append(
+        "• рядок н.п.: <b>% РЕМ</b> — внесок пункту у вулиці району; "
+        "<b>% нас. пункту</b> — яка частка вулиць самого пункту зараз без світла"
+    )
+    lines.append("</blockquote>")
+    lines.append("")
 
     footer_parts: List[str] = []
     if AVARII_ZHOE:
@@ -1775,10 +1544,6 @@ def main() -> int:
             notified=False,  # порожньо / NORM — не ставимо мітку «вже слали»
             prev=prev,
         )
-        try:
-            send_district_dms(stats.get("rem") or {}, as_of)
-        except Exception as e:
-            log_to_buffer(f"❌ district DM batch failed: {e}")
         # при порожньому API в канал не шлемо (база оновлена)
         send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ", message_thread_id=154)
         return 0
@@ -1836,17 +1601,8 @@ def main() -> int:
         prev=prev,
     )
 
-    district_failed = False
-    try:
-        district_failed = send_district_dms(stats.get("rem") or {}, as_of)
-    except Exception as e:
-        log_to_buffer(f"❌ district DM batch failed: {e}")
-        district_failed = True
-
     send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ", message_thread_id=154)
     if do_notify and not notified_ok:
-        return 1
-    if district_failed:
         return 1
     return 0
 
