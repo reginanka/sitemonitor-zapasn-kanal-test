@@ -10,8 +10,9 @@
      і тільки потім двигаємо last_id (якщо канал не прийняв — зупиняємось,
      наступний запуск повторить).
 
-Ігноруємо: репости (forwarded), службові події (зміна аватарки, закріплення тощо),
-пости без тексту й без медіа. Пост з медіа без підпису — шлемо з позначкою «без тексту».
+Пересилаємо ТІЛЬКИ пости, текст яких містить одну з фраз із RELEVANT_PHRASES
+(порівняння нечутливе до регістру, емодзі, розділових знаків і зайвих пробілів).
+Усе інше (включно з репостами, службовими подіями, постами без тексту) ігнорується.
 
 Env:
   MONGO_URI, MONGO_DB          — як у решти модулів
@@ -64,13 +65,12 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
-MEDIA_SELECTORS = (
-    ".tgme_widget_message_photo_wrap, .tgme_widget_message_video_wrap, "
-    ".tgme_widget_message_roundvideo_wrap, .tgme_widget_message_document_wrap, "
-    ".tgme_widget_message_voice, .tgme_widget_message_poll, "
-    ".tgme_widget_message_sticker_wrap, .message_media_not_supported_wrap"
+# Пост пересилається, лише якщо містить одну з цих фраз.
+# Додати нову фразу = дописати рядок у список.
+RELEVANT_PHRASES = (
+    "Увага! Аварійні відключення!",
+    "⚡️ Аварійні відключення на Житомирщині скасовано.",
 )
-
 
 # ---------- парсинг ----------
 
@@ -89,7 +89,7 @@ def _post_text(el) -> str:
 
 
 def parse_posts(page: str) -> Dict[int, dict]:
-    """{id: {text, has_media, forwarded, service}} для всіх постів на сторінці."""
+    """{id: {text, forwarded, service}} для всіх постів на сторінці."""
     soup = BeautifulSoup(page, "html.parser")
     pat = re.compile(rf"^{re.escape(SOURCE_CHANNEL)}/(\d+)$", re.IGNORECASE)
     out: Dict[int, dict] = {}
@@ -102,7 +102,6 @@ def parse_posts(page: str) -> Dict[int, dict]:
         wrap_classes = " ".join(wrap.get("class", [])) if wrap else ""
         out[int(m.group(1))] = {
             "text": _post_text(el),
-            "has_media": bool(el.select_one(MEDIA_SELECTORS)),
             "forwarded": bool(el.select_one(".tgme_widget_message_forwarded_from")),
             "service": "service" in classes or "service" in wrap_classes,
         }
@@ -126,22 +125,28 @@ def fetch_posts() -> Dict[int, dict]:
     raise RuntimeError(f"Не вдалось отримати {PAGE_URL}: {last_err}")
 
 
+# ---------- фільтр ----------
+
+def _norm(text: str) -> str:
+    """Нижній регістр; лишаємо тільки літери й цифри (емодзі, пунктуація, пробіли, \u200b геть)."""
+    return "".join(ch for ch in (text or "").casefold() if ch.isalnum())
+
+
+_NORMALIZED_PHRASES = tuple(_norm(p) for p in RELEVANT_PHRASES)
+
+
+def is_relevant(text: str) -> bool:
+    t = _norm(text)
+    return bool(t) and any(ph and ph in t for ph in _NORMALIZED_PHRASES)
+
+
 # ---------- відправка ----------
 
-def format_message(post_id: int, post: dict) -> str:
-    link = f"https://t.me/{SOURCE_CHANNEL}/{post_id}"
+def format_message(post: dict) -> str:
     text = post["text"]
-    if text:
-        if len(text) > TEXT_LIMIT:
-            text = text[:TEXT_LIMIT].rstrip() + "…"
-        body = html.escape(text)
-    else:
-        body = "📎 <i>Пост без тексту (зображення/медіа)</i>"
-    return (
-        "📢 <b>Нове повідомлення ЖОЕ</b>\n\n"
-        f"{body}\n\n"
-        f'<a href="{link}">Відкрити в каналі</a>'
-    )
+    if len(text) > TEXT_LIMIT:
+        text = text[:TEXT_LIMIT].rstrip() + "…"
+    return f"<b>ЖОЕ інформує -</b>\n\n{html.escape(text)}"
 
 
 def send_to_channel(message: str) -> bool:
@@ -212,7 +217,7 @@ def run() -> bool:
         reason = (
             "службова подія" if p["service"]
             else "репост" if p["forwarded"]
-            else "немає тексту й медіа" if not (p["text"] or p["has_media"])
+            else "не підходить під фільтр" if not is_relevant(p["text"])
             else ""
         )
         if reason:
@@ -220,7 +225,7 @@ def run() -> bool:
             save_last_id(col, pid)
             continue
 
-        message = format_message(pid, p)
+        message = format_message(p)
         if not send_to_channel(message):
             log_to_buffer(f"❌ #{pid}: канал не прийняв, last_id не рухаю — повторю наступного запуску")
             return True
