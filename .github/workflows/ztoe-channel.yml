@@ -1,0 +1,42 @@
+name: ZTOE channel monitor
+
+on:
+  workflow_dispatch:
+
+# не запускати два прогони одночасно — інакше можливі дублі сповіщень
+concurrency:
+  group: ztoe-channel
+  cancel-in-progress: false
+
+jobs:
+  ztoe-channel:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      MONGO_URI: ${{ secrets.MONGO_URI }}
+      MONGO_DB: ${{ secrets.MONGO_DB }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+      ZTOE_BOT_TOKEN: ${{ secrets.ZTOE_BOT_TOKEN }}
+      TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
+      ZTOE_CHANNEL_URL: ${{ secrets.ZTOE_CHANNEL_URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # python-telegram-bot 20.8 потребує httpx~=0.26
+          pip install "httpx~=0.26.0" requests beautifulsoup4 pytz "pymongo>=4.6" "python-telegram-bot==20.8"
+
+      - name: Run ZTOE channel monitor
+        run: python ztoe_channel_monitor.py
