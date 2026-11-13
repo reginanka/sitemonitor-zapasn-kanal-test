@@ -21,7 +21,7 @@ from ztoe_channel_monitor import SOURCE_CHANNEL, STATE_COLLECTION, save_last_id
 
 
 def main() -> int:
-    raw = (os.getenv("LAST_ID") or "1902").strip()
+    raw = (os.getenv("LAST_ID") or "1892").strip()
     try:
         last_id = int(raw)
     except ValueError:
