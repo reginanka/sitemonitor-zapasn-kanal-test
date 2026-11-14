@@ -439,57 +439,57 @@ CITY_PREFIX = {
     "Житомир", "Звягель", "Бердичів", "Овруч", "Коростень", "Малин",
 }
 
-# Покриття району.
-# % вул. РЕМ — статична таблиця нижче (як у старих звітах).
-# % району — живий знаменник: вулиці /pw_streets, місто віднесене до РЕМ
-# за відключеннями (більшість записів), а не за otg картки.
-# % н.п. — з довідника addresses_directory (у API pw_cities дублікати, % там кривий).
+# Покриття району (знаменники).
+# За замовчуванням — статичні таблиці (зріз API /pw_streets + /pw_cities, 2026-11-14).
+# Міста з карткою «АТ Житомиробленерго» розкладені по РЕМ через CITY_TO_REM.
+# Опційно: USE_DYNAMIC_DENOM=1 — перерахунок знаменника з API;
+#          USE_CITY_DIRECTORY=1 — % нас. пункту з /pw_streets.
 REM_TOTAL_STREETS: Dict[str, int] = {
-    "Житомирський": 2782,
-    "Звягельський": 2474,
-    "Овруцький": 1670,
-    "Попільнянський": 1418,
-    "Коростенський": 1154,
+    "Житомирський": 2784,
+    "Звягельський": 2493,
+    "Овруцький": 1904,
+    "Коростенський": 1694,
+    "Попільнянський": 1419,
+    "Бердичівський": 1151,
     "Малинський": 1126,
     "Олевський": 890,
-    "Баранівський": 871,
-    "Хорошівський": 785,
+    "Баранівський": 875,
+    "Черняхівський": 755,
     "Радомишльський": 725,
-    "Бердичівський": 714,
-    "Черняхівський": 703,
-    "Чуднівський": 686,
-    "Любарський": 543,
+    "Чуднівський": 706,
+    "Хорошівський": 634,
+    "Любарський": 624,
+    "Коростишівський": 583,
+    "Романівський": 562,
     "Пулинський": 524,
-    "Романівський": 464,
     "Андрушівський": 433,
-    "Коростишівський": 404,
     "Брусилівський": 357,
 }
 
 REM_TOTAL_CITIES: Dict[str, int] = {
-    "Житомирський": 103,
-    "Звягельський": 224,
-    "Овруцький": 286,
-    "Коростенський": 150,
-    "Попільнянський": 101,
-    "Бердичівський": 66,
-    "Малинський": 110,
-    "Баранівський": 60,
-    "Олевський": 60,
-    "Хорошівський": 78,
-    "Радомишльський": 84,
+    # Унікальні назви н.п., у яких є вулиці в /pw_streets (без порожніх дублів).
+    "Звягельський": 221,
+    "Овруцький": 182,
+    "Коростенський": 142,
+    "Малинський": 104,
+    "Попільнянський": 92,
+    "Житомирський": 85,
+    "Радомишльський": 79,
+    "Хорошівський": 70,
+    "Бердичівський": 63,
+    "Пулинський": 63,
+    "Баранівський": 61,
+    "Олевський": 61,
     "Чуднівський": 60,
-    "Андрушівський": 41,
-    "Коростишівський": 64,
+    "Романівський": 60,
+    "Коростишівський": 58,
+    "Черняхівський": 57,
     "Любарський": 46,
-    "Черняхівський": 58,
-    "Пулинський": 68,
-    "Брусилівський": 36,
-    "Романівський": 63,
+    "Андрушівський": 36,
+    "Брусилівський": 30,
 }
 
 # Якщо otg = АТ «Житомиробленерго» (без РЕМ) — підставляємо РЕМ за назвою н.п.
-# Зібрано з /pw_cities (найчастіший otg для назви).
 OBLAST_TOTAL_STREETS = sum(REM_TOTAL_STREETS.values())
 OBLAST_TOTAL_CITIES = sum(REM_TOTAL_CITIES.values())
 
@@ -517,6 +517,26 @@ CITY_TO_REM: Dict[str, str] = {
     "Головине": "Черняхівський РЕМ",
     "Іршанськ": "Хорошівський РЕМ",
     "Великі Низгірці": "Бердичівський РЕМ",
+    # Картка API = АТ «Житомиробленерго»
+    "Нова Борова": "Хорошівський РЕМ",
+    "Лугини": "Коростенський РЕМ",
+    "Горщик": "Коростенський РЕМ",
+    "Норинськ": "Овруцький РЕМ",
+    "Громада": "Любарський РЕМ",
+    "Стрижівка": "Любарський РЕМ",
+    "Старий Любар": "Любарський РЕМ",
+    "Новогуйвинське": "Житомирський РЕМ",
+    "Осикове": "Бердичівський РЕМ",
+    "Білошиці": "Коростенський РЕМ",
+    "Чижівка": "Звягельський РЕМ",
+    "Васьковичі": "Коростенський РЕМ",
+    "Червоногранітне": "Хорошівський РЕМ",
+    "Гулянка": "Коростенський РЕМ",
+    "Демківці": "Любарський РЕМ",
+    "Пекарщина": "Черняхівський РЕМ",
+    "Понінка": "Баранівський РЕМ",
+    "Кварцитне": "Овруцький РЕМ",
+    "Ємилівка": "Овруцький РЕМ",
 }
 
 
@@ -537,64 +557,126 @@ _CITY_REM_VOTES: Dict[int, Dict[str, int]] = {}
 _CITY_REM_NAMES: Dict[int, str] = {}
 
 
-def _rem_street_total(rem_name: str) -> int | None:
-    """Скільки вулиць у районі: живий довідник, інакше статична таблиця."""
+def _use_dynamic_denom() -> bool:
+    return (os.getenv("USE_DYNAMIC_DENOM") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _dyn_street_raw(key: str) -> int:
+    if _REM_STREETS_DYNAMIC is None:
+        return 0
+    return int(_REM_STREETS_DYNAMIC.get(key) or 0)
+
+
+def _dyn_city_raw(key: str) -> int:
+    if _REM_CITIES_DYNAMIC is None:
+        return 0
+    return int(_REM_CITIES_DYNAMIC.get(key) or 0)
+
+
+def rem_street_denominator(rem_name: str, affected_streets: int = 0) -> int | None:
+    """Гібридний знаменник вулиць району.
+
+    1) база — статика (зріз API);
+    2) якщо є адекватний dynamic — max(static, dynamic);
+    3) ніколи не менше affected (щоб не було «736 з 80 → 100%» від зхлопнутого знаменника).
+
+    Dynamic враховується завжди, коли вже підвантажений (USE_DYNAMIC_DENOM /
+    USE_CITY_DIRECTORY), і відкидається лише якщо підозріло малий vs static.
+    """
     key = _norm_rem_name(rem_name)
-    if _REM_STREETS_DYNAMIC is not None:
-        dyn = int(_REM_STREETS_DYNAMIC.get(key) or 0)
-        if dyn > 0:
-            return dyn
-    return REM_TOTAL_STREETS.get(key)
+    static = int(REM_TOTAL_STREETS.get(key) or 0)
+    dyn = _dyn_street_raw(key)
+    affected = max(0, int(affected_streets or 0))
+
+    base = 0
+    if static > 0 and dyn > 0:
+        # dynamic «адекватний», якщо не в рази менший за статику
+        if dyn >= max(50, int(static * 0.25)):
+            base = max(static, dyn)
+        else:
+            base = static  # зламаний dynamic ігноруємо
+    elif static > 0:
+        base = static
+    elif dyn > 0:
+        base = dyn
+
+    if affected > 0:
+        base = max(base, affected)
+
+    return base if base > 0 else None
+
+
+def rem_city_denominator(rem_name: str, affected_cities: int = 0) -> int | None:
+    """Гібридний знаменник н.п. району (та сама логіка, що для вулиць)."""
+    key = _norm_rem_name(rem_name)
+    static = int(REM_TOTAL_CITIES.get(key) or 0)
+    dyn = _dyn_city_raw(key)
+    affected = max(0, int(affected_cities or 0))
+
+    base = 0
+    if static > 0 and dyn > 0:
+        if dyn >= max(5, int(static * 0.25)):
+            base = max(static, dyn)
+        else:
+            base = static
+    elif static > 0:
+        base = static
+    elif dyn > 0:
+        base = dyn
+
+    if affected > 0:
+        base = max(base, affected)
+
+    return base if base > 0 else None
+
+
+def _rem_street_total(rem_name: str) -> int | None:
+    """Скільки вулиць у районі (гібрид без урахування affected)."""
+    return rem_street_denominator(rem_name, 0)
 
 
 def _oblast_street_total() -> int:
-    if _OBLAST_STREETS_DYNAMIC and _OBLAST_STREETS_DYNAMIC > 0:
-        return int(_OBLAST_STREETS_DYNAMIC)
-    if _REM_STREETS_DYNAMIC:
-        summed = sum(int(v or 0) for v in _REM_STREETS_DYNAMIC.values())
-        if summed > 0:
-            return summed
+    if _use_dynamic_denom():
+        if _OBLAST_STREETS_DYNAMIC and _OBLAST_STREETS_DYNAMIC > 0:
+            return int(_OBLAST_STREETS_DYNAMIC)
+        if _REM_STREETS_DYNAMIC:
+            summed = sum(int(v or 0) for v in _REM_STREETS_DYNAMIC.values())
+            if summed > 0:
+                return max(summed, OBLAST_TOTAL_STREETS)
     return OBLAST_TOTAL_STREETS
 
 
 def _rem_city_total(rem_name: str) -> int | None:
-    """Скільки н.п. у районі: та сама прив'язка, що й для вулиць."""
-    key = _norm_rem_name(rem_name)
-    if _REM_CITIES_DYNAMIC is not None:
-        dyn = int(_REM_CITIES_DYNAMIC.get(key) or 0)
-        if dyn > 0:
-            return dyn
-    return REM_TOTAL_CITIES.get(key)
+    """Скільки н.п. у районі (гібрид без урахування affected)."""
+    return rem_city_denominator(rem_name, 0)
 
 
 def _oblast_city_total() -> int:
-    if _OBLAST_CITIES_DYNAMIC and _OBLAST_CITIES_DYNAMIC > 0:
-        return int(_OBLAST_CITIES_DYNAMIC)
-    if _REM_CITIES_DYNAMIC:
-        summed = sum(int(v or 0) for v in _REM_CITIES_DYNAMIC.values())
-        if summed > 0:
-            return summed
+    if _use_dynamic_denom():
+        if _OBLAST_CITIES_DYNAMIC and _OBLAST_CITIES_DYNAMIC > 0:
+            return int(_OBLAST_CITIES_DYNAMIC)
+        if _REM_CITIES_DYNAMIC:
+            summed = sum(int(v or 0) for v in _REM_CITIES_DYNAMIC.values())
+            if summed > 0:
+                return max(summed, OBLAST_TOTAL_CITIES)
     return OBLAST_TOTAL_CITIES
 
 
 def rem_streets_pct(rem_name: str, affected_streets: int) -> float | None:
-    """
-    % району: уражені вулиці / усі вулиці цього району (живий знаменник).
-    Може бути >100%, якщо API дає більше унікальних ключів, ніж є в довіднику.
-    """
-    total = _rem_street_total(rem_name)
+    """% району: уражені вулиці / гібридний знаменник (≤ 100% у показі)."""
+    n = max(0, int(affected_streets or 0))
+    total = rem_street_denominator(rem_name, n)
     if not total or total <= 0:
         return None
-    n = max(0, int(affected_streets or 0))
-    return 100.0 * n / total
+    return min(100.0, 100.0 * n / total)
 
 
 def rem_cities_pct(rem_name: str, affected_cities: int) -> float | None:
-    """Частка н.п. району. Знаменник — ті самі села, що й у % району."""
-    total = _rem_city_total(rem_name)
+    """Частка н.п. району (гібридний знаменник)."""
+    n = max(0, int(affected_cities or 0))
+    total = rem_city_denominator(rem_name, n)
     if not total or total <= 0:
         return None
-    n = max(0, int(affected_cities or 0))
     return min(100.0, 100.0 * n / total)
 
 
@@ -760,12 +842,23 @@ def rem_street_totals_from(
 
 def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int]:
     """
-    Вулиці н.п. з /pw_streets.
-    Заодно збирає знаменник «% району»: кожне місто — в один РЕМ,
-    за відключеннями, а не за карткою.
+    Вулиці н.п. з /pw_streets (для % нас. пункту) і опційно dynamic-знаменник РЕМ.
+
+    За замовчуванням НЕ ходимо в /pw_streets+/pw_cities — % району зі статики.
+      USE_CITY_DIRECTORY=1  — % нас. пункту з довідника вулиць
+      USE_DYNAMIC_DENOM=1   — ще й перерахунок знаменника РЕМ з API
     """
     global _REM_STREETS_DYNAMIC, _REM_CITIES_DYNAMIC, _OBLAST_STREETS_DYNAMIC, _OBLAST_CITIES_DYNAMIC
     if not API_BASE or not accidents:
+        return {}
+
+    use_dir = (os.getenv("USE_CITY_DIRECTORY") or "").strip().lower() in ("1", "true", "yes")
+    use_dyn = (os.getenv("USE_DYNAMIC_DENOM") or "").strip().lower() in ("1", "true", "yes")
+    if not use_dir and not use_dyn:
+        log_to_buffer(
+            "Довідник вулиць/міст: пропуск (статика). "
+            "USE_CITY_DIRECTORY=1 або USE_DYNAMIC_DENOM=1 — увімкнути API."
+        )
         return {}
 
     headers = {
@@ -1153,10 +1246,10 @@ def aggregate(
         }
         if sp is not None:
             entry["streets_pct"] = round(sp, 1)
-            entry["streets_total"] = _rem_street_total(name)
+            entry["streets_total"] = rem_street_denominator(name, streets_n)
         if cp is not None:
             entry["cities_pct"] = round(cp, 1)
-            entry["cities_total"] = _rem_city_total(name)
+            entry["cities_total"] = rem_city_denominator(name, cities_n)
         if cov is not None:
             entry["coverage_pct"] = round(cov, 1)
             entry["coverage_kind"] = cov_kind
