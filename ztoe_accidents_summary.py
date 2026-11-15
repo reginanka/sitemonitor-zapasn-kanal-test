@@ -14,11 +14,21 @@
 - Завжди зберігає знімок у Mongo (accidents_summary: latest + історія по годині)
 - У Telegram-канал шле ЛИШЕ при рівні CRITICAL
   (антиспам: last_notified_date / last_notified_level у Mongo)
-- FORCE_NOTIFY=1 — примусово в канал
+- FORCE_NOTIFY=1 — примусово в канал + district DM
+- Особисті DM «Стан області» (notify_prefs.region) — разом із каналом
+- Особисті DM «Стан района/ів» (notify_prefs.district + notify_districts):
+  окреме повідомлення по кожному РЕМ з CRITICAL (≥30% вулиць району),
+  незалежно від рівня області; спліт довгих списків н.п.;
+  антиспам per-user: users.district_alert_state[rem].level=CRITICAL
+  (поки епізод триває — не дублюємо; якщо юзер увімкнув пізніше —
+  отримає; коли рівень впав — стан чиститься)
 - Лог у TELEGRAM_LOG_CHANNEL_ID
 
-Рівні (за кількістю н.п.):
+Рівні області (за кількістю н.п.):
   NORM <30 | WARN 30–150 | HIGH 150–400 | CRITICAL >400
+
+Рівень РЕМ (для district DM, за % вулиць району):
+  CRITICAL ≥30% | HIGH ≥15% | WARN ≥5% | NORM >0
 """
 
 from __future__ import annotations
@@ -396,6 +406,476 @@ def send_region_dms(message: str) -> tuple[int, int]:
     )
 
     return sent, failed
+
+
+# ── District (РЕМ) CRITICAL DMs ──────────────────────────────────────────────
+# notify_prefs.district + notify_districts: окреме сповіщення по кожному РЕМ,
+# який зараз CRITICAL. Антиспам на юзері: district_alert_state[rem] = {
+#   level, notified_at, cities, streets, coverage_pct
+# }. Поки РЕМ лишається CRITICAL — не шлемо повторно. Якщо юзер увімкнув
+# пізніше (стану немає) — отримає. Коли рівень впав нижче CRITICAL — стан
+# чистимо, наступний CRITICAL знову спрацює.
+
+
+def _user_wants_district(u: dict) -> bool:
+    """notify_prefs.district (за замовч. False) і є хоча б один обраний РЕМ."""
+    if u.get("notify", True) is False:
+        return False
+    raw = u.get("notify_prefs")
+    if not isinstance(raw, dict) or not bool(raw.get("district")):
+        return False
+    return bool(_user_notify_districts(u))
+
+
+def _user_notify_districts(u: dict) -> List[str]:
+    """Нормалізовані назви РЕМ без « РЕМ» з users.notify_districts."""
+    raw = u.get("notify_districts")
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for x in raw:
+        n = _norm_rem_name(str(x or ""))
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _rem_level_code(streets: int, coverage_pct: float | None) -> Tuple[str, str, str]:
+    """(code, emoji, label) — як у bot/database._level_for_rem."""
+    if coverage_pct is not None:
+        p = float(coverage_pct)
+        if p >= 30:
+            return "CRITICAL", "🔴", "КРИТИЧНИЙ"
+        if p >= 15:
+            return "HIGH", "🟠", "СКЛАДНИЙ"
+        if p >= 5:
+            return "WARN", "🟡", "Погіршений"
+        if p > 0 or streets > 0:
+            return "NORM", "🟢", "Стабільний"
+        return "NORM", "🟢", "Стабільний"
+    n = int(streets or 0)
+    if n >= 400:
+        return "CRITICAL", "🔴", "КРИТИЧНИЙ"
+    if n >= 150:
+        return "HIGH", "🟠", "СКЛАДНИЙ"
+    if n >= 50:
+        return "WARN", "🟡", "Погіршений"
+    if n > 0:
+        return "NORM", "🟢", "Стабільний"
+    return "NORM", "🟢", "Стабільний"
+
+
+def _locative_rem(short: str) -> str:
+    """Радомишльський → Радомишльському."""
+    s = (short or "").strip()
+    if s.endswith("ий"):
+        return s[:-2] + "ому"
+    if s.endswith("ій"):
+        return s[:-2] + "ьому"
+    return s
+
+
+def critical_rems_from_stats(
+    stats: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Нормалізована назва РЕМ → entry зі stats['rem'] лише для CRITICAL.
+    Ключ без « РЕМ».
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for name, st in (stats.get("rem") or {}).items():
+        if not isinstance(st, dict):
+            continue
+        streets = int(st.get("streets") or 0)
+        if streets <= 0:
+            continue
+        cov = st.get("coverage_pct")
+        if cov is None:
+            cov = st.get("streets_pct")
+        try:
+            cov_f = float(cov) if cov is not None else None
+        except (TypeError, ValueError):
+            cov_f = None
+        code, _, _ = _rem_level_code(streets, cov_f)
+        if code != "CRITICAL":
+            continue
+        key = _norm_rem_name(name)
+        if key:
+            entry = dict(st)
+            entry["_raw_name"] = name
+            out[key] = entry
+    return out
+
+
+def format_district_critical_message(
+    rem_key: str,
+    st: Dict[str, Any],
+    as_of: datetime,
+    city_street_totals: Dict[Tuple[str, str], int] | None = None,
+) -> str:
+    """
+    Одне повідомлення про CRITICAL у конкретному РЕМ (усі н.п., без «ще N»).
+    Формат як у /district і тестовому зведенні.
+    """
+    short = _norm_rem_name(rem_key)
+    loc = _locative_rem(short)
+    streets = int(st.get("streets") or 0)
+    cities = int(st.get("cities") or 0)
+    cov = st.get("coverage_pct")
+    if cov is None:
+        cov = st.get("streets_pct")
+    try:
+        cov_f = float(cov) if cov is not None else None
+    except (TypeError, ValueError):
+        cov_f = None
+    _code, emoji, label = _rem_level_code(streets, cov_f)
+
+    streets_s = f"{streets:,}".replace(",", " ")
+    cp = st.get("cities_pct")
+    sp = st.get("streets_pct")
+    try:
+        cp_f = float(cp) if cp is not None else None
+    except (TypeError, ValueError):
+        cp_f = None
+    try:
+        sp_f = float(sp) if sp is not None else cov_f
+    except (TypeError, ValueError):
+        sp_f = cov_f
+
+    pct_bits: List[str] = []
+    if cp_f is not None:
+        pct_bits.append(f"{cp_f:.1f}% н.п.")
+    if sp_f is not None:
+        pct_bits.append(f"{min(sp_f, 100.0):.1f}% району")
+
+    lines: List[str] = [
+        f"{emoji}<b>{label}</b> стан електромереж у {loc} районі",
+        "",
+    ]
+    if pct_bits:
+        lines.append(
+            f"Аварійні відключення зараз у <b>{cities}</b> нас. п. / "
+            f"<b>{streets_s}</b> вул. ({' / '.join(pct_bits)})"
+        )
+    else:
+        lines.append(
+            f"Аварійні відключення зараз у <b>{cities}</b> нас. п. / "
+            f"<b>{streets_s}</b> вул."
+        )
+    lines.append("")
+    lines.append("⚠️ <b>Ситуація по нас.пунктах</b> (від найбільш проблемних):")
+
+    city_streets = st.get("city_streets") or {}
+    if not isinstance(city_streets, dict):
+        city_streets = {}
+    city_items = sorted(
+        ((str(c), int(n or 0)) for c, n in city_streets.items() if int(n or 0) > 0),
+        key=lambda x: -x[1],
+    )
+
+    rem_total = rem_street_denominator(st.get("_raw_name") or short, streets) or 0
+    block: List[str] = []
+    for cname, cnt_i in city_items:
+        rem_pct = (100.0 * cnt_i / rem_total) if rem_total > 0 else 0.0
+        own = None
+        if city_street_totals:
+            total = city_street_totals.get((short, (cname or "").strip()))
+            if total and int(total) > 0:
+                own = min(100.0, 100.0 * cnt_i / int(total))
+        label_c = city_label(cname)
+        if own is not None:
+            block.append(
+                f"    · {label_c} — {cnt_i} вул. "
+                f"({rem_pct:.1f}% РЕМ - {own:.1f}% нас. пункту)"
+            )
+        else:
+            block.append(
+                f"    · {label_c} — {cnt_i} вул. ({rem_pct:.1f}% РЕМ)"
+            )
+
+    if block:
+        lines.append("<blockquote expandable>")
+        lines.extend(block)
+        lines.append("</blockquote>")
+    else:
+        lines.append("<i>немає даних по населених пунктах</i>")
+
+    lines.append("")
+    lines.append("<i>Будь ласка, не користуйтесь потужними електроприладами.</i>")
+    lines.append("")
+    lines.append(f"🕐 {as_of.strftime('%H:%M %d.%m')}")
+    return "\n".join(lines)
+
+
+def _split_district_overflow_local(
+    text: str, label: str, limit: int = TG_MSG_LIMIT
+) -> List[str]:
+    """Рве довгий список н.п. одного району з рядком «продовження»."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    lines = text.split("\n")
+    parts: List[str] = []
+    buf: List[str] = []
+    open_bq = False
+    cont = f"↳ <b>{label}</b> (продовження)"
+
+    def _flush() -> None:
+        nonlocal buf, open_bq
+        if not buf:
+            return
+        body = "\n".join(buf).rstrip()
+        if open_bq and "</blockquote>" not in body:
+            body += "\n</blockquote>"
+        if body:
+            parts.append(body)
+        buf = []
+        open_bq = False
+
+    for ln in lines:
+        extra = 20 if open_bq else 0
+        candidate = buf + [ln]
+        if buf and len("\n".join(candidate)) + extra > limit:
+            _flush()
+            buf = [cont, "<blockquote expandable>"]
+            open_bq = True
+            if ln.strip() in ("</blockquote>", "<blockquote expandable>"):
+                continue
+        buf.append(ln)
+        if "<blockquote" in ln:
+            open_bq = True
+        if "</blockquote>" in ln:
+            open_bq = False
+    _flush()
+    return parts or [text[:limit]]
+
+
+def _should_notify_user_district(
+    u: dict,
+    rem_key: str,
+    st: Dict[str, Any],
+    *,
+    force: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Чи слати CRITICAL по цьому РЕМ цьому юзеру.
+    force / FORCE_NOTIFY — завжди.
+    Інакше: слати, якщо в district_alert_state немає запису з level=CRITICAL
+    (нове входження в CRITICAL або юзер щойно увімкнув сповіщення).
+    """
+    if force:
+        return True, "FORCE_NOTIFY"
+    state = u.get("district_alert_state")
+    if not isinstance(state, dict):
+        return True, "немає стану — перше сповіщення"
+    prev = state.get(rem_key)
+    if not isinstance(prev, dict):
+        return True, "немає стану по РЕМ — перше сповіщення"
+    if str(prev.get("level") or "") != "CRITICAL":
+        return True, f"попередній рівень {prev.get('level') or '—'} → CRITICAL"
+    return False, "вже сповіщали цей CRITICAL-епізод"
+
+
+def send_district_critical_dms(
+    stats: Dict[str, Any],
+    as_of: datetime,
+    city_street_totals: Dict[Tuple[str, str], int] | None = None,
+) -> Tuple[int, int]:
+    """
+    DM по кожному CRITICAL-РЕМ юзерам з notify_prefs.district.
+    Окреме повідомлення на район (спліт при довгому списку н.п.).
+    Оновлює users.district_alert_state.
+    Повертає (users_sent, users_failed).
+    """
+    token = (os.getenv("ZTOE_BOT_TOKEN") or "").strip()
+    if not token:
+        log_to_buffer("⚠️ ZTOE_BOT_TOKEN немає — DM district пропуск")
+        return 0, 0
+
+    try:
+        from pymongo import MongoClient
+    except Exception as e:
+        log_to_buffer(f"❌ pymongo для district DM: {e}")
+        return 0, 0
+
+    uri = (os.getenv("MONGO_URI") or "").strip()
+    db_name = (os.getenv("MONGO_DB") or "").strip()
+    if not uri or not db_name:
+        log_to_buffer("⚠️ Mongo URI/DB немає — DM district пропуск")
+        return 0, 0
+
+    critical = critical_rems_from_stats(stats)
+    force = (os.getenv("FORCE_NOTIFY") or "").strip().lower() in ("1", "true", "yes")
+
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+        users_col = client[db_name]["users"]
+        users = list(users_col.find({"notify": {"$ne": False}}))
+    except Exception as e:
+        log_to_buffer(f"❌ Mongo users для district DM: {e}")
+        return 0, 0
+
+    msg_by_rem: Dict[str, List[str]] = {}
+    for rem_key, st in critical.items():
+        raw = format_district_critical_message(
+            rem_key, st, as_of, city_street_totals
+        )
+        parts = _split_district_overflow_local(raw, rem_key, TG_MSG_LIMIT)
+        parts = _fit_html_parts(parts, 4000)
+        msg_by_rem[rem_key] = parts
+        log_to_buffer(
+            f"🏘️ CRITICAL {rem_key}: cities={st.get('cities')} "
+            f"streets={st.get('streets')} cov={st.get('coverage_pct')} "
+            f"parts={len(parts)} lens={[len(p) for p in parts]}"
+        )
+
+    if not critical:
+        log_to_buffer("🏘️ district DM: немає CRITICAL РЕМ — чистимо стани")
+    else:
+        log_to_buffer(
+            f"🏘️ district DM CRITICAL РЕМ: {', '.join(sorted(critical.keys()))}"
+        )
+
+    setup_kb = json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Налаштувати 🔔",
+                        "callback_data": "pref:district_setup",
+                    }
+                ]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    sent_users = failed_users = 0
+    sent_msgs = skipped = 0
+    critical_keys = set(critical.keys())
+
+    for u in users:
+        tid = u.get("telegram_id")
+        if not tid:
+            continue
+
+        state = u.get("district_alert_state")
+        if not isinstance(state, dict):
+            state = {}
+        else:
+            state = dict(state)
+        state_changed = False
+        for k in list(state.keys()):
+            prev = state.get(k)
+            if isinstance(prev, dict) and str(prev.get("level") or "") == "CRITICAL":
+                if k not in critical_keys:
+                    del state[k]
+                    state_changed = True
+
+        if not _user_wants_district(u):
+            if state_changed:
+                try:
+                    users_col.update_one(
+                        {"telegram_id": tid},
+                        {"$set": {"district_alert_state": state}},
+                    )
+                except Exception as e:
+                    log_to_buffer(f"⚠️ district state clear tid={tid}: {e}")
+            continue
+
+        wanted = _user_notify_districts(u)
+        to_send: List[str] = []
+        for rem_key in wanted:
+            if rem_key not in critical:
+                continue
+            ok, reason = _should_notify_user_district(
+                u, rem_key, critical[rem_key], force=force
+            )
+            if ok:
+                to_send.append(rem_key)
+            else:
+                skipped += 1
+                log_to_buffer(f"⏭ district DM tid={tid} {rem_key}: {reason}")
+
+        if not to_send and not state_changed:
+            continue
+
+        silent = _is_quiet_now(u)
+        user_sent_any = False
+        user_failed = False
+
+        for rem_key in to_send:
+            parts = msg_by_rem.get(rem_key) or []
+            if not parts:
+                continue
+            rem_ok = True
+            try:
+                for i, part in enumerate(parts):
+                    payload = {
+                        "chat_id": str(tid),
+                        "text": part,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": "true",
+                        "disable_notification": "true" if silent else "false",
+                    }
+                    if i == len(parts) - 1:
+                        payload["reply_markup"] = setup_kb
+                    r = httpx.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        data=payload,
+                        timeout=30,
+                    )
+                    if not (r.status_code == 200 and (r.json() or {}).get("ok")):
+                        rem_ok = False
+                        log_to_buffer(
+                            f"❌ district DM tid={tid} {rem_key}: "
+                            f"HTTP {r.status_code} {r.text[:120]}"
+                        )
+                        break
+            except Exception as e:
+                rem_ok = False
+                log_to_buffer(f"❌ district DM tid={tid} {rem_key}: {e}")
+
+            if rem_ok:
+                user_sent_any = True
+                sent_msgs += 1
+                st = critical[rem_key]
+                state[rem_key] = {
+                    "level": "CRITICAL",
+                    "notified_at": datetime.now(timezone.utc),
+                    "as_of": as_of.isoformat(),
+                    "cities": int(st.get("cities") or 0),
+                    "streets": int(st.get("streets") or 0),
+                    "coverage_pct": st.get("coverage_pct"),
+                }
+                state_changed = True
+            else:
+                user_failed = True
+
+        if state_changed:
+            try:
+                users_col.update_one(
+                    {"telegram_id": tid},
+                    {"$set": {"district_alert_state": state}},
+                )
+            except Exception as e:
+                log_to_buffer(f"❌ district state write tid={tid}: {e}")
+
+        if user_sent_any:
+            sent_users += 1
+        elif user_failed:
+            failed_users += 1
+
+    log_to_buffer(
+        f"📬 district DM: users_sent={sent_users} users_failed={failed_users} "
+        f"msgs={sent_msgs} skipped={skipped} critical_rems={len(critical)}"
+    )
+    return sent_users, failed_users
 
 
 # --- logging buffer (сумісно з log_utils + fallback) ---
@@ -1690,6 +2170,11 @@ def main() -> int:
             notified=False,  # порожньо / NORM — не ставимо мітку «вже слали»
             prev=prev,
         )
+        # немає аварій → скинути district CRITICAL-стани в users
+        try:
+            send_district_critical_dms(stats, as_of, None)
+        except Exception as e:
+            log_to_buffer(f"❌ district DM clear failed: {e}")
         # при порожньому API в канал не шлемо (база оновлена)
         send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ", message_thread_id=154)
         return 0
@@ -1736,7 +2221,15 @@ def main() -> int:
         except Exception as e:
             log_to_buffer(f"❌ region DM batch failed: {e}")
     else:
-        log_to_buffer("⏭ Telegram: пропущено (антиспам / рівень)")
+        log_to_buffer("⏭ Telegram канал/region: пропущено (антиспам / рівень)")
+
+    # District CRITICAL — незалежно від рівня області.
+    # Юзери з notify_prefs.district + notify_districts отримують окреме
+    # повідомлення по кожному своєму РЕМ, який зараз CRITICAL.
+    try:
+        send_district_critical_dms(stats, as_of, city_street_totals)
+    except Exception as e:
+        log_to_buffer(f"❌ district DM batch failed: {e}")
 
     # Mongo завжди; мітку last_notified оновлюємо лише якщо реально відправили
     save_to_mongo(
