@@ -919,6 +919,14 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
 
 
 
+# Рівень по кількості населених пунктів (область ~1400 н.п.)
+# 🟢 NORM     < 30
+# 🟡 WARN     30–150
+# 🟠 HIGH     150–400
+# 🔴 CRITICAL > 400
+LEVEL_ORDER = {"NORM": 0, "WARN": 1, "HIGH": 2, "CRITICAL": 3}
+
+
 def level_from_cities(total_cities: int) -> Tuple[str, str, str]:
     """Повертає (code, emoji, label_uk).
 
