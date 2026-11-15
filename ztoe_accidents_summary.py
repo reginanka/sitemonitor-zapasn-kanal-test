@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -189,6 +190,41 @@ def split_by_rem_blocks(text: str, limit: int = TG_MSG_LIMIT) -> List[str]:
     return fixed or [text[:limit]]
 
 
+def _fit_html_parts(parts: List[str], limit: int = 4000) -> List[str]:
+    """Жодна частина не довша за ліміт і не лишає відкритий blockquote."""
+    out: List[str] = []
+
+    def _emit(chunk_lines: List[str], open_bq: bool) -> None:
+        body = "\n".join(chunk_lines).rstrip()
+        if not body:
+            return
+        if open_bq and "</blockquote>" not in body.split("\n")[-3:]:
+            if body.count("<blockquote") > body.count("</blockquote>"):
+                body += "\n</blockquote>"
+        out.append(body)
+
+    for part in parts or []:
+        part = part or ""
+        if len(part) <= limit and part.count("<blockquote") == part.count("</blockquote>"):
+            out.append(part)
+            continue
+        buf: List[str] = []
+        open_bq = False
+        for ln in part.split("\n"):
+            extra = 20 if open_bq else 0
+            if buf and len("\n".join(buf + [ln])) + extra > limit:
+                _emit(buf, open_bq)
+                buf = ["<blockquote expandable>"] if open_bq else []
+            buf.append(ln)
+            if "<blockquote" in ln:
+                open_bq = True
+            if "</blockquote>" in ln:
+                open_bq = False
+        if buf:
+            _emit(buf, open_bq)
+    return out
+
+
 def send_notification(message: str, image_path=None) -> bool:
     """Шле в TELEGRAM_CHANNEL_ID без preview лінків.
     Якщо текст довший за ліміт — ріже по межах РЕМ і шле 2–3 повідомлення підряд.
@@ -198,7 +234,7 @@ def send_notification(message: str, image_path=None) -> bool:
     if not token or not chat_id:
         print("❌ TELEGRAM_BOT_TOKEN або TELEGRAM_CHANNEL_ID не налаштовані")
         return False
-    parts = split_by_rem_blocks(message, TG_MSG_LIMIT)
+    parts = _fit_html_parts(split_by_rem_blocks(message, TG_MSG_LIMIT), 4000)
     if not parts:
         return False
     ok_all = True
@@ -208,7 +244,7 @@ def send_notification(message: str, image_path=None) -> bool:
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 data={
                     "chat_id": chat_id,
-                    "text": part[:4096],
+                    "text": part,
                     "parse_mode": "HTML",
                     "disable_web_page_preview": "true",
                 },
@@ -293,12 +329,26 @@ def send_region_dms(message: str) -> tuple[int, int]:
     targets = [u for u in users if _user_wants_region(u) and u.get("telegram_id")]
     log_to_buffer(f"📬 region DM candidates: {len(targets)} (з {len(users)} notify)")
 
-    parts = split_by_rem_blocks(message, TG_MSG_LIMIT)
+    parts = _fit_html_parts(split_by_rem_blocks(message, TG_MSG_LIMIT), 4000)
     if not parts:
         log_to_buffer("⚠️ region DM: порожнє повідомлення після split")
         return 0, 0
     if len(parts) > 1:
         log_to_buffer(f"✂️ region DM split: {len(parts)} parts, lens={[len(p) for p in parts]}")
+
+    setup_kb = json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Налаштувати 🔔",
+                        "callback_data": "pref:district_setup",
+                    }
+                ]
+            ]
+        },
+        ensure_ascii=False,
+    )
 
     sent = failed = 0
     sent_quiet = sent_sound = 0
@@ -307,16 +357,19 @@ def send_region_dms(message: str) -> tuple[int, int]:
         silent = _is_quiet_now(u)
         user_ok = True
         try:
-            for part in parts:
+            for i, part in enumerate(parts):
+                payload = {
+                    "chat_id": str(tid),
+                    "text": part,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": "true",
+                    "disable_notification": "true" if silent else "false",
+                }
+                if i == len(parts) - 1:
+                    payload["reply_markup"] = setup_kb
                 r = httpx.post(
                     f"https://api.telegram.org/bot{token}/sendMessage",
-                    data={
-                        "chat_id": str(tid),
-                        "text": part[:4096],
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": "true",
-                        "disable_notification": "true" if silent else "false",
-                    },
+                    data=payload,
                     timeout=30,
                 )
                 if not (r.status_code == 200 and (r.json() or {}).get("ok")):
