@@ -842,24 +842,17 @@ def rem_street_totals_from(
 
 def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int]:
     """
-    Вулиці н.п. з /pw_streets (для % нас. пункту) і опційно dynamic-знаменник РЕМ.
+    Вулиці н.п. з /pw_streets — для «% нас. пункту» в рядках сіл.
 
-    За замовчуванням НЕ ходимо в /pw_streets+/pw_cities — % району зі статики.
-      USE_CITY_DIRECTORY=1  — % нас. пункту з довідника вулиць
-      USE_DYNAMIC_DENOM=1   — ще й перерахунок знаменника РЕМ з API
+    Завжди тягнемо /pw_streets (потрібно для % нас. пункту).
+    /pw_cities + dynamic-знаменник РЕМ — лише при USE_DYNAMIC_DENOM=1
+    (гібрид і так бере статику; dynamic лише як підстраховка).
     """
     global _REM_STREETS_DYNAMIC, _REM_CITIES_DYNAMIC, _OBLAST_STREETS_DYNAMIC, _OBLAST_CITIES_DYNAMIC
     if not API_BASE or not accidents:
         return {}
 
-    use_dir = (os.getenv("USE_CITY_DIRECTORY") or "").strip().lower() in ("1", "true", "yes")
     use_dyn = (os.getenv("USE_DYNAMIC_DENOM") or "").strip().lower() in ("1", "true", "yes")
-    if not use_dir and not use_dyn:
-        log_to_buffer(
-            "Довідник вулиць/міст: пропуск (статика). "
-            "USE_CITY_DIRECTORY=1 або USE_DYNAMIC_DENOM=1 — увімкнути API."
-        )
-        return {}
 
     headers = {
         "Accept": "application/ld+json",
@@ -869,10 +862,13 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
     try:
         with httpx.Client(timeout=180, headers=headers) as client:
             streets = _fetch_collection(client, "/pw_streets")
-            try:
-                cities = _fetch_collection(client, "/pw_cities")
-            except Exception as e:
-                log_to_buffer(f"⚠️ Довідник міст недоступний, % району зі статичного: {e}")
+            if use_dyn:
+                try:
+                    cities = _fetch_collection(client, "/pw_cities")
+                except Exception as e:
+                    log_to_buffer(
+                        f"⚠️ Довідник міст недоступний, % району зі статичного: {e}"
+                    )
     except Exception as e:
         log_to_buffer(f"⚠️ Довідник вулиць н.п. недоступний: {e}")
         return {}
@@ -889,7 +885,7 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
         f"Довідник вулиць н.п.: {len(totals)} (streets={len(streets)})"
     )
 
-    if cities:
+    if use_dyn and cities:
         cards: Dict[int, Tuple[str, str]] = {}
         for city in cities:
             cid = _ref_id(city)
@@ -898,7 +894,9 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
             otg = city.get("otg") or {}
             oname = (otg.get("name") or "").strip() if isinstance(otg, dict) else ""
             cards[cid] = ((city.get("name") or "").strip(), oname)
-        rem_totals, city_totals, moves = rem_street_totals_from(per_city, cards, _CITY_REM_VOTES)
+        rem_totals, city_totals, moves = rem_street_totals_from(
+            per_city, cards, _CITY_REM_VOTES
+        )
         if rem_totals:
             _REM_STREETS_DYNAMIC = rem_totals
             _REM_CITIES_DYNAMIC = city_totals
@@ -919,12 +917,6 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
     return totals
 
 
-# Рівень по кількості населених пунктів (область ~1400 н.п.)
-# 🟢 NORM     < 30
-# 🟡 WARN     30–150
-# 🟠 HIGH     150–400
-# 🔴 CRITICAL > 400
-LEVEL_ORDER = {"NORM": 0, "WARN": 1, "HIGH": 2, "CRITICAL": 3}
 
 
 def level_from_cities(total_cities: int) -> Tuple[str, str, str]:
