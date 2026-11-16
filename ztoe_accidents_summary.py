@@ -23,6 +23,8 @@
   (поки епізод триває — не дублюємо; якщо юзер увімкнув пізніше —
   отримає; коли рівень впав — стан чиститься)
 - Лог у TELEGRAM_LOG_CHANNEL_ID
+- Оновлення карти через GitHub Contents API (MAP_GITHUB_REPO / MAP_GITHUB_TOKEN / MAP_GITHUB_PATH)
+  завжди при кожному запуску
 
 Рівні області (за кількістю н.п.):
   NORM <30 | WARN 30–150 | HIGH 150–400 | CRITICAL >400
@@ -33,6 +35,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -2116,6 +2119,174 @@ def save_to_mongo(
         log_to_buffer(f"❌ Mongo write failed: {e}")
 
 
+# ── GitHub Pages map ─────────────────────────────────────────────────────────
+# Оновлює файл через GitHub Contents API.
+# Потрібні секрети: MAP_GITHUB_REPO, MAP_GITHUB_TOKEN, MAP_GITHUB_PATH.
+# Працює завжди (незалежно від рівня CRITICAL).
+
+
+def build_map_payload(
+    stats: Dict[str, Any],
+    city_street_totals: Dict[Tuple[str, str], int] | None = None,
+) -> Tuple[Dict[str, float], Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Готує дані для карти з поточного stats.
+    Повертає (outages_data, summary_data, raions_data).
+    """
+    outages_data: Dict[str, float] = {}
+    major = {n.lower() for n in CITY_PREFIX}
+    for rem_name, st in (stats.get("rem") or {}).items():
+        rem_key = _norm_rem_name(rem_name)
+        city_streets = st.get("city_streets") or {}
+        if not isinstance(city_streets, dict):
+            continue
+        for cname, cnt in city_streets.items():
+            cnt_i = int(cnt or 0)
+            if cnt_i <= 0:
+                continue
+            key = (cname or "").strip().lower()
+            if not key:
+                continue
+            own_pct: float | None = None
+            if city_street_totals:
+                total = city_street_totals.get((rem_key, (cname or "").strip()))
+                if total and int(total) > 0:
+                    own_pct = min(100.0, 100.0 * cnt_i / int(total))
+            if own_pct is None:
+                rem_total = rem_street_denominator(rem_name, int(st.get("streets") or 0))
+                if rem_total and rem_total > 0:
+                    own_pct = min(100.0, 100.0 * cnt_i / rem_total)
+            if own_pct is not None and (key in major or own_pct >= 5.0):
+                prev = outages_data.get(key)
+                if prev is None or own_pct > prev:
+                    outages_data[key] = round(own_pct, 1)
+
+    total_streets = int(stats.get("total_streets") or 0)
+    total_cities = int(stats.get("total_cities") or 0)
+    oblast_streets = _oblast_street_total() or 0
+    off_percent = (
+        round(min(100.0, 100.0 * total_streets / oblast_streets), 1)
+        if oblast_streets > 0
+        else 0.0
+    )
+    summary_data: Dict[str, Any] = {
+        "off_percent": off_percent,
+        "off_streets": total_streets,
+        "total_streets": oblast_streets or total_streets,
+        "off_settlements": total_cities,
+    }
+
+    raions_data: List[Dict[str, Any]] = []
+    for rem_name, st in (stats.get("rem") or {}).items():
+        streets = int(st.get("streets") or 0)
+        if streets <= 0:
+            continue
+        cities = int(st.get("cities") or 0)
+        short = _norm_rem_name(rem_name)
+        cov = st.get("coverage_pct")
+        if cov is None:
+            cov = st.get("streets_pct")
+        try:
+            off_pct = float(cov) if cov is not None else None
+        except (TypeError, ValueError):
+            off_pct = None
+        if off_pct is None:
+            off_pct = rem_streets_pct(rem_name, streets) or 0.0
+        cities_pct = st.get("cities_pct")
+        try:
+            cities_pct_f = float(cities_pct) if cities_pct is not None else None
+        except (TypeError, ValueError):
+            cities_pct_f = None
+        if cities_pct_f is None:
+            cities_pct_f = rem_cities_pct(rem_name, cities) or 0.0
+
+        raions_data.append(
+            {
+                "name": short,
+                "off_percent": round(min(float(off_pct), 100.0), 1),
+                "off_streets": streets,
+                "off_settlements": cities,
+                "off_settlements_percent": round(min(float(cities_pct_f), 100.0), 1),
+            }
+        )
+    raions_data.sort(
+        key=lambda r: (-float(r.get("off_percent") or 0), -int(r.get("off_streets") or 0))
+    )
+
+    return outages_data, summary_data, raions_data
+
+
+def push_outages_to_github(
+    outages_data: dict,
+    summary_data: dict | None = None,
+    raions_data: list | None = None,
+) -> None:
+    """
+    Оновлює файл через GitHub Contents API.
+    Працює незалежно від рівня CRITICAL — синхронізує стан з мапою.
+    Потрібні секрети: MAP_GITHUB_REPO, MAP_GITHUB_TOKEN, MAP_GITHUB_PATH.
+    """
+    repo = (os.getenv("MAP_GITHUB_REPO") or "").strip()
+    token = (os.getenv("MAP_GITHUB_TOKEN") or "").strip()
+    path = (os.getenv("MAP_GITHUB_PATH") or "").strip()
+
+    if not repo or not token or not path:
+        log_to_buffer(
+            "⚠️ MAP_GITHUB_REPO / MAP_GITHUB_TOKEN / MAP_GITHUB_PATH "
+            "не налаштовані — оновлення карти пропущено"
+        )
+        return
+
+    payload: Dict[str, Any] = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "data": outages_data or {},
+    }
+    if summary_data:
+        payload["summary"] = summary_data
+    if raions_data:
+        payload["raions"] = raions_data
+
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ztoe-accidents-summary/1.3",
+    }
+
+    try:
+        with httpx.Client(timeout=25, headers=headers) as client:
+            res = client.get(url)
+            sha = None
+            if res.status_code == 200:
+                try:
+                    sha = (res.json() or {}).get("sha")
+                except Exception:
+                    sha = None
+
+            json_bytes = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            encoded_content = base64.b64encode(json_bytes).decode("ascii")
+
+            body: Dict[str, Any] = {
+                "message": (
+                    "chore(data): автоматичне оновлення карти від бота "
+                    f"({datetime.now(timezone.utc).strftime('%H:%M %d.%m')})"
+                ),
+                "content": encoded_content,
+            }
+            if sha:
+                body["sha"] = sha
+
+            put_res = client.put(url, json=body)
+            if put_res.status_code in (200, 201):
+                log_to_buffer("✅ Дані відключень успішно оновлені на GitHub Pages")
+            else:
+                log_to_buffer(
+                    f"❌ GitHub map update HTTP {put_res.status_code}: {put_res.text[:300]}"
+                )
+    except Exception as e:
+        log_to_buffer(f"❌ Помилка оновлення карти через GitHub API: {e}")
+
 
 def main() -> int:
     log_to_buffer("=" * 40)
@@ -2175,6 +2346,12 @@ def main() -> int:
             send_district_critical_dms(stats, as_of, None)
         except Exception as e:
             log_to_buffer(f"❌ district DM clear failed: {e}")
+        # оновлення карти (порожній стан)
+        try:
+            outages_data, summary_data, raions_data = build_map_payload(stats, None)
+            push_outages_to_github(outages_data, summary_data, raions_data)
+        except Exception as e:
+            log_to_buffer(f"❌ GitHub map push failed: {e}")
         # при порожньому API в канал не шлемо (база оновлена)
         send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ", message_thread_id=154)
         return 0
@@ -2230,6 +2407,15 @@ def main() -> int:
         send_district_critical_dms(stats, as_of, city_street_totals)
     except Exception as e:
         log_to_buffer(f"❌ district DM batch failed: {e}")
+
+    # Оновлення карти (завжди, незалежно від рівня CRITICAL)
+    try:
+        outages_data, summary_data, raions_data = build_map_payload(
+            stats, city_street_totals
+        )
+        push_outages_to_github(outages_data, summary_data, raions_data)
+    except Exception as e:
+        log_to_buffer(f"❌ GitHub map push failed: {e}")
 
     # Mongo завжди; мітку last_notified оновлюємо лише якщо реально відправили
     save_to_mongo(
