@@ -1,117 +1,2251 @@
-import base64
+#!/usr/bin/env python3
+"""
+Звіт про аварійні відключення в Житомирській області (ЖОЕ).
+
+- Тягне всі записи з /pw_accidents
+- Рахує унікальні вулиці / нас. пункти по РЕМ
+- Сортує РЕМ за часткою району без світла (% вулиць), не за старою карткою
+- Під кожним РЕМ — населені пункти: % РЕМ і % вимкнення самого н.п.
+- Село належить РЕМ із відключення, не з картки міста
+  (Коростень → Коростенський, навіть якщо картка каже Хорошівський)
+- У рядку РЕМ лише два відсотки з цієї ж прив'язки: % н.п. і % району
+- Запис без РЕМ («АТ Житомиробленерго») клеїться до РЕМ цього ж city id
+  (Нова Борова → Хорошівський)
+- Завжди зберігає знімок у Mongo (accidents_summary: latest + історія по годині)
+- У Telegram-канал шле ЛИШЕ при рівні CRITICAL
+  (антиспам: last_notified_date / last_notified_level у Mongo)
+- FORCE_NOTIFY=1 — примусово в канал + district DM
+- Особисті DM «Стан області» (notify_prefs.region) — разом із каналом
+- Особисті DM «Стан района/ів» (notify_prefs.district + notify_districts):
+  окреме повідомлення по кожному РЕМ з CRITICAL (≥30% вулиць району),
+  незалежно від рівня області; спліт довгих списків н.п.;
+  антиспам per-user: users.district_alert_state[rem].level=CRITICAL
+  (поки епізод триває — не дублюємо; якщо юзер увімкнув пізніше —
+  отримає; коли рівень впав — стан чиститься)
+- Лог у TELEGRAM_LOG_CHANNEL_ID
+
+Рівні області (за кількістю н.п.):
+  NORM <30 | WARN 30–150 | HIGH 150–400 | CRITICAL >400
+
+Рівень РЕМ (для district DM, за % вулиць району):
+  CRITICAL ≥30% | HIGH ≥15% | WARN ≥5% | NORM >0
+"""
+
+from __future__ import annotations
+
 import json
+import logging
 import os
+import sys
+from collections import defaultdict
 from datetime import datetime, timezone
-import requests
+import re
+from typing import Any, Dict, List, Set, Tuple
 
-# Налаштування MongoDB (приблизна структура, адаптуйте під ваше існуюче підключення)
-# MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-# client = MongoClient(MONGO_URI)
-# db = client["ztoe_db"]
-# accidents_collection = db["accidents"]
+import httpx
 
-def push_outages_to_github(outages_data: dict, summary_data: dict = None, raions_data: list = None) -> None:
+try:
+    from zoneinfo import ZoneInfo
+    KYIV = ZoneInfo("Europe/Kyiv")
+except Exception:
+    import pytz
+    KYIV = pytz.timezone("Europe/Kyiv")
+
+
+# Telegram HTML message limit; keep margin for safety
+TG_MSG_LIMIT = 4000
+
+
+def split_by_rem_blocks(text: str, limit: int = TG_MSG_LIMIT) -> List[str]:
     """
-    Оновлює файл docs/data/outages.json у репозиторії zh-map через GitHub Contents API.
-    Працює незалежно від того, критичний рівень чи ні — синхронізує стан з мапою.
+    Ріже довге зведення по межах блоків РЕМ (emoji + <b>Назва</b>).
+    Повертає 1–N частин ≤ limit символів. Header — у першій, footer — в останній.
     """
-    repo = os.getenv("MAP_GITHUB_REPO", "reginanka/zh-map").strip()
-    token = os.getenv("MAP_GITHUB_TOKEN", "").strip()
-    path = os.getenv("MAP_GITHUB_PATH", "docs/data/outages.json").strip()
-    
-    if not repo or not token:
-        print("⚠️ MAP_GITHUB_REPO або MAP_GITHUB_TOKEN не налаштовані в середовищі. Оновлення карти на GitHub пропущено.")
-        return
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
 
-    # Формуємо структуру згідно з вимогами zh-map
-    payload = {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "data": outages_data
-    }
-    if summary_data:
-        payload["summary"] = summary_data
-    if raions_data:
-        payload["raions"] = raions_data
-
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    try:
-        # 1. Отримуємо актуальний sha існуючого файлу на GitHub (вимагається GitHub API для оновлення)
-        res = requests.get(url, headers=headers, timeout=15)
-        sha = res.json().get("sha") if res.status_code == 200 else None
-
-        # 2. Кодуємо JSON у base64
-        json_bytes = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        encoded_content = base64.b64encode(json_bytes).decode("ascii")
-
-        body = {
-            "message": f"chore(data): автоматичне оновлення карти від бота ({datetime.now(timezone.utc).strftime('%H:%M %d.%m')})",
-            "content": encoded_content
-        }
-        if sha:
-            body["sha"] = sha
-
-        # 3. Надсилаємо PUT запит на GitHub
-        put_res = requests.put(url, headers=headers, json=body, timeout=20)
-        put_res.raise_for_status()
-        print("✅ Дані відключень успішно оновлені на GitHub Pages (zh-map)!")
-    except Exception as e:
-        print(f"❌ Помилка оновлення карти через GitHub API: {e}")
-
-def main():
-    print("🚀 Запуск скрипта збору аварій та оновлення...")
-    
-    # --- 1. Ваша існуюча логіка збору даних з обленерго ---
-    # raw_accidents = fetch_ztoe_accidents()
-
-    # --- 2. Ваша існуюча логіка збереження в MongoDB ---
-    # accidents_collection.insert_many(raw_accidents)
-    # print("💾 Дані успішно збережено в MongoDB.")
-
-    # --- 3. Приклад підготовки даних для мапи zh-map ---
-    current_outages_data = {
-        "житомир": 10.0,
-        "бердичів": 63.1,
-        "коростень": 0.0,
-        "коростишів": 32.5,
-        "звягель": 0.0
-    }
-
-    current_summary = {
-        "off_percent": 15.2,
-        "off_streets": 180,
-        "total_streets": 15000,
-        "off_settlements": 34
-    }
-
-    current_raions = [
-        {
-            "name": "Житомирський",
-            "off_percent": 18.4,
-            "off_streets": 65,
-            "off_settlements": 14,
-            "off_settlements_percent": 14.0
-        },
-        {
-            "name": "Бердичівський",
-            "off_percent": 63.1,
-            "off_streets": 45,
-            "off_settlements": 8,
-            "off_settlements_percent": 30.0
-        }
-    ]
-
-    # --- 4. Оновлення карти на GitHub (працює завжди при кожному запуску крона) ---
-    push_outages_to_github(
-        outages_data=current_outages_data,
-        summary_data=current_summary,
-        raions_data=current_raions
+    lines = text.split("\n")
+    # рядок початку РЕМ: 🔴/🟠/🟡/🟢/⚪ + пробіл + <b>
+    rem_start = re.compile(
+        r"^[\s]*(?:🔴|🟠|🟡|🟢|⚪)\s*<b>[^<]+</b>\s*[—\-]\s*",
     )
 
+    header: List[str] = []
+    blocks: List[List[str]] = []  # кожен блок = список рядків одного РЕМ
+    footer: List[str] = []
+    current: List[str] | None = None
+    in_rem_zone = False
+    past_blockquote = False
+
+    for line in lines:
+        if rem_start.match(line):
+            in_rem_zone = True
+            if current is not None:
+                blocks.append(current)
+            current = [line]
+            continue
+        if current is not None:
+            # продовження блоку РЕМ (міста, порожні, закриття blockquote)
+            if line.strip() == "</blockquote>":
+                current.append(line)
+                blocks.append(current)
+                current = None
+                past_blockquote = True
+                continue
+            # якщо після blockquote пішли footer-рядки — не чіпаємо current
+            if past_blockquote:
+                footer.append(line)
+            else:
+                current.append(line)
+            continue
+        if in_rem_zone or past_blockquote:
+            footer.append(line)
+        else:
+            header.append(line)
+
+    if current is not None:
+        blocks.append(current)
+
+    # якщо не знайшли жодного РЕМ-блоку — грубий split
+    if not blocks:
+        parts = []
+        rest = text
+        while rest:
+            if len(rest) <= limit:
+                parts.append(rest)
+                break
+            cut = rest.rfind("\n", 0, limit)
+            if cut < limit // 2:
+                cut = limit
+            parts.append(rest[:cut].rstrip())
+            rest = rest[cut:].lstrip("\n")
+        return parts or [text[:limit]]
+
+    header_s = "\n".join(header).rstrip()
+    footer_s = "\n".join(footer).strip()
+    # відкриваємо blockquote лише якщо header його ще не містить
+    open_bq = "<blockquote expandable>"
+    close_bq = "</blockquote>"
+    header_has_bq = open_bq in header_s
+
+    parts: List[str] = []
+    # перша частина: header + скільки влізе РЕМ
+    buf_lines: List[str] = []
+    if header_s:
+        buf_lines.extend(header_s.split("\n"))
+    if not header_has_bq and blocks:
+        # header зазвичай закінчується рядком «Ситуація по РЕМ», blockquote додаємо
+        if open_bq not in "\n".join(buf_lines):
+            buf_lines.append(open_bq)
+
+    def _flush(is_last: bool, extra_footer: str = "") -> None:
+        nonlocal buf_lines
+        body = "\n".join(buf_lines).rstrip()
+        # закрити blockquote якщо відкритий і ще не закритий
+        if open_bq in body and close_bq not in body:
+            body = body + "\n" + close_bq
+        if is_last and extra_footer:
+            body = body + ("\n\n" if body else "") + extra_footer
+        if body:
+            parts.append(body)
+        buf_lines = []
+
+    for bi, block in enumerate(blocks):
+        # прибрати зайві </blockquote> зсередини блоку (ми закриємо самі)
+        clean = [ln for ln in block if ln.strip() != close_bq]
+        candidate_lines = buf_lines + clean
+        candidate = "\n".join(candidate_lines)
+        # запас на закриття blockquote + footer на останній
+        reserve = 20
+        is_last_block = bi == len(blocks) - 1
+        if is_last_block and footer_s:
+            reserve += len(footer_s) + 4
+        if len(candidate) + reserve <= limit or not buf_lines or (
+            # header-only ще порожній від РЕМ — все одно кладемо
+            len(buf_lines) <= (len(header_s.split("\n")) + 2) and not any(
+                rem_start.match(x) for x in buf_lines
+            )
+        ):
+            buf_lines = candidate_lines
+            continue
+        # не влазить — flush поточний (без цього блоку) і почни новий
+        _flush(is_last=False)
+        # нова частина: короткий заголовок-продовження + blockquote
+        buf_lines = [
+            "⚠️ <b>Ситуація по РЕМ</b> (продовження):",
+            open_bq,
+        ] + clean
+
+    _flush(is_last=True, extra_footer=footer_s)
+
+    # safety: якщо щось все одно > limit — грубий доріз
+    fixed: List[str] = []
+    for p in parts:
+        if len(p) <= limit:
+            fixed.append(p)
+            continue
+        rest = p
+        while rest:
+            if len(rest) <= limit:
+                fixed.append(rest)
+                break
+            cut = rest.rfind("\n", 0, limit)
+            if cut < limit // 2:
+                cut = limit
+            fixed.append(rest[:cut].rstrip())
+            rest = rest[cut:].lstrip("\n")
+    return fixed or [text[:limit]]
+
+
+def _fit_html_parts(parts: List[str], limit: int = 4000) -> List[str]:
+    """Жодна частина не довша за ліміт і не лишає відкритий blockquote."""
+    out: List[str] = []
+
+    def _emit(chunk_lines: List[str], open_bq: bool) -> None:
+        body = "\n".join(chunk_lines).rstrip()
+        if not body:
+            return
+        if open_bq and "</blockquote>" not in body.split("\n")[-3:]:
+            if body.count("<blockquote") > body.count("</blockquote>"):
+                body += "\n</blockquote>"
+        out.append(body)
+
+    for part in parts or []:
+        part = part or ""
+        if len(part) <= limit and part.count("<blockquote") == part.count("</blockquote>"):
+            out.append(part)
+            continue
+        buf: List[str] = []
+        open_bq = False
+        for ln in part.split("\n"):
+            extra = 20 if open_bq else 0
+            if buf and len("\n".join(buf + [ln])) + extra > limit:
+                _emit(buf, open_bq)
+                buf = ["<blockquote expandable>"] if open_bq else []
+            buf.append(ln)
+            if "<blockquote" in ln:
+                open_bq = True
+            if "</blockquote>" in ln:
+                open_bq = False
+        if buf:
+            _emit(buf, open_bq)
+    return out
+
+
+def send_notification(message: str, image_path=None) -> bool:
+    """Шле в TELEGRAM_CHANNEL_ID без preview лінків.
+    Якщо текст довший за ліміт — ріже по межах РЕМ і шле 2–3 повідомлення підряд.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+    chat_id = os.getenv("TELEGRAM_CHANNEL_ID") or ""
+    if not token or not chat_id:
+        print("❌ TELEGRAM_BOT_TOKEN або TELEGRAM_CHANNEL_ID не налаштовані")
+        return False
+    parts = _fit_html_parts(split_by_rem_blocks(message, TG_MSG_LIMIT), 4000)
+    if not parts:
+        return False
+    ok_all = True
+    for i, part in enumerate(parts):
+        try:
+            r = httpx.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={
+                    "chat_id": chat_id,
+                    "text": part,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": "true",
+                },
+                timeout=30,
+            )
+            if r.status_code == 200:
+                if len(parts) > 1:
+                    print(f"✓ канал part {i+1}/{len(parts)} ({len(part)} символів)")
+            else:
+                print(f"❌ Telegram send HTTP {r.status_code}: {r.text[:300]}")
+                ok_all = False
+        except Exception as e:
+            print(f"❌ Telegram send failed: {e}")
+            ok_all = False
+    return ok_all
+
+
+def _user_wants_region(u: dict) -> bool:
+    """notify_prefs.region (за замовч. True, якщо ключа немає)."""
+    if u.get("notify", True) is False:
+        return False
+    raw = u.get("notify_prefs")
+    if isinstance(raw, dict):
+        return bool(raw.get("region", True))
+    return True
+
+
+def _is_quiet_now(u: dict) -> bool:
+    """Тихий режим з хвилинами (як у bot_notify / ZTOE-боті)."""
+    if not u.get("quiet_mode"):
+        return False
+    try:
+        fh = int(u.get("quiet_from", 23)) % 24
+        th = int(u.get("quiet_to", 7)) % 24
+    except (TypeError, ValueError):
+        fh, th = 23, 7
+    try:
+        fm = max(0, min(59, int(u.get("quiet_from_min", 0) or 0)))
+        tm = max(0, min(59, int(u.get("quiet_to_min", 0) or 0)))
+    except (TypeError, ValueError):
+        fm, tm = 0, 0
+    now = datetime.now(KYIV)
+    cur = now.hour * 60 + now.minute
+    start = fh * 60 + fm
+    end = th * 60 + tm
+    if start == end:
+        return True
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end
+
+
+def send_region_dms(message: str) -> tuple[int, int]:
+    """
+    Особисті DM підписникам з notify_prefs.region=true.
+    Повертає (sent, failed).
+    """
+    token = (os.getenv("ZTOE_BOT_TOKEN") or "").strip()
+    if not token:
+        log_to_buffer("⚠️ ZTOE_BOT_TOKEN немає — DM region пропуск")
+        return 0, 0
+
+    try:
+        from pymongo import MongoClient
+    except Exception as e:
+        log_to_buffer(f"❌ pymongo для DM: {e}")
+        return 0, 0
+
+    uri = (os.getenv("MONGO_URI") or "").strip()
+    db_name = (os.getenv("MONGO_DB") or "").strip()
+    if not uri or not db_name:
+        log_to_buffer("⚠️ Mongo URI/DB немає — DM region пропуск")
+        return 0, 0
+
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+        users = list(client[db_name]["users"].find({"notify": {"$ne": False}}))
+    except Exception as e:
+        log_to_buffer(f"❌ Mongo users для DM: {e}")
+        return 0, 0
+
+    targets = [u for u in users if _user_wants_region(u) and u.get("telegram_id")]
+    log_to_buffer(f"📬 region DM candidates: {len(targets)} (з {len(users)} notify)")
+
+    parts = _fit_html_parts(split_by_rem_blocks(message, TG_MSG_LIMIT), 4000)
+    if not parts:
+        log_to_buffer("⚠️ region DM: порожнє повідомлення після split")
+        return 0, 0
+    if len(parts) > 1:
+        log_to_buffer(f"✂️ region DM split: {len(parts)} parts, lens={[len(p) for p in parts]}")
+
+    setup_kb = json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Налаштувати 🔔",
+                        "callback_data": "pref:district_setup",
+                    }
+                ]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    sent = failed = 0
+    sent_quiet = sent_sound = 0
+    for u in targets:
+        tid = u.get("telegram_id")
+        silent = _is_quiet_now(u)
+        user_ok = True
+        try:
+            for i, part in enumerate(parts):
+                payload = {
+                    "chat_id": str(tid),
+                    "text": part,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": "true",
+                    "disable_notification": "true" if silent else "false",
+                }
+                if i == len(parts) - 1:
+                    payload["reply_markup"] = setup_kb
+                r = httpx.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    data=payload,
+                    timeout=30,
+                )
+                if not (r.status_code == 200 and (r.json() or {}).get("ok")):
+                    user_ok = False
+                    log_to_buffer(
+                        f"❌ region DM tid={tid}: HTTP {r.status_code} {r.text[:120]}"
+                    )
+                    break
+            if user_ok:
+                sent += 1
+                if silent:
+                    sent_quiet += 1
+                else:
+                    sent_sound += 1
+            else:
+                failed += 1
+        except Exception as e:
+            failed += 1
+            log_to_buffer(f"❌ region DM tid={tid}: {e}")
+
+    log_to_buffer(f"📬 region DM: sent={sent} failed={failed}")
+    log_to_buffer(
+        f"📬 region DM: sent={sent} failed={failed} (🔊={sent_sound} 🔇={sent_quiet})"
+    )
+
+    return sent, failed
+
+
+# ── District (РЕМ) CRITICAL DMs ──────────────────────────────────────────────
+# notify_prefs.district + notify_districts: окреме сповіщення по кожному РЕМ,
+# який зараз CRITICAL. Антиспам на юзері: district_alert_state[rem] = {
+#   level, notified_at, cities, streets, coverage_pct
+# }. Поки РЕМ лишається CRITICAL — не шлемо повторно. Якщо юзер увімкнув
+# пізніше (стану немає) — отримає. Коли рівень впав нижче CRITICAL — стан
+# чистимо, наступний CRITICAL знову спрацює.
+
+
+def _user_wants_district(u: dict) -> bool:
+    """notify_prefs.district (за замовч. False) і є хоча б один обраний РЕМ."""
+    if u.get("notify", True) is False:
+        return False
+    raw = u.get("notify_prefs")
+    if not isinstance(raw, dict) or not bool(raw.get("district")):
+        return False
+    return bool(_user_notify_districts(u))
+
+
+def _user_notify_districts(u: dict) -> List[str]:
+    """Нормалізовані назви РЕМ без « РЕМ» з users.notify_districts."""
+    raw = u.get("notify_districts")
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for x in raw:
+        n = _norm_rem_name(str(x or ""))
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _rem_level_code(streets: int, coverage_pct: float | None) -> Tuple[str, str, str]:
+    """(code, emoji, label) — як у bot/database._level_for_rem."""
+    if coverage_pct is not None:
+        p = float(coverage_pct)
+        if p >= 30:
+            return "CRITICAL", "🔴", "КРИТИЧНИЙ"
+        if p >= 15:
+            return "HIGH", "🟠", "СКЛАДНИЙ"
+        if p >= 5:
+            return "WARN", "🟡", "Погіршений"
+        if p > 0 or streets > 0:
+            return "NORM", "🟢", "Стабільний"
+        return "NORM", "🟢", "Стабільний"
+    n = int(streets or 0)
+    if n >= 400:
+        return "CRITICAL", "🔴", "КРИТИЧНИЙ"
+    if n >= 150:
+        return "HIGH", "🟠", "СКЛАДНИЙ"
+    if n >= 50:
+        return "WARN", "🟡", "Погіршений"
+    if n > 0:
+        return "NORM", "🟢", "Стабільний"
+    return "NORM", "🟢", "Стабільний"
+
+
+def _locative_rem(short: str) -> str:
+    """Радомишльський → Радомишльському."""
+    s = (short or "").strip()
+    if s.endswith("ий"):
+        return s[:-2] + "ому"
+    if s.endswith("ій"):
+        return s[:-2] + "ьому"
+    return s
+
+
+def critical_rems_from_stats(
+    stats: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Нормалізована назва РЕМ → entry зі stats['rem'] лише для CRITICAL.
+    Ключ без « РЕМ».
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for name, st in (stats.get("rem") or {}).items():
+        if not isinstance(st, dict):
+            continue
+        streets = int(st.get("streets") or 0)
+        if streets <= 0:
+            continue
+        cov = st.get("coverage_pct")
+        if cov is None:
+            cov = st.get("streets_pct")
+        try:
+            cov_f = float(cov) if cov is not None else None
+        except (TypeError, ValueError):
+            cov_f = None
+        code, _, _ = _rem_level_code(streets, cov_f)
+        if code != "CRITICAL":
+            continue
+        key = _norm_rem_name(name)
+        if key:
+            entry = dict(st)
+            entry["_raw_name"] = name
+            out[key] = entry
+    return out
+
+
+def format_district_critical_message(
+    rem_key: str,
+    st: Dict[str, Any],
+    as_of: datetime,
+    city_street_totals: Dict[Tuple[str, str], int] | None = None,
+) -> str:
+    """
+    Одне повідомлення про CRITICAL у конкретному РЕМ (усі н.п., без «ще N»).
+    Формат як у /district і тестовому зведенні.
+    """
+    short = _norm_rem_name(rem_key)
+    loc = _locative_rem(short)
+    streets = int(st.get("streets") or 0)
+    cities = int(st.get("cities") or 0)
+    cov = st.get("coverage_pct")
+    if cov is None:
+        cov = st.get("streets_pct")
+    try:
+        cov_f = float(cov) if cov is not None else None
+    except (TypeError, ValueError):
+        cov_f = None
+    _code, emoji, label = _rem_level_code(streets, cov_f)
+
+    streets_s = f"{streets:,}".replace(",", " ")
+    cp = st.get("cities_pct")
+    sp = st.get("streets_pct")
+    try:
+        cp_f = float(cp) if cp is not None else None
+    except (TypeError, ValueError):
+        cp_f = None
+    try:
+        sp_f = float(sp) if sp is not None else cov_f
+    except (TypeError, ValueError):
+        sp_f = cov_f
+
+    pct_bits: List[str] = []
+    if cp_f is not None:
+        pct_bits.append(f"{cp_f:.1f}% н.п.")
+    if sp_f is not None:
+        pct_bits.append(f"{min(sp_f, 100.0):.1f}% району")
+
+    lines: List[str] = [
+        f"{emoji}<b>{label}</b> стан електромереж у {loc} районі",
+        "",
+    ]
+    if pct_bits:
+        lines.append(
+            f"Аварійні відключення зараз у <b>{cities}</b> нас. п. / "
+            f"<b>{streets_s}</b> вул. ({' / '.join(pct_bits)})"
+        )
+    else:
+        lines.append(
+            f"Аварійні відключення зараз у <b>{cities}</b> нас. п. / "
+            f"<b>{streets_s}</b> вул."
+        )
+    lines.append("")
+    lines.append("⚠️ <b>Ситуація по нас.пунктах</b> (від найбільш проблемних):")
+
+    city_streets = st.get("city_streets") or {}
+    if not isinstance(city_streets, dict):
+        city_streets = {}
+    city_items = sorted(
+        ((str(c), int(n or 0)) for c, n in city_streets.items() if int(n or 0) > 0),
+        key=lambda x: -x[1],
+    )
+
+    rem_total = rem_street_denominator(st.get("_raw_name") or short, streets) or 0
+    block: List[str] = []
+    for cname, cnt_i in city_items:
+        rem_pct = (100.0 * cnt_i / rem_total) if rem_total > 0 else 0.0
+        own = None
+        if city_street_totals:
+            total = city_street_totals.get((short, (cname or "").strip()))
+            if total and int(total) > 0:
+                own = min(100.0, 100.0 * cnt_i / int(total))
+        label_c = city_label(cname)
+        if own is not None:
+            block.append(
+                f"    · {label_c} — {cnt_i} вул. "
+                f"({rem_pct:.1f}% РЕМ - {own:.1f}% нас. пункту)"
+            )
+        else:
+            block.append(
+                f"    · {label_c} — {cnt_i} вул. ({rem_pct:.1f}% РЕМ)"
+            )
+
+    if block:
+        lines.append("<blockquote expandable>")
+        lines.extend(block)
+        lines.append("</blockquote>")
+    else:
+        lines.append("<i>немає даних по населених пунктах</i>")
+
+    lines.append("")
+    lines.append("<i>Будь ласка, не користуйтесь потужними електроприладами.</i>")
+    lines.append("")
+    lines.append(f"🕐 {as_of.strftime('%H:%M %d.%m')}")
+    return "\n".join(lines)
+
+
+def _split_district_overflow_local(
+    text: str, label: str, limit: int = TG_MSG_LIMIT
+) -> List[str]:
+    """Рве довгий список н.п. одного району з рядком «продовження»."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    lines = text.split("\n")
+    parts: List[str] = []
+    buf: List[str] = []
+    open_bq = False
+    cont = f"↳ <b>{label}</b> (продовження)"
+
+    def _flush() -> None:
+        nonlocal buf, open_bq
+        if not buf:
+            return
+        body = "\n".join(buf).rstrip()
+        if open_bq and "</blockquote>" not in body:
+            body += "\n</blockquote>"
+        if body:
+            parts.append(body)
+        buf = []
+        open_bq = False
+
+    for ln in lines:
+        extra = 20 if open_bq else 0
+        candidate = buf + [ln]
+        if buf and len("\n".join(candidate)) + extra > limit:
+            _flush()
+            buf = [cont, "<blockquote expandable>"]
+            open_bq = True
+            if ln.strip() in ("</blockquote>", "<blockquote expandable>"):
+                continue
+        buf.append(ln)
+        if "<blockquote" in ln:
+            open_bq = True
+        if "</blockquote>" in ln:
+            open_bq = False
+    _flush()
+    return parts or [text[:limit]]
+
+
+def _should_notify_user_district(
+    u: dict,
+    rem_key: str,
+    st: Dict[str, Any],
+    *,
+    force: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Чи слати CRITICAL по цьому РЕМ цьому юзеру.
+    force / FORCE_NOTIFY — завжди.
+    Інакше: слати, якщо в district_alert_state немає запису з level=CRITICAL
+    (нове входження в CRITICAL або юзер щойно увімкнув сповіщення).
+    """
+    if force:
+        return True, "FORCE_NOTIFY"
+    state = u.get("district_alert_state")
+    if not isinstance(state, dict):
+        return True, "немає стану — перше сповіщення"
+    prev = state.get(rem_key)
+    if not isinstance(prev, dict):
+        return True, "немає стану по РЕМ — перше сповіщення"
+    if str(prev.get("level") or "") != "CRITICAL":
+        return True, f"попередній рівень {prev.get('level') or '—'} → CRITICAL"
+    return False, "вже сповіщали цей CRITICAL-епізод"
+
+
+def send_district_critical_dms(
+    stats: Dict[str, Any],
+    as_of: datetime,
+    city_street_totals: Dict[Tuple[str, str], int] | None = None,
+) -> Tuple[int, int]:
+    """
+    DM по кожному CRITICAL-РЕМ юзерам з notify_prefs.district.
+    Окреме повідомлення на район (спліт при довгому списку н.п.).
+    Оновлює users.district_alert_state.
+    Повертає (users_sent, users_failed).
+    """
+    token = (os.getenv("ZTOE_BOT_TOKEN") or "").strip()
+    if not token:
+        log_to_buffer("⚠️ ZTOE_BOT_TOKEN немає — DM district пропуск")
+        return 0, 0
+
+    try:
+        from pymongo import MongoClient
+    except Exception as e:
+        log_to_buffer(f"❌ pymongo для district DM: {e}")
+        return 0, 0
+
+    uri = (os.getenv("MONGO_URI") or "").strip()
+    db_name = (os.getenv("MONGO_DB") or "").strip()
+    if not uri or not db_name:
+        log_to_buffer("⚠️ Mongo URI/DB немає — DM district пропуск")
+        return 0, 0
+
+    critical = critical_rems_from_stats(stats)
+    force = (os.getenv("FORCE_NOTIFY") or "").strip().lower() in ("1", "true", "yes")
+
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+        users_col = client[db_name]["users"]
+        users = list(users_col.find({"notify": {"$ne": False}}))
+    except Exception as e:
+        log_to_buffer(f"❌ Mongo users для district DM: {e}")
+        return 0, 0
+
+    msg_by_rem: Dict[str, List[str]] = {}
+    for rem_key, st in critical.items():
+        raw = format_district_critical_message(
+            rem_key, st, as_of, city_street_totals
+        )
+        parts = _split_district_overflow_local(raw, rem_key, TG_MSG_LIMIT)
+        parts = _fit_html_parts(parts, 4000)
+        msg_by_rem[rem_key] = parts
+        log_to_buffer(
+            f"🏘️ CRITICAL {rem_key}: cities={st.get('cities')} "
+            f"streets={st.get('streets')} cov={st.get('coverage_pct')} "
+            f"parts={len(parts)} lens={[len(p) for p in parts]}"
+        )
+
+    if not critical:
+        log_to_buffer("🏘️ district DM: немає CRITICAL РЕМ — чистимо стани")
+    else:
+        log_to_buffer(
+            f"🏘️ district DM CRITICAL РЕМ: {', '.join(sorted(critical.keys()))}"
+        )
+
+    setup_kb = json.dumps(
+        {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Налаштувати 🔔",
+                        "callback_data": "pref:district_setup",
+                    }
+                ]
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    sent_users = failed_users = 0
+    sent_msgs = skipped = 0
+    critical_keys = set(critical.keys())
+
+    for u in users:
+        tid = u.get("telegram_id")
+        if not tid:
+            continue
+
+        state = u.get("district_alert_state")
+        if not isinstance(state, dict):
+            state = {}
+        else:
+            state = dict(state)
+        state_changed = False
+        for k in list(state.keys()):
+            prev = state.get(k)
+            if isinstance(prev, dict) and str(prev.get("level") or "") == "CRITICAL":
+                if k not in critical_keys:
+                    del state[k]
+                    state_changed = True
+
+        if not _user_wants_district(u):
+            if state_changed:
+                try:
+                    users_col.update_one(
+                        {"telegram_id": tid},
+                        {"$set": {"district_alert_state": state}},
+                    )
+                except Exception as e:
+                    log_to_buffer(f"⚠️ district state clear tid={tid}: {e}")
+            continue
+
+        wanted = _user_notify_districts(u)
+        to_send: List[str] = []
+        for rem_key in wanted:
+            if rem_key not in critical:
+                continue
+            ok, reason = _should_notify_user_district(
+                u, rem_key, critical[rem_key], force=force
+            )
+            if ok:
+                to_send.append(rem_key)
+            else:
+                skipped += 1
+                log_to_buffer(f"⏭ district DM tid={tid} {rem_key}: {reason}")
+
+        if not to_send and not state_changed:
+            continue
+
+        silent = _is_quiet_now(u)
+        user_sent_any = False
+        user_failed = False
+
+        for rem_key in to_send:
+            parts = msg_by_rem.get(rem_key) or []
+            if not parts:
+                continue
+            rem_ok = True
+            try:
+                for i, part in enumerate(parts):
+                    payload = {
+                        "chat_id": str(tid),
+                        "text": part,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": "true",
+                        "disable_notification": "true" if silent else "false",
+                    }
+                    if i == len(parts) - 1:
+                        payload["reply_markup"] = setup_kb
+                    r = httpx.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        data=payload,
+                        timeout=30,
+                    )
+                    if not (r.status_code == 200 and (r.json() or {}).get("ok")):
+                        rem_ok = False
+                        log_to_buffer(
+                            f"❌ district DM tid={tid} {rem_key}: "
+                            f"HTTP {r.status_code} {r.text[:120]}"
+                        )
+                        break
+            except Exception as e:
+                rem_ok = False
+                log_to_buffer(f"❌ district DM tid={tid} {rem_key}: {e}")
+
+            if rem_ok:
+                user_sent_any = True
+                sent_msgs += 1
+                st = critical[rem_key]
+                state[rem_key] = {
+                    "level": "CRITICAL",
+                    "notified_at": datetime.now(timezone.utc),
+                    "as_of": as_of.isoformat(),
+                    "cities": int(st.get("cities") or 0),
+                    "streets": int(st.get("streets") or 0),
+                    "coverage_pct": st.get("coverage_pct"),
+                }
+                state_changed = True
+            else:
+                user_failed = True
+
+        if state_changed:
+            try:
+                users_col.update_one(
+                    {"telegram_id": tid},
+                    {"$set": {"district_alert_state": state}},
+                )
+            except Exception as e:
+                log_to_buffer(f"❌ district state write tid={tid}: {e}")
+
+        if user_sent_any:
+            sent_users += 1
+        elif user_failed:
+            failed_users += 1
+
+    log_to_buffer(
+        f"📬 district DM: users_sent={sent_users} users_failed={failed_users} "
+        f"msgs={sent_msgs} skipped={skipped} critical_rems={len(critical)}"
+    )
+    return sent_users, failed_users
+
+
+# --- logging buffer (сумісно з log_utils + fallback) ---
+_log_lines: list[str] = []
+
+try:
+    from log_utils import log_to_buffer as _lu_log, send_log_to_channel as _lu_send
+    _HAS_LOG_UTILS = True
+except Exception:
+    _HAS_LOG_UTILS = False
+
+    def _lu_log(msg: str) -> None:
+        pass
+
+    def _lu_send(title: str = "", message_thread_id=None) -> None:
+        pass
+
+
+def log_to_buffer(msg: str) -> None:
+    """Пише в консоль + буфер + log_utils (якщо є)."""
+    print(msg)
+    _log_lines.append(msg)
+    try:
+        _lu_log(msg)
+    except Exception:
+        pass
+
+
+def send_log_to_channel(title: str = "📊 ЛОГ · АВАРІЇ ЖОЕ", message_thread_id: int | None = 154) -> None:
+    """
+    Шле лог у TELEGRAM_LOG_CHANNEL_ID.
+    1) пробує log_utils
+    2) fallback на httpx (якщо log_utils/requests злетіли)
+    """
+    try:
+        if _HAS_LOG_UTILS:
+            _lu_send(title, message_thread_id=message_thread_id)
+    except Exception as e:
+        print(f"log_utils send failed: {e}")
+
+    token = os.getenv("ZTOE_BOT_TOKEN") or ""
+    chat_id = os.getenv("TELEGRAM_LOG_CHANNEL_ID") or ""
+    if not token or not chat_id or not _log_lines:
+        if not chat_id:
+            print("⚠️ TELEGRAM_LOG_CHANNEL_ID не задано — лог у канал не піде")
+        elif not token:
+            print("⚠️ ZTOE_BOT_TOKEN не задано — лог у канал не піде")
+        return
+
+    try:
+        body = "\n".join(_log_lines)
+        text_msg = f"{title}\n\n<pre>{body}</pre>"
+        if len(text_msg) > 4000:
+            text_msg = text_msg[:3900] + "\n…</pre>"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = {
+                "chat_id": chat_id,
+                "text": text_msg,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "true",
+            }
+        if message_thread_id is not None:
+            data["message_thread_id"] = message_thread_id
+        r = httpx.post(
+            url,
+            data=data,
+            timeout=15,
+        )
+        if r.status_code == 200:
+            print(f"✓ Лог відправлено в {chat_id}")
+        else:
+            print(f"❌ Лог Telegram HTTP {r.status_code}: {r.text[:300]}")
+    except Exception as e:
+        print(f"❌ Лог fallback failed: {e}")
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("ztoe_accidents_summary")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+API_BASE = (os.getenv("ZTOE_API_BASE") or "").rstrip("/")
+AVARII_ZHOE = (os.getenv("AVARII_ZHOE") or "").strip()
+SUBSCRIBE = (os.getenv("SUBSCRIBE") or "").strip()
+
+# н.п. під РЕМ: показуємо окремо, якщо ≥ CITY_PCT_MIN % вулиць району
+CITY_PCT_MIN = 1.0
+CITY_LIST_MAX = 20  # захист від занадто довгого списку
+
+CITY_PREFIX = {
+    "Житомир", "Звягель", "Бердичів", "Овруч", "Коростень", "Малин",
+}
+
+# Покриття району (знаменники).
+# За замовчуванням — статичні таблиці (зріз API /pw_streets + /pw_cities, 2026-11-14).
+# Міста з карткою «АТ Житомиробленерго» розкладені по РЕМ через CITY_TO_REM.
+# Опційно: USE_DYNAMIC_DENOM=1 — перерахунок знаменника з API;
+#          USE_CITY_DIRECTORY=1 — % нас. пункту з /pw_streets.
+REM_TOTAL_STREETS: Dict[str, int] = {
+    "Житомирський": 2784,
+    "Звягельський": 2493,
+    "Овруцький": 1904,
+    "Коростенський": 1694,
+    "Попільнянський": 1419,
+    "Бердичівський": 1151,
+    "Малинський": 1126,
+    "Олевський": 890,
+    "Баранівський": 875,
+    "Черняхівський": 755,
+    "Радомишльський": 725,
+    "Чуднівський": 706,
+    "Хорошівський": 634,
+    "Любарський": 624,
+    "Коростишівський": 583,
+    "Романівський": 562,
+    "Пулинський": 524,
+    "Андрушівський": 433,
+    "Брусилівський": 357,
+}
+
+REM_TOTAL_CITIES: Dict[str, int] = {
+    # Унікальні назви н.п., у яких є вулиці в /pw_streets (без порожніх дублів).
+    "Звягельський": 221,
+    "Овруцький": 182,
+    "Коростенський": 142,
+    "Малинський": 104,
+    "Попільнянський": 92,
+    "Житомирський": 85,
+    "Радомишльський": 79,
+    "Хорошівський": 70,
+    "Бердичівський": 63,
+    "Пулинський": 63,
+    "Баранівський": 61,
+    "Олевський": 61,
+    "Чуднівський": 60,
+    "Романівський": 60,
+    "Коростишівський": 58,
+    "Черняхівський": 57,
+    "Любарський": 46,
+    "Андрушівський": 36,
+    "Брусилівський": 30,
+}
+
+# Якщо otg = АТ «Житомиробленерго» (без РЕМ) — підставляємо РЕМ за назвою н.п.
+OBLAST_TOTAL_STREETS = sum(REM_TOTAL_STREETS.values())
+OBLAST_TOTAL_CITIES = sum(REM_TOTAL_CITIES.values())
+
+CITY_TO_REM: Dict[str, str] = {
+    "Малин": "Малинський РЕМ",
+    "Житомир": "Житомирський РЕМ",
+    "Звягель": "Звягельський РЕМ",
+    "Новоград-Волинський": "Звягельський РЕМ",
+    "Бердичів": "Бердичівський РЕМ",
+    "Коростень": "Коростенський РЕМ",
+    "Овруч": "Овруцький РЕМ",
+    "Олевськ": "Олевський РЕМ",
+    "Радомишль": "Радомишльський РЕМ",
+    "Коростишів": "Коростишівський РЕМ",
+    "Андрушівка": "Андрушівський РЕМ",
+    "Баранівка": "Баранівський РЕМ",
+    "Чуднів": "Чуднівський РЕМ",
+    "Любар": "Любарський РЕМ",
+    "Романів": "Романівський РЕМ",
+    "Пулини": "Пулинський РЕМ",
+    "Черняхів": "Черняхівський РЕМ",
+    "Брусилів": "Брусилівський РЕМ",
+    "Попільня": "Попільнянський РЕМ",
+    "Хорошів": "Хорошівський РЕМ",
+    "Головине": "Черняхівський РЕМ",
+    "Іршанськ": "Хорошівський РЕМ",
+    "Великі Низгірці": "Бердичівський РЕМ",
+    # Картка API = АТ «Житомиробленерго»
+    "Нова Борова": "Хорошівський РЕМ",
+    "Лугини": "Коростенський РЕМ",
+    "Горщик": "Коростенський РЕМ",
+    "Норинськ": "Овруцький РЕМ",
+    "Громада": "Любарський РЕМ",
+    "Стрижівка": "Любарський РЕМ",
+    "Старий Любар": "Любарський РЕМ",
+    "Новогуйвинське": "Житомирський РЕМ",
+    "Осикове": "Бердичівський РЕМ",
+    "Білошиці": "Коростенський РЕМ",
+    "Чижівка": "Звягельський РЕМ",
+    "Васьковичі": "Коростенський РЕМ",
+    "Червоногранітне": "Хорошівський РЕМ",
+    "Гулянка": "Коростенський РЕМ",
+    "Демківці": "Любарський РЕМ",
+    "Пекарщина": "Черняхівський РЕМ",
+    "Понінка": "Баранівський РЕМ",
+    "Кварцитне": "Овруцький РЕМ",
+    "Ємилівка": "Овруцький РЕМ",
+}
+
+
+def _norm_rem_name(name: str) -> str:
+    """«Звягельський РЕМ» → «Звягельський»."""
+    s = (name or "").strip()
+    s = s.replace(" РЕМ", "").replace(" рем", "").strip()
+    return s
+
+
+# Живий знаменник. None — ще не завантажили, лишається статична таблиця.
+_REM_STREETS_DYNAMIC: Dict[str, int] | None = None
+_REM_CITIES_DYNAMIC: Dict[str, int] | None = None
+_OBLAST_STREETS_DYNAMIC: int | None = None
+_OBLAST_CITIES_DYNAMIC: int | None = None
+# city id → {сира назва РЕМ: скільки записів}, з усіх відключень, включно з ГПВ.
+_CITY_REM_VOTES: Dict[int, Dict[str, int]] = {}
+_CITY_REM_NAMES: Dict[int, str] = {}
+
+
+def _use_dynamic_denom() -> bool:
+    return (os.getenv("USE_DYNAMIC_DENOM") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _dyn_street_raw(key: str) -> int:
+    if _REM_STREETS_DYNAMIC is None:
+        return 0
+    return int(_REM_STREETS_DYNAMIC.get(key) or 0)
+
+
+def _dyn_city_raw(key: str) -> int:
+    if _REM_CITIES_DYNAMIC is None:
+        return 0
+    return int(_REM_CITIES_DYNAMIC.get(key) or 0)
+
+
+def rem_street_denominator(rem_name: str, affected_streets: int = 0) -> int | None:
+    """Гібридний знаменник вулиць району.
+
+    1) база — статика (зріз API);
+    2) якщо є адекватний dynamic — max(static, dynamic);
+    3) ніколи не менше affected (щоб не було «736 з 80 → 100%» від зхлопнутого знаменника).
+
+    Dynamic враховується завжди, коли вже підвантажений (USE_DYNAMIC_DENOM /
+    USE_CITY_DIRECTORY), і відкидається лише якщо підозріло малий vs static.
+    """
+    key = _norm_rem_name(rem_name)
+    static = int(REM_TOTAL_STREETS.get(key) or 0)
+    dyn = _dyn_street_raw(key)
+    affected = max(0, int(affected_streets or 0))
+
+    base = 0
+    if static > 0 and dyn > 0:
+        # dynamic «адекватний», якщо не в рази менший за статику
+        if dyn >= max(50, int(static * 0.25)):
+            base = max(static, dyn)
+        else:
+            base = static  # зламаний dynamic ігноруємо
+    elif static > 0:
+        base = static
+    elif dyn > 0:
+        base = dyn
+
+    if affected > 0:
+        base = max(base, affected)
+
+    return base if base > 0 else None
+
+
+def rem_city_denominator(rem_name: str, affected_cities: int = 0) -> int | None:
+    """Гібридний знаменник н.п. району (та сама логіка, що для вулиць)."""
+    key = _norm_rem_name(rem_name)
+    static = int(REM_TOTAL_CITIES.get(key) or 0)
+    dyn = _dyn_city_raw(key)
+    affected = max(0, int(affected_cities or 0))
+
+    base = 0
+    if static > 0 and dyn > 0:
+        if dyn >= max(5, int(static * 0.25)):
+            base = max(static, dyn)
+        else:
+            base = static
+    elif static > 0:
+        base = static
+    elif dyn > 0:
+        base = dyn
+
+    if affected > 0:
+        base = max(base, affected)
+
+    return base if base > 0 else None
+
+
+def _rem_street_total(rem_name: str) -> int | None:
+    """Скільки вулиць у районі (гібрид без урахування affected)."""
+    return rem_street_denominator(rem_name, 0)
+
+
+def _oblast_street_total() -> int:
+    if _use_dynamic_denom():
+        if _OBLAST_STREETS_DYNAMIC and _OBLAST_STREETS_DYNAMIC > 0:
+            return int(_OBLAST_STREETS_DYNAMIC)
+        if _REM_STREETS_DYNAMIC:
+            summed = sum(int(v or 0) for v in _REM_STREETS_DYNAMIC.values())
+            if summed > 0:
+                return max(summed, OBLAST_TOTAL_STREETS)
+    return OBLAST_TOTAL_STREETS
+
+
+def _rem_city_total(rem_name: str) -> int | None:
+    """Скільки н.п. у районі (гібрид без урахування affected)."""
+    return rem_city_denominator(rem_name, 0)
+
+
+def _oblast_city_total() -> int:
+    if _use_dynamic_denom():
+        if _OBLAST_CITIES_DYNAMIC and _OBLAST_CITIES_DYNAMIC > 0:
+            return int(_OBLAST_CITIES_DYNAMIC)
+        if _REM_CITIES_DYNAMIC:
+            summed = sum(int(v or 0) for v in _REM_CITIES_DYNAMIC.values())
+            if summed > 0:
+                return max(summed, OBLAST_TOTAL_CITIES)
+    return OBLAST_TOTAL_CITIES
+
+
+def rem_streets_pct(rem_name: str, affected_streets: int) -> float | None:
+    """% району: уражені вулиці / гібридний знаменник (≤ 100% у показі)."""
+    n = max(0, int(affected_streets or 0))
+    total = rem_street_denominator(rem_name, n)
+    if not total or total <= 0:
+        return None
+    return min(100.0, 100.0 * n / total)
+
+
+def rem_cities_pct(rem_name: str, affected_cities: int) -> float | None:
+    """Частка н.п. району (гібридний знаменник)."""
+    n = max(0, int(affected_cities or 0))
+    total = rem_city_denominator(rem_name, n)
+    if not total or total <= 0:
+        return None
+    return min(100.0, 100.0 * n / total)
+
+
+def rem_coverage_pct(
+    rem_name: str, affected_streets: int, affected_cities: int
+) -> tuple[float | None, str]:
+    """Сортування лише за % району: яка частка його вулиць без світла."""
+    sp = rem_streets_pct(rem_name, affected_streets)
+    if sp is None:
+        return None, "streets"
+    return min(float(sp), 100.0), "streets"
+
+
+def _is_oblenergo(otg_name: str) -> bool:
+    """АТ «Житомиробленерго» без конкретного РЕМ."""
+    s = (otg_name or "").lower()
+    return "житомиробленерго" in s and "рем" not in s
+
+
+def _ref_id(value: Any) -> int | None:
+    """id з int, з об'єкта API або з IRI виду /api/pw_cities/214."""
+    if isinstance(value, dict):
+        value = value.get("id") if value.get("id") is not None else value.get("@id")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value:
+        tail = value.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            return int(tail)
+        except ValueError:
+            return None
+    return None
+
+
+def _accident_place(accident: dict) -> Tuple[str, str, int | None]:
+    """РЕМ (як у зведенні), назва н.п. і city id з аварії."""
+    city = accident.get("city") or {}
+    otg = accident.get("otg") or {}
+    cname = (city.get("name") or "").strip() or "?"
+    cid = _ref_id(city)
+    oname = (otg.get("name") or "").strip() or "?"
+    # АТ «Житомиробленерго» без конкретного РЕМ.
+    # Спочатку РЕМ, у якому цей самий city id уже є (Нова Борова → Хорошівський).
+    # Список CITY_TO_REM — лише якщо інших записів по селу немає.
+    if _is_oblenergo(oname):
+        mapped = _rem_from_city_votes(cid)
+        if not mapped:
+            mapped = CITY_TO_REM.get(cname)
+        oname = mapped if mapped else "Інше (обленерго)"
+    return oname, cname, cid
+
+
+def _fetch_collection(client: httpx.Client, path: str) -> List[dict]:
+    r = client.get(f"{API_BASE}{path}", params={"pagination": "false"})
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        return data
+    return list(data.get("hydra:member") or [])
+
+
+def city_street_totals_from(
+    accidents: List[dict], per_city: Dict[int, int]
+) -> Dict[Tuple[str, str], int]:
+    """
+    (нормалізований РЕМ, назва н.п.) → скільки вулиць у довіднику.
+
+    Беремо city id з самої аварії, а не otg з картки міста: у дублів
+    (Калинівка, Сколобів, Добринь) картка числиться в іншому РЕМ,
+    хоча відключення приходить уже з Хорошівського.
+    """
+    ids: Dict[Tuple[str, str], Set[int]] = defaultdict(set)
+    for accident in accidents:
+        oname, cname, cid = _accident_place(accident)
+        if not cname or cname == "?" or cid is None:
+            continue
+        ids[(_norm_rem_name(oname), cname)].add(cid)
+
+    totals: Dict[Tuple[str, str], int] = {}
+    for key, cids in ids.items():
+        n = sum(int(per_city.get(cid) or 0) for cid in cids)
+        if n > 0:
+            totals[key] = n
+    return totals
+
+
+def _prefer_real_rem(votes: Dict[str, int]) -> str | None:
+    """Більшість записів. Справжній РЕМ важливіший за голе «обленерго»."""
+    if not votes:
+        return None
+    real = [(n, c) for n, c in votes.items() if n and not _is_oblenergo(n)]
+    pool = real or [(n, c) for n, c in votes.items() if n]
+    if not pool:
+        return None
+    pool.sort(key=lambda x: (-x[1], x[0]))
+    return pool[0][0]
+
+
+def _rem_from_city_votes(cid: int | None) -> str | None:
+    """РЕМ, який уже стоїть у відключеннях цього city id. Не назва з картки."""
+    if cid is None:
+        return None
+    winner = _prefer_real_rem(_CITY_REM_VOTES.get(cid) or {})
+    if winner and not _is_oblenergo(winner):
+        return winner
+    return None
+
+
+def resolve_city_rem(
+    card_otg: str, card_name: str, votes: Dict[str, int] | None
+) -> str | None:
+    """
+    Куди класти вулиці міста в знаменник району.
+
+    Є відключення по цьому city id — РЕМ беремо з них, картку ігноруємо.
+    Окремий виняток на село не потрібен.
+    Картка лишається лише для сіл, яких зараз немає в жодному відключенні.
+    """
+    winner = _prefer_real_rem(votes or {})
+    if winner and _is_oblenergo(winner):
+        winner = CITY_TO_REM.get((card_name or "").strip()) or ""
+    if winner:
+        return winner
+    name = (card_otg or "").strip()
+    if not name:
+        return None
+    if _is_oblenergo(name):
+        return CITY_TO_REM.get((card_name or "").strip()) or None
+    return name
+
+
+def rem_street_totals_from(
+    per_city: Dict[int, int],
+    cards: Dict[int, Tuple[str, str]],
+    votes: Dict[int, Dict[str, int]],
+) -> Tuple[Dict[str, int], Dict[str, int], List[Tuple[int, str, str, str]]]:
+    """
+    Нормалізований РЕМ → вулиці району і кількість н.п.
+    Третє значення — села, чия картка вказує інший РЕМ, ніж відключення.
+    """
+    totals: Dict[str, int] = defaultdict(int)
+    city_totals: Dict[str, int] = defaultdict(int)
+    moves: List[Tuple[int, str, str, str]] = []
+    for cid, nstreets in per_city.items():
+        nstreets = int(nstreets or 0)
+        if nstreets <= 0:
+            continue
+        cname, cotg = cards.get(cid, ("", ""))
+        if not cname:
+            cname = _CITY_REM_NAMES.get(cid, "")
+        chosen = resolve_city_rem(cotg, cname, votes.get(cid))
+        if not chosen:
+            continue
+        key = _norm_rem_name(chosen)
+        totals[key] += nstreets
+        if (cname or "").strip() not in ("", "?", "Невідомо"):
+            city_totals[key] += 1
+        if cotg and not _is_oblenergo(cotg) and _norm_rem_name(cotg) != key:
+            moves.append((nstreets, cname or str(cid), cotg, chosen))
+    moves.sort(key=lambda row: -row[0])
+    return dict(totals), dict(city_totals), moves
+
+
+def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int]:
+    """
+    Вулиці н.п. з /pw_streets — для «% нас. пункту» в рядках сіл.
+
+    Завжди тягнемо /pw_streets (потрібно для % нас. пункту).
+    /pw_cities + dynamic-знаменник РЕМ — лише при USE_DYNAMIC_DENOM=1
+    (гібрид і так бере статику; dynamic лише як підстраховка).
+    """
+    global _REM_STREETS_DYNAMIC, _REM_CITIES_DYNAMIC, _OBLAST_STREETS_DYNAMIC, _OBLAST_CITIES_DYNAMIC
+    if not API_BASE or not accidents:
+        return {}
+
+    use_dyn = (os.getenv("USE_DYNAMIC_DENOM") or "").strip().lower() in ("1", "true", "yes")
+
+    headers = {
+        "Accept": "application/ld+json",
+        "User-Agent": "ztoe-accidents-summary/1.3",
+    }
+    cities: List[dict] = []
+    try:
+        with httpx.Client(timeout=180, headers=headers) as client:
+            streets = _fetch_collection(client, "/pw_streets")
+            if use_dyn:
+                try:
+                    cities = _fetch_collection(client, "/pw_cities")
+                except Exception as e:
+                    log_to_buffer(
+                        f"⚠️ Довідник міст недоступний, % району зі статичного: {e}"
+                    )
+    except Exception as e:
+        log_to_buffer(f"⚠️ Довідник вулиць н.п. недоступний: {e}")
+        return {}
+
+    per_city: Dict[int, int] = defaultdict(int)
+    for street in streets:
+        cid = _ref_id(street.get("city"))
+        if cid is None:
+            continue
+        per_city[cid] += 1
+
+    totals = city_street_totals_from(accidents, per_city)
+    log_to_buffer(
+        f"Довідник вулиць н.п.: {len(totals)} (streets={len(streets)})"
+    )
+
+    if use_dyn and cities:
+        cards: Dict[int, Tuple[str, str]] = {}
+        for city in cities:
+            cid = _ref_id(city)
+            if cid is None:
+                continue
+            otg = city.get("otg") or {}
+            oname = (otg.get("name") or "").strip() if isinstance(otg, dict) else ""
+            cards[cid] = ((city.get("name") or "").strip(), oname)
+        rem_totals, city_totals, moves = rem_street_totals_from(
+            per_city, cards, _CITY_REM_VOTES
+        )
+        if rem_totals:
+            _REM_STREETS_DYNAMIC = rem_totals
+            _REM_CITIES_DYNAMIC = city_totals
+            _OBLAST_STREETS_DYNAMIC = sum(int(v or 0) for v in per_city.values())
+            _OBLAST_CITIES_DYNAMIC = sum(int(v or 0) for v in city_totals.values())
+            moved_streets = sum(row[0] for row in moves)
+            log_to_buffer(
+                f"Довідник районів: {sum(rem_totals.values())} вул. у {len(rem_totals)} РЕМ "
+                f"(усіх вулиць {_OBLAST_STREETS_DYNAMIC}, "
+                f"перенесено з чужої картки {moved_streets} вул. / {len(moves)} н.п.)"
+            )
+            if moves:
+                sample = ", ".join(
+                    f"{cname}: {_norm_rem_name(src)}→{_norm_rem_name(dst)} ({n})"
+                    for n, cname, src, dst in moves[:5]
+                )
+                log_to_buffer(f"  не той РЕМ у картці, рахуємо за аварією: {sample}")
+    return totals
+
+
+
+
+# Рівень по кількості населених пунктів (область ~1400 н.п.)
+# 🟢 NORM     < 30
+# 🟡 WARN     30–150
+# 🟠 HIGH     150–400
+# 🔴 CRITICAL > 400
+LEVEL_ORDER = {"NORM": 0, "WARN": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+def level_from_cities(total_cities: int) -> Tuple[str, str, str]:
+    """Повертає (code, emoji, label_uk).
+
+    Код (NORM/WARN/HIGH/CRITICAL) — для антиспаму в Mongo.
+    label_uk — для повідомлення в канал (варіант A).
+    """
+    n = int(total_cities or 0)
+    if n > 400:
+        return "CRITICAL", "🔴", "КРИТИЧНИЙ"
+    if n >= 150:
+        return "HIGH", "🟠", "СКЛАДНИЙ"
+    if n >= 30:
+        return "WARN", "🟡", "Погіршений"
+    return "NORM", "🟢", "Стабільний"
+
+
+def get_mongo_col():
+    """Колекція accidents_summary або None."""
+    uri = os.getenv("MONGO_URI")
+    if not uri:
+        return None
+    db_name = os.getenv("MONGO_DB") or "vidkluchennya"
+    try:
+        from pymongo import MongoClient
+
+        client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+        return client[db_name]["accidents_summary"]
+    except Exception as e:
+        log_to_buffer(f"⚠️ Mongo connect failed: {e}")
+        return None
+
+
+def load_latest_summary() -> dict | None:
+    col = get_mongo_col()
+    if col is None:
+        return None
+    try:
+        return col.find_one({"_id": "latest"})
+    except Exception as e:
+        log_to_buffer(f"⚠️ Mongo read latest failed: {e}")
+        return None
+
+
+def should_notify_channel(
+    level: str,
+    prev: dict | None,
+    as_of: datetime,
+) -> Tuple[bool, str]:
+    """
+    Mongo — завжди. Канал — без щогодинного спаму.
+
+    1) FORCE_NOTIFY=1/true/yes — завжди слати
+    2) Рівень CRITICAL і ескалація (або перше за день) — слати
+    3) Всі інші рівні (NORM / WARN / HIGH) — у канал не слати
+    """
+    force = (os.getenv("FORCE_NOTIFY") or "").strip().lower() in ("1", "true", "yes")
+    if force:
+        return True, "FORCE_NOTIFY"
+
+    rank = LEVEL_ORDER.get(level, 0)
+    today = as_of.strftime("%Y-%m-%d")
+    prev = prev or {}
+
+    last_date = str(prev.get("last_notified_date") or "")[:10]
+    last_notified_level = prev.get("last_notified_level") or ""
+    last_rank = (
+        LEVEL_ORDER.get(last_notified_level, -1) if last_notified_level else -1
+    )
+
+    # Тільки CRITICAL
+    if rank < LEVEL_ORDER["CRITICAL"]:
+        return False, f"рівень {level}, у канал не шлемо (тільки CRITICAL)"
+
+    # Ескалація до CRITICAL (навіть якщо вже писали сьогодні)
+    if rank > last_rank:
+        return True, f"ескалація {last_notified_level or '—'} → {level}"
+
+    # Сьогодні вже є сповіщення — не спамимо
+    if last_date == today and last_rank >= 0:
+        return False, f"вже сповіщали сьогодні ({last_notified_level}, {last_date})"
+
+    # Перше за день при CRITICAL
+    return True, f"перше сповіщення за день, рівень {level}"
+
+
+def severity_emoji(streets: int = 0, coverage_pct: float | None = None) -> str:
+    """
+    Колір за % покриття району (як сортування).
+    Якщо % немає — fallback на абсолютну кількість вулиць.
+    """
+    if coverage_pct is not None:
+        p = float(coverage_pct)
+        if p >= 30:
+            return "🔴"
+        if p >= 15:
+            return "🟠"
+        if p >= 5:
+            return "🟡"
+        if p > 0:
+            return "🟢"
+        return "⚪"
+    n = int(streets or 0)
+    if n >= 400:
+        return "🔴"
+    if n >= 150:
+        return "🟠"
+    if n >= 50:
+        return "🟡"
+    if n > 0:
+        return "🟢"
+    return "⚪"
+
+
+def city_label(name: str) -> str:
+    if name in CITY_PREFIX:
+        return f"м. {name}"
+    return name
+
+
+
+def is_real_accident(doc: dict) -> bool:
+    """
+    True лише для справжніх аварій / ГАВ / СГАВ.
+    ГПВ (графік погодинних) і явні згадки ГПВ у коментарі — відкидаємо.
+
+    Логіка як у bot_notify._classify_outage:
+      switchSubReason: 1=ГАВ, 2=ГПВ(ігнор), 3=СГАВ
+      typeOff (якщо sub==0): 1=аварійне
+    """
+    koment = (doc.get("koment") or doc.get("comment") or "").upper()
+    if "ГПВ" in koment:
+        return False
+
+    # текстовий тип з API / таблиці
+    type_name = (
+        doc.get("type_name")
+        or doc.get("typeName")
+        or doc.get("typeOffName")
+        or ""
+    )
+    if isinstance(type_name, str):
+        tn = type_name.lower()
+        if "погодин" in tn or "гпв" in tn:
+            return False
+
+    try:
+        sub = int(doc.get("switchSubReason") or 0)
+    except (TypeError, ValueError):
+        sub = 0
+    try:
+        t = int(doc.get("typeOff")) if doc.get("typeOff") is not None else -1
+    except (TypeError, ValueError):
+        t = -1
+
+    if sub == 2:
+        return False  # ГПВ
+    if sub in (1, 3):
+        return True   # ГАВ / СГАВ
+    if sub > 0:
+        # невідомий sub — не рахуємо як аварію
+        return False
+
+    # sub == 0 → дивимось typeOff
+    return t == 1
+
+
+def _note_city_rems(accidents: List[dict]) -> None:
+    """city id → РЕМ з усіх записів API, включно з ГПВ. Картку міста не чіпаємо."""
+    global _CITY_REM_VOTES, _CITY_REM_NAMES
+    votes: Dict[int, Dict[str, int]] = {}
+    names: Dict[int, str] = {}
+    for accident in accidents:
+        city = accident.get("city") or {}
+        otg = accident.get("otg") or {}
+        cid = _ref_id(city)
+        if cid is None:
+            continue
+        cname = (city.get("name") or "").strip() if isinstance(city, dict) else ""
+        oname = (otg.get("name") or "").strip() if isinstance(otg, dict) else ""
+        if not oname:
+            continue
+        bucket = votes.setdefault(cid, {})
+        bucket[oname] = bucket.get(oname, 0) + 1
+        if cname:
+            names[cid] = cname
+    _CITY_REM_VOTES = votes
+    _CITY_REM_NAMES = names
+
+
+def fetch_all_accidents() -> List[dict]:
+
+    if not API_BASE:
+        raise SystemExit("Немає ZTOE_API_BASE")
+
+    headers = {
+        "Accept": "application/ld+json",
+        "User-Agent": "ztoe-accidents-summary/1.3",
+    }
+    items: List[dict] = []
+
+    with httpx.Client(timeout=60, headers=headers) as client:
+        try:
+            r = client.get(
+                f"{API_BASE}/pw_accidents",
+                params={"pagination": "false"},
+            )
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                log_to_buffer(f"API: list → {len(data)} записів")
+                _note_city_rems(data)
+                filtered = [x for x in data if is_real_accident(x)]
+                log_to_buffer(
+                    f"Фільтр аварій: {len(data)} → {len(filtered)} "
+                    f"(відкинуто ГПВ/не-аварії: {len(data) - len(filtered)})"
+                )
+                return filtered
+            batch = data.get("hydra:member") or []
+            if batch:
+                log_to_buffer(f"API: pagination=false → {len(batch)} записів")
+                _note_city_rems(batch)
+                filtered = [x for x in batch if is_real_accident(x)]
+                log_to_buffer(
+                    f"Фільтр аварій: {len(batch)} → {len(filtered)} "
+                    f"(відкинуто ГПВ/не-аварії: {len(batch) - len(filtered)})"
+                )
+                return filtered
+        except Exception as e:
+            log_to_buffer(f"⚠️ pagination=false failed: {e} — сторінки")
+
+        page = 1
+        while page <= 100:
+            r = client.get(
+                f"{API_BASE}/pw_accidents",
+                params={"page": page, "itemsPerPage": 100},
+            )
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                items.extend(data)
+                break
+            batch = data.get("hydra:member") or []
+            items.extend(batch)
+            if not (data.get("hydra:view") or {}).get("hydra:next") or not batch:
+                break
+            page += 1
+        log_to_buffer(f"API: по сторінках → {len(items)} записів (сторінок: {page})")
+
+    _note_city_rems(items)
+    raw_n = len(items)
+    items = [a for a in items if is_real_accident(a)]
+    log_to_buffer(
+        f"Фільтр аварій: {raw_n} → {len(items)} "
+        f"(відкинуто ГПВ/не-аварії: {raw_n - len(items)})"
+    )
+    return items
+
+
+def aggregate(
+    accidents: List[dict],
+    city_street_totals: Dict[Tuple[str, str], int] | None = None,
+) -> Dict[str, Any]:
+    """
+    rem[name] = {
+      records, streets(set), cities(set),
+      city_streets: {city_name: set(street_keys)}
+    }
+    """
+    all_streets: Set[Any] = set()
+    all_cities: Set[Any] = set()
+    zhytomyr_streets: Set[Any] = set()
+
+    rem: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "records": 0,
+            "streets": set(),
+            "cities": set(),
+            "city_streets": defaultdict(set),
+        }
+    )
+
+    for a in accidents:
+        street = a.get("street") or {}
+        oname, cname, cid = _accident_place(a)
+        sid = street.get("id")
+
+        street_key = sid if sid is not None else (cname, street.get("name"))
+        city_key = cid if cid is not None else cname
+
+        all_streets.add(street_key)
+        all_cities.add(city_key)
+
+        if cname == "Житомир":
+            zhytomyr_streets.add(street_key)
+
+        rem[oname]["records"] += 1
+        rem[oname]["streets"].add(street_key)
+        rem[oname]["cities"].add(city_key)
+        rem[oname]["city_streets"][cname].add(street_key)
+
+    # серіалізація для Mongo / форматування
+    rem_out: Dict[str, Any] = {}
+    for name, st in rem.items():
+        city_counts = {
+            c: len(sids) for c, sids in st["city_streets"].items()
+        }
+        streets_n = len(st["streets"])
+        cities_n = len(st["cities"])
+        sp = rem_streets_pct(name, streets_n)
+        cp = rem_cities_pct(name, cities_n)
+        cov, cov_kind = rem_coverage_pct(name, streets_n, cities_n)
+        entry: Dict[str, Any] = {
+            "records": st["records"],
+            "streets": streets_n,
+            "cities": cities_n,
+            "city_streets": city_counts,
+        }
+        if sp is not None:
+            entry["streets_pct"] = round(sp, 1)
+            entry["streets_total"] = rem_street_denominator(name, streets_n)
+        if cp is not None:
+            entry["cities_pct"] = round(cp, 1)
+            entry["cities_total"] = rem_city_denominator(name, cities_n)
+        if cov is not None:
+            entry["coverage_pct"] = round(cov, 1)
+            entry["coverage_kind"] = cov_kind
+        # для /district: % нас. пункту
+        if city_street_totals:
+            rem_key = _norm_rem_name(name)
+            ct = {
+                cname: int(n)
+                for (rk, cname), n in city_street_totals.items()
+                if rk == rem_key and int(n or 0) > 0
+            }
+            if ct:
+                entry["city_totals"] = ct
+        rem_out[name] = entry
+
+    return {
+        "total_records": len(accidents),
+        "total_streets": len(all_streets),
+        "total_cities": len(all_cities),
+        "zhytomyr_streets": len(zhytomyr_streets),
+        "rem": rem_out,
+    }
+
+
+def format_message(
+    stats: Dict[str, Any],
+    as_of: datetime,
+    level_meta: Tuple[str, str, str] | None = None,
+    city_street_totals: Dict[Tuple[str, str], int] | None = None,
+) -> str:
+    time_full = as_of.strftime("%d.%m.%Y %H:%M")
+    time_short = as_of.strftime("%H:%M %d.%m")
+
+    total_cities = stats["total_cities"]
+    total_streets = stats["total_streets"]
+
+    if level_meta is None:
+        level_meta = level_from_cities(total_cities)
+    _level_code, level_emoji, level_label = level_meta
+
+    cities_pct_obl = None
+    streets_pct_obl = None
+    if _oblast_city_total() > 0:
+        cities_pct_obl = min(
+            100.0, 100.0 * int(total_cities or 0) / _oblast_city_total()
+        )
+    if _oblast_street_total() > 0:
+        streets_pct_obl = min(
+            100.0, 100.0 * int(total_streets or 0) / _oblast_street_total()
+        )
+
+    header_counts = (
+        f"Аварійні відключення зараз у <b>{total_cities}</b> населених пунктах "
+        f"(загалом <b>{total_streets:,}</b> вулиць)"
+    ).replace(",", " ")
+    if cities_pct_obl is not None and streets_pct_obl is not None:
+        header_counts += (
+            f" — <b>{cities_pct_obl:.1f}%</b> н.п. / <b>{streets_pct_obl:.1f}%</b> вул. області"
+        )
+    header_counts += "."
+
+    lines: List[str] = [
+        f"{level_emoji}<b>{level_label}</b> стан електромереж у Житомирській області",
+        "",
+        header_counts,
+        "",
+        "⚠️ <b>Ситуація по РЕМ</b> (від найбільш проблемних):",
+    ]
+
+    def _rem_sort_key(item: Tuple[str, dict]) -> Tuple[float, int, int, int]:
+        """Спочатку за % району (частка вулиць без світла), далі за кількістю."""
+        name, st = item
+        streets = int(st.get("streets") or 0)
+        cities = int(st.get("cities") or 0)
+        pct = st.get("coverage_pct")
+        if pct is None:
+            pct, _ = rem_coverage_pct(name, streets, cities)
+        pct_v = float(pct) if pct is not None else -1.0
+        return (
+            -pct_v,
+            -streets,
+            -cities,
+            -int(st.get("records") or 0),
+        )
+
+    rem_sorted = sorted(stats["rem"].items(), key=_rem_sort_key)
+
+    block: List[str] = []
+    for name, st in rem_sorted:
+        if st["streets"] == 0:
+            continue
+        short = name.replace(" РЕМ", "").strip()
+        streets_s = f"{st['streets']:,}".replace(",", " ")
+
+        cp = st.get("cities_pct")
+        sp = st.get("streets_pct")
+        if cp is None:
+            cp = rem_cities_pct(name, st["cities"])
+        if sp is None:
+            sp = rem_streets_pct(name, st["streets"])
+
+        cov = st.get("coverage_pct")
+        if cov is None:
+            cov, _ = rem_coverage_pct(name, st["streets"], st["cities"])
+        emoji = severity_emoji(st["streets"], coverage_pct=cov)
+
+        pct_parts: List[str] = []
+        if cp is not None:
+            pct_parts.append(f"{cp:.1f}% н.п.")
+        if sp is not None:
+            pct_parts.append(f"{min(float(sp), 100.0):.1f}% району")
+        if pct_parts:
+            block.append(
+                f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
+                f"{streets_s} вул. ({' / '.join(pct_parts)})"
+            )
+        else:
+            block.append(
+                f"{emoji} <b>{short}</b> — {st['cities']} нас.п. / "
+                f"{streets_s} вул."
+            )
+
+        city_items = sorted(
+            st.get("city_streets", {}).items(),
+            key=lambda x: -x[1],
+        )
+        rem_total = _rem_street_total(name)
+        rem_affected = int(st.get("streets") or 0) or 1
+
+        def _city_pct(cnt_i: int) -> float:
+            if rem_total and rem_total > 0:
+                return 100.0 * cnt_i / rem_total
+            return 100.0 * cnt_i / rem_affected
+
+        def _own_pct(cname: str, cnt_i: int) -> float | None:
+            """Частка вимкнених вулиць у самому населеному пункті."""
+            if not city_street_totals or cnt_i <= 0:
+                return None
+            total = city_street_totals.get(
+                (_norm_rem_name(name), (cname or "").strip())
+            )
+            if not total or total <= 0:
+                return None
+            return min(100.0, 100.0 * cnt_i / total)
+
+        def _fmt_np_line(cname: str, cnt_i: int) -> str:
+            bits = [f"{_city_pct(cnt_i):.1f}% РЕМ"]
+            own = _own_pct(cname, cnt_i)
+            if own is not None:
+                bits.append(f"{own:.1f}% нас. пункту")
+            return (
+                f"    · {city_label(cname)} — {cnt_i} вул. "
+                f"({' - '.join(bits)})"
+            )
+
+        def _own_pct_many(items: List[Tuple[str, int]]) -> float | None:
+            """Сумарна частка вимкнених вулиць по кількох н.п. разом."""
+            if not city_street_totals or not items:
+                return None
+            total = 0
+            affected = 0
+            rem_key = _norm_rem_name(name)
+            for cname, cnt_i in items:
+                known = city_street_totals.get((rem_key, (cname or "").strip()))
+                if not known or known <= 0:
+                    return None
+                total += int(known)
+                affected += int(cnt_i or 0)
+            if total <= 0 or affected <= 0:
+                return None
+            return min(100.0, 100.0 * affected / total)
+
+        # окремо — н.п. з ≥ CITY_PCT_MIN % вулиць району; дрібні → «ще N»
+        shown: list = []
+        rest: list = []
+        for cname, cnt in city_items:
+            cnt_i = int(cnt or 0)
+            if _city_pct(cnt_i) >= CITY_PCT_MIN and len(shown) < CITY_LIST_MAX:
+                shown.append((cname, cnt_i))
+            else:
+                rest.append((cname, cnt_i))
+
+        for cname, cnt_i in shown:
+            block.append(_fmt_np_line(cname, cnt_i))
+
+        if rest:
+            # < CITY_PCT_MIN: один н.п. → лише назва; кілька → назва + «ще N»
+            if len(rest) == 1:
+                cname, cnt_i = rest[0]
+                if cnt_i > 0:
+                    block.append(_fmt_np_line(cname, cnt_i))
+            else:
+                first_name, _first_cnt = rest[0]
+                more = len(rest) - 1
+                rest_streets = sum(c for _, c in rest)
+                if rest_streets > 0:
+                    bits = [f"{_city_pct(rest_streets):.1f}% РЕМ"]
+                    own = _own_pct_many(rest)
+                    if own is not None:
+                        bits.append(f"{own:.1f}% нас. пункту")
+                    block.append(
+                        f"    · {city_label(first_name)} + ще {more} нас.п. — "
+                        f"{rest_streets} вул. ({' - '.join(bits)})"
+                    )
+
+    if block:
+        lines.append("<blockquote expandable>")
+        lines.extend(block)
+        lines.append("</blockquote>")
+    else:
+        lines.append("<i>немає даних</i>")
+
+    lines.append("")
+
+    # Лише для CRITICAL — заклик після блоку РЕМ, перед легендою
+    if _level_code == "CRITICAL":
+        lines.append("<i>Будь ласка, не користуйтесь потужними електроприладами.</i>")
+        lines.append("")
+
+    lines.append("<blockquote expandable>")
+    lines.append("ℹ️ <b>Як читати відсотки</b>")
+    lines.append("• шапка — частка <b>області</b>: % н.п. (населені пункти) і % вул. (вулиці)")
+    lines.append(
+        "• рядок РЕМ: село в тому РЕМ, який стоїть у відключеннях, не в картці "
+        "(Коростень — Коростенський). <b>% н.п.</b> — частка населених пунктів цього РЕМ; "
+        "<b>% району</b> — яка частка його вулиць зараз без світла. "
+        "Порядок — від найбільшого % району"
+    )
+    lines.append(
+        "• рядок н.п.: <b>% РЕМ</b> — внесок пункту у вулиці району; "
+        "<b>% нас. пункту</b> — яка частка вулиць самого пункту зараз без світла"
+    )
+    lines.append("</blockquote>")
+    lines.append("")
+
+    footer_parts: List[str] = []
+    if AVARII_ZHOE:
+        footer_parts.append(f'<a href="{AVARII_ZHOE}">🔗 Сайт "ЖОЕ"</a>')
+    if SUBSCRIBE:
+        footer_parts.append(f'<a href="{SUBSCRIBE}">⚡️ ПІДПИСАТИСЯ</a>')
+    if footer_parts:
+        lines.append("  ".join(footer_parts))
+    lines.append(f"🕐 {time_short}")
+
+    return '\n'.join(lines)
+
+
+
+def save_to_mongo(
+    stats: Dict[str, Any],
+    as_of: datetime,
+    message: str,
+    *,
+    level: str,
+    level_emoji: str,
+    notified: bool,
+    prev: dict | None = None,
+) -> None:
+    """
+    Завжди пише latest + історію по годині.
+    notified=True → оновлює last_notified_* (антиспам на день).
+    notified=False → зберігає попередні last_notified_* з prev.
+    """
+    col = get_mongo_col()
+    if col is None:
+        log_to_buffer("⚠️ Немає MONGO_URI — пропускаємо запис у Mongo")
+        return
+
+    db_name = os.getenv("MONGO_DB") or "vidkluchennya"
+
+    try:
+        prev = prev or {}
+        today = as_of.strftime("%Y-%m-%d")
+
+        if notified:
+            last_notified_date = today
+            last_notified_level = level
+            last_notified_at = datetime.now(timezone.utc)
+            last_notified_cities = stats["total_cities"]
+        else:
+            last_notified_date = prev.get("last_notified_date")
+            last_notified_level = prev.get("last_notified_level")
+            last_notified_at = prev.get("last_notified_at")
+            last_notified_cities = prev.get("last_notified_cities")
+
+        oc_pct = None
+        os_pct = None
+        if _oblast_city_total() > 0:
+            oc_pct = round(
+                min(100.0, 100.0 * int(stats["total_cities"] or 0) / _oblast_city_total()),
+                1,
+            )
+        if _oblast_street_total() > 0:
+            os_pct = round(
+                min(100.0, 100.0 * int(stats["total_streets"] or 0) / _oblast_street_total()),
+                1,
+            )
+
+        doc = {
+            "_id": "latest",
+            "as_of": as_of.isoformat(),
+            "as_of_utc": datetime.now(timezone.utc),
+            "total_records": stats["total_records"],
+            "total_streets": stats["total_streets"],
+            "total_cities": stats["total_cities"],
+            "zhytomyr_streets": stats["zhytomyr_streets"],
+            "oblast_cities_pct": oc_pct,
+            "oblast_streets_pct": os_pct,
+            "rem": stats["rem"],
+            "message": message,
+            "level": level,
+            "level_emoji": level_emoji,
+            "updated_at": datetime.now(timezone.utc),
+            "last_notified_date": last_notified_date,
+            "last_notified_level": last_notified_level,
+            "last_notified_at": last_notified_at,
+            "last_notified_cities": last_notified_cities,
+        }
+        col.update_one({"_id": "latest"}, {"$set": doc}, upsert=True)
+
+        history_id = as_of.strftime("%Y-%m-%dT%H")
+        hist = {k: v for k, v in doc.items() if k != "_id"}
+        hist["_id"] = history_id
+        col.update_one({"_id": history_id}, {"$set": hist}, upsert=True)
+
+        log_to_buffer(
+            f"🗄 Mongo: {db_name}.accidents_summary (latest + {history_id}), "
+            f"level={level}, notified={notified}"
+        )
+    except Exception as e:
+        log_to_buffer(f"❌ Mongo write failed: {e}")
+
+
+
+def main() -> int:
+    log_to_buffer("=" * 40)
+    log_to_buffer("🚀 СТАРТ · Зведення аварій ЖОЕ")
+    log_to_buffer(f"ZTOE_API_BASE={'задано' if API_BASE else 'НЕМАЄ'}")
+    log_to_buffer(
+        f"AVARII_ZHOE={'є' if AVARII_ZHOE else 'немає'} · "
+        f"SUBSCRIBE={'є' if SUBSCRIBE else 'немає'}"
+    )
+    force = (os.getenv("FORCE_NOTIFY") or "").strip()
+    if force:
+        log_to_buffer(f"FORCE_NOTIFY={force}")
+
+    try:
+        accidents = fetch_all_accidents()
+    except Exception as e:
+        log_to_buffer(f"❌ Fetch failed: {e}")
+        send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ (помилка)", message_thread_id=154)
+        return 1
+
+    as_of = datetime.now(KYIV)
+    prev = load_latest_summary()
+
+    if not accidents:
+        log_to_buffer("⚠️ Порожня відповідь API")
+        stats = {
+            "total_records": 0,
+            "total_streets": 0,
+            "total_cities": 0,
+            "zhytomyr_streets": 0,
+            "rem": {},
+        }
+        level, level_emoji, level_label = level_from_cities(0)
+        msg = (
+            f"{level_emoji}<b>{level_label}</b> стан електромереж у Житомирській області\n\n"
+            "Зараз аварійних відключень за даними API немає."
+        )
+        if AVARII_ZHOE or SUBSCRIBE:
+            parts = []
+            if AVARII_ZHOE:
+                parts.append(f'<a href="{AVARII_ZHOE}">🔗 Сайт "ЖОЕ"</a>')
+            if SUBSCRIBE:
+                parts.append(f'<a href="{SUBSCRIBE}">⚡️ ПІДПИСАТИСЯ</a>')
+            msg += "\n\n" + "  ".join(parts)
+            msg += f"\n🕐 {as_of.strftime('%H:%M %d.%m')}"
+
+        do_notify, reason = should_notify_channel(level, prev, as_of)
+        log_to_buffer(f"📢 notify={do_notify} ({reason})")
+        save_to_mongo(
+            stats, as_of, msg,
+            level=level, level_emoji=level_emoji,
+            notified=False,  # порожньо / NORM — не ставимо мітку «вже слали»
+            prev=prev,
+        )
+        # немає аварій → скинути district CRITICAL-стани в users
+        try:
+            send_district_critical_dms(stats, as_of, None)
+        except Exception as e:
+            log_to_buffer(f"❌ district DM clear failed: {e}")
+        # при порожньому API в канал не шлемо (база оновлена)
+        send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ", message_thread_id=154)
+        return 0
+
+    city_street_totals = fetch_city_street_totals(accidents)
+    stats = aggregate(accidents, city_street_totals)
+    level, level_emoji, level_label = level_from_cities(stats["total_cities"])
+    msg = format_message(
+        stats, as_of, (level, level_emoji, level_label), city_street_totals
+    )
+
+    log_to_buffer(
+        f"📊 records={stats['total_records']} "
+        f"streets={stats['total_streets']} "
+        f"cities={stats['total_cities']} "
+        f"zhytomyr={stats['zhytomyr_streets']} "
+        f"level={level}"
+    )
+    top_rem = sorted(
+        stats["rem"].items(),
+        key=lambda x: (-x[1]["streets"], -x[1]["cities"]),
+    )[:5]
+    for name, st in top_rem:
+        top_cities = sorted(st.get("city_streets", {}).items(), key=lambda x: -x[1])[:3]
+        cities_s = ", ".join(f"{c}:{n}" for c, n in top_cities)
+        log_to_buffer(
+            f"  REM {name}: streets={st['streets']} cities={st['cities']} [{cities_s}]"
+        )
+
+    do_notify, reason = should_notify_channel(level, prev, as_of)
+    log_to_buffer(f"📢 notify={do_notify} ({reason})")
+
+    notified_ok = False
+    if do_notify:
+        ok = send_notification(msg)
+        if ok:
+            notified_ok = True
+            log_to_buffer(f"✓ Telegram канал: звіт відправлено ({len(msg)} символів)")
+        else:
+            log_to_buffer("❌ Telegram канал: не вдалося відправити")
+        # Особисті DM тим, у кого увімкнено «Стан області» (notify_prefs.region)
+        try:
+            send_region_dms(msg)
+        except Exception as e:
+            log_to_buffer(f"❌ region DM batch failed: {e}")
+    else:
+        log_to_buffer("⏭ Telegram канал/region: пропущено (антиспам / рівень)")
+
+    # District CRITICAL — незалежно від рівня області.
+    # Юзери з notify_prefs.district + notify_districts отримують окреме
+    # повідомлення по кожному своєму РЕМ, який зараз CRITICAL.
+    try:
+        send_district_critical_dms(stats, as_of, city_street_totals)
+    except Exception as e:
+        log_to_buffer(f"❌ district DM batch failed: {e}")
+
+    # Mongo завжди; мітку last_notified оновлюємо лише якщо реально відправили
+    save_to_mongo(
+        stats, as_of, msg,
+        level=level,
+        level_emoji=level_emoji,
+        notified=notified_ok,
+        prev=prev,
+    )
+
+    send_log_to_channel("📊 ЛОГ · АВАРІЇ ЖОЕ", message_thread_id=154)
+    if do_notify and not notified_ok:
+        return 1
+    return 0
+
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
