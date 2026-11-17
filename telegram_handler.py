@@ -85,7 +85,6 @@ async def send_photos_with_caption(
     bot = Bot(token=token)
     cap = (caption or "")[:1024]
 
-    # Загальні kwargs для всіх send_* викликів
     common_kwargs = {
         "chat_id": chat_id,
         "disable_notification": disable_notification,
@@ -114,7 +113,7 @@ async def send_photos_with_caption(
             )
             return True
 
-        # Media group: до 10 фото; caption лише на першому
+        # Media group
         media: List[InputMediaPhoto] = []
         for i, png in enumerate(images[:10]):
             media.append(
@@ -137,8 +136,6 @@ async def send_photos_with_caption(
 def send_notification(message: str, image_path: Path = None) -> bool:
     """
     Синхронна обгортка для відправлення в канал.
-    Якщо є картинка — шле повідомлення З картинкою (без дублювання).
-    Якщо нема картинки — шле просто текст.
     """
     try:
         loop = asyncio.new_event_loop()
