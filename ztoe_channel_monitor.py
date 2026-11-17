@@ -288,7 +288,15 @@ def run() -> bool:
             else ""
         )
         if reason:
-            log_to_buffer(f"⏭ #{pid} пропущено: {reason}")
+            if reason == "не підходить під фільтр":
+                snippet = " ".join((p["text"] or "").split())  # в один рядок
+                if not snippet:
+                    snippet = "(без тексту)"
+                elif len(snippet) > 200:
+                    snippet = snippet[:200].rstrip() + "…"
+                log_to_buffer(f"⏭ #{pid} пропущено: {reason}\n    «{snippet}»")
+            else:
+                log_to_buffer(f"⏭ #{pid} пропущено: {reason}")
             save_last_id(col, pid)
             continue
 
