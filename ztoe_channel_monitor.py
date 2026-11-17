@@ -210,9 +210,10 @@ def fetch_posts() -> Dict[int, dict]:
             return posts
         except Exception as e:  # noqa: BLE001
             last_err = e
-            log_to_buffer(f"⚠️ Запит до {PAGE_URL} (спроба {attempt + 1}/3): {e}")
+            # Не логуємо PAGE_URL, щоб секрет не світився в GitHub Actions
+            log_to_buffer(f"⚠️ Запит до каналу (спроба {attempt + 1}/3): {e}")
             time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"Не вдалось отримати {PAGE_URL}: {last_err}")
+    raise RuntimeError(f"Не вдалось отримати сторінку каналу: {last_err}")
 
 
 # ---------- фільтр ----------
@@ -346,7 +347,11 @@ def run() -> bool:
             else ""
         )
         if reason:
-            post_url = f"https://t.me/{SOURCE_CHANNEL}/{pid}"
+            # Використовуємо оригінальний секрет (CHANNEL_URL),
+            # щоб GitHub міг замаскувати його в Actions-логах.
+            # У Telegram-лог-групі посилання будуть клікабельними.
+            post_url = f"{CHANNEL_URL.rstrip('/')}/{pid}"
+
             if reason == "не підходить під фільтр":
                 snippet = " ".join((p["text"] or "").split())  # в один рядок
                 if not snippet:
