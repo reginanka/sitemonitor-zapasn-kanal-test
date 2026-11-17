@@ -85,6 +85,10 @@ RELEVANT_PHRASES = (
 
 _LOG_LINES: List[str] = []
 
+# Службові маркери: текст між ними в лозі загортається в розкриту цитату (<blockquote expandable>)
+_Q_OPEN = "\x01"
+_Q_CLOSE = "\x02"
+
 
 def log_to_buffer(msg: str) -> None:
     """Пише і в спільний буфер log_utils, і в локальний (для відправки в гілку)."""
@@ -102,8 +106,15 @@ def send_log_to_thread(title: str) -> None:
     if not _LOG_LINES:
         return
 
-    body = "\n".join(_LOG_LINES)
-    text = f"<b>{html.escape(title)}</b>\n\n{html.escape(body)}"
+    raw = "\n".join(_LOG_LINES)
+    plain = raw.replace(_Q_OPEN, "").replace(_Q_CLOSE, "")  # для .txt без розмітки
+    body_html = (
+        html.escape(raw)
+        .replace(_Q_CLOSE + "\n", "</blockquote>")
+        .replace(_Q_CLOSE, "</blockquote>")
+        .replace(_Q_OPEN, "<blockquote expandable>")
+    )
+    text = f"<b>{html.escape(title)}</b>\n\n{body_html}"
     base = f"https://api.telegram.org/bot{token}"
 
     try:
@@ -130,7 +141,7 @@ def send_log_to_thread(title: str) -> None:
                     "parse_mode": "HTML",
                     "message_thread_id": LOG_THREAD_ID,
                 },
-                files={"document": (filename, body.encode("utf-8"), "text/plain")},
+                files={"document": (filename, plain.encode("utf-8"), "text/plain")},
                 timeout=30,
             )
         if not (r.status_code == 200 and r.json().get("ok")):
@@ -294,7 +305,8 @@ def run() -> bool:
                     snippet = "(без тексту)"
                 elif len(snippet) > 200:
                     snippet = snippet[:200].rstrip() + "…"
-                log_to_buffer(f"⏭ #{pid} пропущено: {reason}\n    «{snippet}»")
+                snippet = snippet.replace(_Q_OPEN, "").replace(_Q_CLOSE, "")
+                log_to_buffer(f"⏭ #{pid} пропущено: {reason}\n{_Q_OPEN}«{snippet}»{_Q_CLOSE}")
             else:
                 log_to_buffer(f"⏭ #{pid} пропущено: {reason}")
             save_last_id(col, pid)
