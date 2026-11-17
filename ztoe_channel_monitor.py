@@ -147,18 +147,31 @@ def format_message(post: dict) -> str:
 
 
 def send_to_channel(message: str) -> bool:
+    """Пряма відправка через Bot API з message_thread_id."""
     chat_id = os.getenv("TELEGRAM_CHANNEL_ID")
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not chat_id or not token:
         log_to_buffer("❌ Немає TELEGRAM_CHANNEL_ID / TELEGRAM_BOT_TOKEN")
         return False
-    return send_photos_sync(
-        chat_id,
-        [],
-        message,
-        bot_token=token,
-        message_thread_id=MESSAGE_THREAD_ID,
-    )
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "message_thread_id": MESSAGE_THREAD_ID,
+    }
+
+    try:
+        r = requests.post(url, data=data, timeout=20)
+        if r.status_code == 200 and r.json().get("ok"):
+            return True
+        log_to_buffer(f"❌ sendMessage error: {r.status_code} {r.text[:400]}")
+        return False
+    except Exception as e:
+        log_to_buffer(f"❌ sendMessage exception: {e}")
+        return False
 
 
 def send_to_users(message: str) -> Tuple[int, int, int]:
