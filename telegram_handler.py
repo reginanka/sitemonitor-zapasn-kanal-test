@@ -70,11 +70,10 @@ async def send_photos_with_caption(
     *,
     bot_token: Optional[str] = None,
     disable_notification: bool = False,
-    message_thread_id: Optional[int] = None,
 ) -> bool:
     """
     Надіслати 1..N картинок одним повідомленням.
-    caption — під першим фото (ліміт Telegram \~1024 для media group caption).
+    caption — під першим фото (ліміт Telegram ~1024 для media group caption).
     Якщо images порожній — шле тільки текст.
     """
     token = bot_token or TELEGRAM_BOT_TOKEN
@@ -85,32 +84,26 @@ async def send_photos_with_caption(
     bot = Bot(token=token)
     cap = (caption or "")[:1024]
 
-    # Загальні kwargs для всіх send_* викликів
-    common_kwargs = {
-        "chat_id": chat_id,
-        "disable_notification": disable_notification,
-    }
-    if message_thread_id is not None:
-        common_kwargs["message_thread_id"] = message_thread_id
-
     try:
         if not images:
             if not caption:
                 return False
             await bot.send_message(
+                chat_id=chat_id,
                 text=caption[:4096],
                 parse_mode="HTML",
                 disable_web_page_preview=True,
-                **common_kwargs,
+                disable_notification=disable_notification,
             )
             return True
 
         if len(images) == 1:
             await bot.send_photo(
+                chat_id=chat_id,
                 photo=images[0],
                 caption=cap or None,
                 parse_mode="HTML" if cap else None,
-                **common_kwargs,
+                disable_notification=disable_notification,
             )
             return True
 
@@ -124,10 +117,7 @@ async def send_photos_with_caption(
                     parse_mode="HTML" if i == 0 and cap else None,
                 )
             )
-        await bot.send_media_group(
-            media=media,
-            **common_kwargs,
-        )
+        await bot.send_media_group(chat_id=chat_id, media=media, disable_notification=disable_notification)
         return True
     except TelegramError as e:
         logger.error(f"❌ Помилка send_photos chat={chat_id}: {e}")
@@ -164,7 +154,6 @@ def send_photos_sync(
     *,
     bot_token: Optional[str] = None,
     disable_notification: bool = False,
-    message_thread_id: Optional[int] = None,
 ) -> bool:
     """Синхронна обгортка send_photos_with_caption."""
     try:
@@ -178,7 +167,6 @@ def send_photos_sync(
                     caption,
                     bot_token=bot_token,
                     disable_notification=disable_notification,
-                    message_thread_id=message_thread_id,
                 )
             )
         finally:
