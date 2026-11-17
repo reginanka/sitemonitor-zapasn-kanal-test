@@ -346,6 +346,7 @@ def run() -> bool:
             else ""
         )
         if reason:
+            post_url = f"https://t.me/{SOURCE_CHANNEL}/{pid}"
             if reason == "не підходить під фільтр":
                 snippet = " ".join((p["text"] or "").split())  # в один рядок
                 if not snippet:
@@ -353,9 +354,13 @@ def run() -> bool:
                 elif len(snippet) > 200:
                     snippet = snippet[:200].rstrip() + "…"
                 snippet = snippet.replace(_Q_OPEN, "").replace(_Q_CLOSE, "")
-                log_to_buffer(f"⏭ #{pid} пропущено: {reason}\n{_Q_OPEN}«{snippet}»{_Q_CLOSE}")
+                log_to_buffer(
+                    f"⏭ #{pid} пропущено: {reason}\n"
+                    f"{post_url}\n"
+                    f"{_Q_OPEN}«{snippet}»{_Q_CLOSE}"
+                )
             else:
-                log_to_buffer(f"⏭ #{pid} пропущено: {reason}")
+                log_to_buffer(f"⏭ #{pid} пропущено: {reason}\n{post_url}")
             save_last_id(col, pid)
             skipped += 1
             continue
