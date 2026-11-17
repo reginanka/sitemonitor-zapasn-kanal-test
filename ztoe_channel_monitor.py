@@ -14,12 +14,14 @@
 (порівняння нечутливе до регістру, емодзі, розділових знаків і зайвих пробілів).
 Усе інше (включно з репостами, службовими подіями, постами без тексту) ігнорується.
 
+Лог проходу відправляється в лог-групу (TELEGRAM_LOG_CHANNEL_ID) у гілку LOG_THREAD_ID.
+
 Env:
   MONGO_URI, MONGO_DB          — як у решти модулів
   TELEGRAM_BOT_TOKEN           — бот, що пише в канал
   TELEGRAM_CHANNEL_ID          — канал-приймач
   ZTOE_BOT_TOKEN               — бот для DM підписникам (+ логи)
-  TELEGRAM_LOG_CHANNEL_ID      — лог-група (опційно)
+  TELEGRAM_LOG_CHANNEL_ID      — лог-група
   ZTOE_CHANNEL_URL             — https://t.me/s/<канал> (обов'язково, лише в секретах)
 """
 
@@ -31,13 +33,13 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import requests
 from bs4 import BeautifulSoup
 
 from bot_notify import is_quiet_now, load_notify_users
-from log_utils import log_to_buffer, send_log_to_channel
+from log_utils import log_to_buffer as _log_to_buffer
 from mongo_store import get_db
 from telegram_handler import send_photos_sync
 
@@ -52,29 +54,78 @@ def _channel_from_url(url: str) -> str:
 CHANNEL_URL = (os.getenv("ZTOE_CHANNEL_URL") or "").strip()
 if not CHANNEL_URL:
     raise RuntimeError("Немає секрету ZTOE_CHANNEL_URL")
-SOURCE_CHANNEL = _channel_from_url(CHANNEL_URL)
+SOURCE_CHANNEL = _channel_from_url(CHANNEL_URL)  # назва каналу для data-post і посилань на пости
 PAGE_URL = f"https://t.me/s/{SOURCE_CHANNEL}"
 STATE_COLLECTION = "channel_monitor_state"
+# kind не входить у PREF_DEFAULTS бота → user_wants() віддає True кожному з notify=true.
+# Якщо колись додасте окремий перемикач у боті — просто додайте ключ у PREF_DEFAULTS.
 NOTIFY_KIND = "ztoe_news"
-TEXT_LIMIT = 3500
+TEXT_LIMIT = 3500  # запас до 4096 під шапку/посилання
 
-# ID гілки (topic) в групі, куди відправляти повідомлення
-MESSAGE_THREAD_ID = 12135
+# Гілка (topic) у лог-групі, куди відправляється лог цього крона
+LOG_THREAD_ID = 12135
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+# Пост пересилається, лише якщо містить одну з цих фраз.
+# Додати нову фразу = дописати рядок у список.
 RELEVANT_PHRASES = (
     "Увага! Аварійні відключення!",
     "⚡️ Аварійні відключення на Житомирщині скасовано.",
     "на Житомирщині аварійні знеструмлення",
 )
 
+# ---------- лог ----------
+
+_LOG_LINES: List[str] = []
+
+
+def log_to_buffer(msg: str) -> None:
+    """Пише і в спільний буфер log_utils, і в локальний (для відправки в гілку)."""
+    _LOG_LINES.append(msg)
+    _log_to_buffer(msg)
+
+
+def send_log_to_thread(title: str) -> None:
+    """Відправляє накопичений лог у лог-групу в гілку LOG_THREAD_ID."""
+    chat_id = os.getenv("TELEGRAM_LOG_CHANNEL_ID")
+    token = os.getenv("ZTOE_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    if not chat_id or not token:
+        print("Лог у гілку не відправлено: немає TELEGRAM_LOG_CHANNEL_ID / токена бота")
+        return
+    if not _LOG_LINES:
+        return
+
+    body = "\n".join(_LOG_LINES)
+    if len(body) > TEXT_LIMIT:
+        body = "…" + body[-TEXT_LIMIT:]
+    text = f"<b>{html.escape(title)}</b>\n\n{html.escape(body)}"
+
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+                "message_thread_id": LOG_THREAD_ID,
+            },
+            timeout=20,
+        )
+        if not (r.status_code == 200 and r.json().get("ok")):
+            print(f"Лог у гілку не відправлено: {r.status_code} {r.text[:300]}")
+    except Exception as e:  # noqa: BLE001
+        print(f"Лог у гілку: виняток {e}")
+
+
 # ---------- парсинг ----------
 
 def _post_text(el) -> str:
+    """Текст самого поста (не прев'ю відповіді/репосту)."""
     for t in el.select(".tgme_widget_message_text"):
         if t.find_parent(class_="tgme_widget_message_reply"):
             continue
@@ -88,6 +139,7 @@ def _post_text(el) -> str:
 
 
 def parse_posts(page: str) -> Dict[int, dict]:
+    """{id: {text, forwarded, service}} для всіх постів на сторінці."""
     soup = BeautifulSoup(page, "html.parser")
     pat = re.compile(rf"^{re.escape(SOURCE_CHANNEL)}/(\d+)$", re.IGNORECASE)
     out: Dict[int, dict] = {}
@@ -116,7 +168,7 @@ def fetch_posts() -> Dict[int, dict]:
             if not posts:
                 raise RuntimeError("На сторінці не знайдено жодного поста (змінилась верстка?)")
             return posts
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             last_err = e
             log_to_buffer(f"⚠️ Запит до {PAGE_URL} (спроба {attempt + 1}/3): {e}")
             time.sleep(2 * (attempt + 1))
@@ -126,6 +178,7 @@ def fetch_posts() -> Dict[int, dict]:
 # ---------- фільтр ----------
 
 def _norm(text: str) -> str:
+    """Нижній регістр; лишаємо тільки літери й цифри (емодзі, пунктуація, пробіли, \u200b геть)."""
     return "".join(ch for ch in (text or "").casefold() if ch.isalnum())
 
 
@@ -147,43 +200,23 @@ def format_message(post: dict) -> str:
 
 
 def send_to_channel(message: str) -> bool:
-    """Пряма відправка через Bot API з message_thread_id."""
     chat_id = os.getenv("TELEGRAM_CHANNEL_ID")
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not chat_id or not token:
         log_to_buffer("❌ Немає TELEGRAM_CHANNEL_ID / TELEGRAM_BOT_TOKEN")
         return False
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-        "message_thread_id": MESSAGE_THREAD_ID,
-    }
-
-    try:
-        r = requests.post(url, data=data, timeout=20)
-        if r.status_code == 200 and r.json().get("ok"):
-            return True
-        log_to_buffer(f"❌ sendMessage error: {r.status_code} {r.text[:400]}")
-        return False
-    except Exception as e:
-        log_to_buffer(f"❌ sendMessage exception: {e}")
-        return False
+    return send_photos_sync(chat_id, [], message, bot_token=token)
 
 
-def send_to_users(message: str) -> Tuple[int, int, int]:
-    """Повертає (sent, failed, total_users)."""
+def send_to_users(message: str) -> None:
     token = os.getenv("ZTOE_BOT_TOKEN")
     if not token:
         log_to_buffer("⚠️ Немає ZTOE_BOT_TOKEN — DM не шлю")
-        return 0, 0, 0
+        return
     users = [u for u in load_notify_users(NOTIFY_KIND) if u.get("telegram_id") is not None]
     if not users:
         log_to_buffer("ℹ️ Немає підписників бота для DM")
-        return 0, 0, 0
+        return
     sent = failed = 0
     for u in users:
         silent = is_quiet_now(u)
@@ -196,7 +229,6 @@ def send_to_users(message: str) -> Tuple[int, int, int]:
             failed += 1
         time.sleep(0.05)
     log_to_buffer(f"📬 DM підписникам: sent={sent} failed={failed} users={len(users)}")
-    return sent, failed, len(users)
 
 
 # ---------- стан ----------
@@ -211,38 +243,25 @@ def save_last_id(col, last_id: int) -> None:
 
 # ---------- main ----------
 
-def run() -> None:
-    """Завжди пише детальний лог. Лог у гілку відправляється з main()."""
+def run() -> bool:
+    """True — активність була (є що логувати в лог-групу)."""
     col = get_db()[STATE_COLLECTION]
     posts = fetch_posts()
     ids: List[int] = sorted(posts)
     state = col.find_one({"_id": SOURCE_CHANNEL})
 
-    page_max = ids[-1] if ids else 0
-    log_to_buffer(f"📥 Сторінка: {len(ids)} постів, max_id={page_max}")
-
     if not state or state.get("last_id") is None:
-        save_last_id(col, page_max)
-        log_to_buffer(f"🆕 Перший запуск: last_id встановлено = {page_max} (нічого не шлю)")
-        log_to_buffer("📌 Підсумок: ініціалізація стану, сповіщень немає")
-        return
+        save_last_id(col, ids[-1])
+        log_to_buffer(f"🆕 Перший запуск: last_id={ids[-1]} (нічого не шлю)")
+        return True
 
     last = int(state["last_id"])
     new_ids = [i for i in ids if i > last]
-
     if not new_ids:
-        log_to_buffer(f"ℹ️ Нових постів немає (last_id={last}, на сторінці до {page_max})")
-        log_to_buffer("📌 Підсумок: прохід без змін, нічого не розсилали")
-        return
+        print(f"Нових постів немає (last_id={last}, на сторінці до {ids[-1]})")
+        return False
 
     log_to_buffer(f"🔔 Нових постів: {len(new_ids)} ({new_ids[0]}…{new_ids[-1]}), last_id={last}")
-
-    sent_to_channel = 0
-    skipped = 0
-    total_dm_sent = 0
-    total_dm_failed = 0
-    total_dm_users = 0
-
     for pid in new_ids:
         p = posts[pid]
         reason = (
@@ -252,59 +271,35 @@ def run() -> None:
             else ""
         )
         if reason:
-            log_to_buffer(f"⏭ #{pid} пропущено: {reason} → last_id оновлено в Mongo")
+            log_to_buffer(f"⏭ #{pid} пропущено: {reason}")
             save_last_id(col, pid)
-            skipped += 1
             continue
 
         message = format_message(p)
         if not send_to_channel(message):
-            log_to_buffer(
-                f"❌ #{pid}: канал не прийняв, last_id НЕ рухаю — повторю наступного запуску"
-            )
-            log_to_buffer(
-                f"📌 Підсумок (перервано): відправлено в канал={sent_to_channel}, "
-                f"пропущено={skipped}, DM sent={total_dm_sent} failed={total_dm_failed}"
-            )
-            return
-
-        sent_to_channel += 1
-        log_to_buffer(f"✅ #{pid} відправлено в канал ({len(p['text'])} симв.)")
-        s, f, u = send_to_users(message)
-        total_dm_sent += s
-        total_dm_failed += f
-        total_dm_users = u
+            log_to_buffer(f"❌ #{pid}: канал не прийняв, last_id не рухаю — повторю наступного запуску")
+            return True
+        log_to_buffer(f"✅ #{pid} у каналі ({len(p['text'])} симв.)")
+        send_to_users(message)
         save_last_id(col, pid)
-        log_to_buffer(f"💾 #{pid}: last_id оновлено в Mongo")
-
-    if sent_to_channel == 0 and skipped > 0:
-        log_to_buffer(
-            f"📌 Підсумок: нових постів {len(new_ids)}, усі пропущені "
-            f"(не під фільтр / репост / службові). Пропущено={skipped}. "
-            f"last_id оновлено в Mongo. Нічого не розсилали."
-        )
-    elif sent_to_channel > 0:
-        log_to_buffer(
-            f"📌 Підсумок: нових постів {len(new_ids)} → "
-            f"відправлено в канал={sent_to_channel}, пропущено={skipped}, "
-            f"DM: sent={total_dm_sent} failed={total_dm_failed} (підписників={total_dm_users})"
-        )
-    else:
-        log_to_buffer(f"📌 Підсумок: нових постів {len(new_ids)}, обробка завершена")
+    return True
 
 
 def main() -> int:
     code = 0
+    active = False
     try:
-        run()
-    except Exception as e:
+        active = run()
+    except Exception as e:  # noqa: BLE001
         code = 1
+        active = True
         log_to_buffer(f"❌ Критична помилка ZTOE channel monitor: {e}")
     finally:
-        # Завжди відправляємо лог у гілку
-        send_log_to_channel("📊 ЛОГ ВИКОНАННЯ СКРИПТА · ЖОЕ КАНАЛ")
+        if active:
+            send_log_to_thread("📊 ЛОГ ВИКОНАННЯ СКРИПТА · ЖОЕ КАНАЛ")
     return code
 
 
 if __name__ == "__main__":
     sys.exit(main())
+  
