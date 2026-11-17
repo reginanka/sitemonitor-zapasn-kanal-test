@@ -64,6 +64,9 @@ TEXT_LIMIT = 3500  # запас до 4096 під шапку/посилання
 
 # Гілка (topic) у лог-групі, куди відправляється лог цього крона
 LOG_THREAD_ID = 12135
+# Ліміт Telegram — 4096 символів на повідомлення (після HTML-екранування); з запасом 4000.
+# Якщо лог довший — він відправляється файлом .txt
+LOG_MESSAGE_LIMIT = 4000
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -100,22 +103,36 @@ def send_log_to_thread(title: str) -> None:
         return
 
     body = "\n".join(_LOG_LINES)
-    if len(body) > TEXT_LIMIT:
-        body = "…" + body[-TEXT_LIMIT:]
     text = f"<b>{html.escape(title)}</b>\n\n{html.escape(body)}"
+    base = f"https://api.telegram.org/bot{token}"
 
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-                "message_thread_id": LOG_THREAD_ID,
-            },
-            timeout=20,
-        )
+        if len(text) <= LOG_MESSAGE_LIMIT:
+            r = requests.post(
+                f"{base}/sendMessage",
+                data={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                    "message_thread_id": LOG_THREAD_ID,
+                },
+                timeout=20,
+            )
+        else:
+            # Лог завеликий для одного повідомлення → шлемо повний лог файлом .txt
+            filename = f"ztoe_channel_log_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.txt"
+            r = requests.post(
+                f"{base}/sendDocument",
+                data={
+                    "chat_id": chat_id,
+                    "caption": f"<b>{html.escape(title)}</b>\n(лог завеликий — файлом)",
+                    "parse_mode": "HTML",
+                    "message_thread_id": LOG_THREAD_ID,
+                },
+                files={"document": (filename, body.encode("utf-8"), "text/plain")},
+                timeout=30,
+            )
         if not (r.status_code == 200 and r.json().get("ok")):
             print(f"Лог у гілку не відправлено: {r.status_code} {r.text[:300]}")
     except Exception as e:  # noqa: BLE001
