@@ -14,6 +14,9 @@
 (порівняння нечутливе до регістру, емодзі, розділових знаків і зайвих пробілів).
 Усе інше (включно з репостами, службовими подіями, постами без тексту) ігнорується.
 
+При відправці релевантного поста додається картинка assets/channel.jpg
+(повідомлення йде як caption до фото — одне повідомлення).
+
 Лог проходу:
   - якщо була активність (нові пости / ініціалізація / помилки) → гілка 12135
   - якщо просто перевірка без нових постів → гілка 13196
@@ -72,6 +75,10 @@ LOG_THREAD_ID_IDLE = 13196       # просто перевірка без нов
 # Ліміт Telegram — 4096 символів на повідомлення (після HTML-екранування); з запасом 4000.
 # Якщо лог довший — він відправляється файлом .txt
 LOG_MESSAGE_LIMIT = 4000
+
+# Картинка, яка додається до кожного релевантного повідомлення
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+CHANNEL_PHOTO = os.path.join(_ASSETS_DIR, "channel.jpg")
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -232,13 +239,22 @@ def format_message(post: dict) -> str:
     return f"<b>ЖОЕ інформує -</b>\n\n{html.escape(text)}"
 
 
+def _get_photo_list() -> List[str]:
+    """Повертає список з шляхом до картинки, якщо файл існує."""
+    if os.path.isfile(CHANNEL_PHOTO):
+        return [CHANNEL_PHOTO]
+    log_to_buffer(f"⚠️ Картинка не знайдена: {CHANNEL_PHOTO} — відправляю без фото")
+    return []
+
+
 def send_to_channel(message: str) -> bool:
     chat_id = os.getenv("TELEGRAM_CHANNEL_ID")
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not chat_id or not token:
         log_to_buffer("❌ Немає TELEGRAM_CHANNEL_ID / TELEGRAM_BOT_TOKEN")
         return False
-    return send_photos_sync(chat_id, [], message, bot_token=token)
+    photos = _get_photo_list()
+    return send_photos_sync(chat_id, photos, message, bot_token=token)
 
 
 def send_to_users(message: str) -> Tuple[int, int, int]:
@@ -253,11 +269,17 @@ def send_to_users(message: str) -> Tuple[int, int, int]:
     if not users:
         log_to_buffer("ℹ️ Немає підписників бота для DM")
         return 0, 0, 0
+
+    photos = _get_photo_list()
     sent = failed = 0
     for u in users:
         silent = is_quiet_now(u)
         ok = send_photos_sync(
-            int(u["telegram_id"]), [], message, bot_token=token, disable_notification=silent
+            int(u["telegram_id"]),
+            photos,
+            message,
+            bot_token=token,
+            disable_notification=silent,
         )
         if ok:
             sent += 1
@@ -350,7 +372,7 @@ def run() -> bool:
             return True
 
         sent_to_channel += 1
-        log_to_buffer(f"✅ #{pid} відправлено в канал ({len(p['text'])} симв.)")
+        log_to_buffer(f"✅ #{pid} відправлено в канал ({len(p['text'])} симв.) + фото")
         s, f, u = send_to_users(message)
         total_dm_sent += s
         total_dm_failed += f
