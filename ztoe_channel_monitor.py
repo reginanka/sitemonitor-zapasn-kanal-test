@@ -62,6 +62,12 @@ if not CHANNEL_URL:
 
 SOURCE_CHANNEL = _channel_from_url(CHANNEL_URL)  # назва каналу для data-post і посилань на пости
 PAGE_URL = f"https://t.me/s/{SOURCE_CHANNEL}"
+
+# Ім'я каналу для посилань у лозі (секрет ZTOE_CHANNEL_NAME, лише ім'я без URL).
+# Посилання вигляду https://t.me/<канал>/<id> (без /s/) відкривається прямо в застосунку Telegram.
+# Якщо секрету немає — беремо ім'я з ZTOE_CHANNEL_URL.
+LINK_CHANNEL = (os.getenv("ZTOE_CHANNEL_NAME") or "").strip().lstrip("@") or SOURCE_CHANNEL
+
 STATE_COLLECTION = "channel_monitor_state"
 
 # kind не входить у PREF_DEFAULTS бота → user_wants() віддає True кожному з notify=true.
@@ -119,8 +125,9 @@ def _link(url: str, text: str) -> str:
 def log_to_buffer(msg: str) -> None:
     """Пише і в спільний буфер log_utils, і в локальний (для відправки в гілку)."""
     _LOG_LINES.append(msg)
-    # У спільний буфер (GitHub Actions тощо) — без маркерів: «текст (url)»
-    _log_to_buffer(_LINK_RE.sub(r"\2 (\1)", msg))
+    # У спільний буфер (GitHub Actions тощо) — лише текст посилання, без URL,
+    # щоб назва каналу не світилась у відкритих логах
+    _log_to_buffer(_LINK_RE.sub(r"\2", msg))
 
 
 def send_log_to_thread(title: str, message_thread_id: int) -> None:
@@ -363,10 +370,9 @@ def run() -> bool:
             else ""
         )
         if reason:
-            # Використовуємо оригінальний секрет (CHANNEL_URL),
-            # щоб GitHub міг замаскувати його в Actions-логах.
             # У Telegram-лог-групі причина пропуску — клікабельне посилання на пост.
-            post_url = f"{CHANNEL_URL.rstrip('/')}/{pid}"
+            # Без /s/ → відкривається в застосунку Telegram, а не в браузері.
+            post_url = f"https://t.me/{LINK_CHANNEL}/{pid}"
             reason_link = _link(post_url, reason)
 
             if reason == "не підходить під фільтр":
@@ -451,4 +457,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-  
+   
