@@ -1728,6 +1728,7 @@ def main() -> int:
     log.info("users=%s groups=%s unique_otgs=%s", len(users), len(groups), len(unique_otgs))
 
     notified: Dict[int, list] = {}
+    cancelled: Dict[int, list] = {}
     groups_checked = 0
 
     # Один HTTP-клієнт на весь прогін
