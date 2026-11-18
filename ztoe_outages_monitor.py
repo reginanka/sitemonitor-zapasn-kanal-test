@@ -10,11 +10,24 @@
 - bulk_write у Mongo замість поштучних update_one
 - без подвійного retry empty+city
 
-Архітектура сповіщень (v1.4):
-- Глобальний outages_cache (fps / soft_fps / plan_by_addr_day) — лише для
-  детекції змін в API і продовжень аварій.
+Архітектура сповіщень (v1.5):
+- Глобальний outages_cache (fps / soft_fps / plan_by_addr_day / snapshot) —
+  для детекції змін в API, продовжень аварій і зникнень.
+- snapshot — компактний знімок записів, які API віддав на попередньому
+  успішному прогоні. pending_cancels — ті, що зникли раніше datePlanIn:
+  лишаються, доки плановий кінець не мине, щоб збій Telegram не з’їв
+  сповіщення (дедуп пишеться лише після успішної відправки).
+- Якщо запис був у знімку, його більше немає в API, плановий кінець ще
+  попереду, і для цієї адреси немає продовження (той самий addr_day або
+  інший запис на той самий будинок і день) — окреме сповіщення «Скасовано».
+  Зникнення після datePlanIn мовчазне: відключення просто добігло кінця.
+- Неповний fetch (аварії чи плани не прочитались) не чіпає кеш і не
+  вважається «усе зникло».
 - Per-user дедуп у колекції user_outage_notified:
   ключ = telegram_id + notify_dedup_key.
+  Для скасування ключ інший (`gone|...`), тож «нове» і «скасовано» не зливаються.
+  Після успішного скасування старий ключ появи знімається: якщо запис
+  повернеться в API, людина знову отримає сповіщення.
   Запис пишеться лише після успішної відправки в Telegram,
   тож збій розсилки не «з’їдає» сповіщення.
   Завдяки цьому користувач, який додав адресу ПІСЛЯ появи аварії,
@@ -402,7 +415,13 @@ def format_outage(outage: dict, user_house: str = "") -> str:
         addr_line += f", {house}"
 
     # --- видима шапка ---
-    if outage.get("_plan_updated"):
+    if outage.get("_cancelled"):
+        text = f"✅ <b>Скасовано:</b> {addr_line}"
+        text += "\nЗапис зник з графіка ЖОЕ до запланованого кінця."
+        period = h(format_forecast_period(date_event_raw, date_plan_raw))
+        if period:
+            text += f"\n📅 {period}"
+    elif outage.get("_plan_updated"):
         text = f"⏱ <b>Оновлення:</b> {addr_line}"
         was = h((outage.get("_plan_was") or "")[:16].replace("T", " "))
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
@@ -1202,7 +1221,16 @@ def _norm_street(name: str) -> str:
 def remember_user_notified(col, tid: int, outage: dict, addr: dict) -> None:
     """Фіксує дедуп лише після того, як Telegram прийняв повідомлення."""
     house = str(addr.get("house") or addr.get("building") or "")
-    dkey = notify_dedup_key(outage, house)
+    if outage.get("_cancelled"):
+        dkey = cancel_notify_dedup_key(outage, house)
+        # Запис повернувся в API — появу треба сказати знову, старий ключ не блокує.
+        orig = notify_dedup_key(outage, house)
+        try:
+            col.delete_one({"_id": f"{int(tid)}:{orig}"})
+        except Exception as e:
+            log.warning("drop appearance dedup %s: %s", tid, e)
+    else:
+        dkey = notify_dedup_key(outage, house)
     otg_raw = addr.get("otg_id") or addr.get("otgId") or 0
     city_raw = addr.get("city_id") or addr.get("cityId") or 0
     try:
@@ -1362,6 +1390,300 @@ def user_queue_key(addr: dict) -> str:
     return f"{q}.{sq}" if sq else q
 
 
+def _kyiv_zone():
+    """Місцевий час ЖОЕ. API часто віддає naive ISO — це київський час, не UTC."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Europe/Kyiv")
+    except Exception:
+        return timezone(timedelta(hours=2))
+
+
+def _to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_kyiv_zone())
+    return dt.astimezone(timezone.utc)
+
+
+def plan_still_open(outage: dict, now: Optional[datetime] = None) -> bool:
+    """True, якщо datePlanIn ще попереду.
+
+    Немає розбірного кінця — не можна стверджувати, що запис зняли рано.
+    """
+    end = _parse_iso_dt(str(outage.get("datePlanIn") or ""))
+    if end is None:
+        return False
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_kyiv_zone())
+    return _to_utc(end) > now.astimezone(timezone.utc)
+
+
+def _outage_interval_utc(outage: dict) -> Optional[Tuple[datetime, datetime]]:
+    start = _parse_iso_dt(str(outage.get("dateEvent") or ""))
+    end = _parse_iso_dt(str(outage.get("datePlanIn") or ""))
+    if start is None and end is None:
+        return None
+    if start is None:
+        start = end
+    if end is None:
+        end = start
+    start_utc, end_utc = _to_utc(start), _to_utc(end)
+    if end_utc < start_utc:
+        start_utc, end_utc = end_utc, start_utc
+    return start_utc, end_utc
+
+
+def _intervals_overlap(
+    a: Optional[Tuple[datetime, datetime]],
+    b: Optional[Tuple[datetime, datetime]],
+) -> bool:
+    if not a or not b:
+        return False
+    return a[0] < b[1] and b[0] < a[1]
+
+
+def _brief_place(obj) -> dict:
+    if not isinstance(obj, dict):
+        return {}
+    return {"id": obj.get("id"), "name": obj.get("name")}
+
+
+def snapshot_from_outage(outage: dict) -> dict:
+    """Компактний запис знімка: достатньо, щоб наступного разу порівняти і зібрати текст."""
+    source = outage.get("_source") or outage.get("source") or "x"
+    oid = outage.get("id")
+    if oid is None:
+        oid = outage.get("source_id")
+    key = outage.get("key") or f"{source}:{oid}"
+    return {
+        "key": key,
+        "id": oid,
+        "_source": source,
+        "typeOff": outage.get("typeOff"),
+        "switchSubReason": outage.get("switchSubReason"),
+        "city": _brief_place(outage.get("city")),
+        "street": _brief_place(outage.get("street")),
+        "otg": _brief_place(outage.get("otg")),
+        "buildingNames": outage.get("buildingNames") or "",
+        "dateEvent": outage.get("dateEvent") or "",
+        "datePlanIn": outage.get("datePlanIn") or "",
+        "koment": outage.get("koment") or "",
+    }
+
+
+def mongo_doc_to_outage(doc: dict) -> dict:
+    """Старий документ колекції outages → форма, з якою працюють матч і текст."""
+    return {
+        "id": doc.get("source_id"),
+        "_source": doc.get("source") or doc.get("_source"),
+        "typeOff": doc.get("typeOff"),
+        "switchSubReason": doc.get("switchSubReason"),
+        "city": {"id": doc.get("city_id"), "name": doc.get("city_name")},
+        "street": {"id": doc.get("street_id"), "name": doc.get("street_name")},
+        "otg": {"id": doc.get("otg_id"), "name": doc.get("otg_name")},
+        "buildingNames": doc.get("buildingNames") or "",
+        "dateEvent": doc.get("dateEvent") or "",
+        "datePlanIn": doc.get("datePlanIn") or "",
+        "koment": doc.get("koment") or "",
+    }
+
+
+def bootstrap_snapshot_from_ids(ids: List[str], outages_full) -> List[dict]:
+    """Перший прогін після деплою: повного snapshot ще нема, але ids + outages є.
+
+    Порожній snapshot у кеші (API реально нічого не віддав) сюди не потрапляє.
+    """
+    if outages_full is None:
+        return []
+    records: List[dict] = []
+    seen = set()
+    for key in ids or []:
+        key = str(key or "")
+        if ":" not in key or key in seen:
+            continue
+        seen.add(key)
+        source, sid = key.split(":", 1)
+        ors: List[dict] = [{"source": source, "source_id": sid}]
+        try:
+            ors.append({"source": source, "source_id": int(sid)})
+        except ValueError:
+            pass
+        try:
+            doc = outages_full.find_one({"$or": ors})
+        except Exception as e:
+            log.warning("snapshot bootstrap %s: %s", key, e)
+            continue
+        if not doc:
+            continue
+        rec = snapshot_from_outage(mongo_doc_to_outage(doc))
+        rec["key"] = key
+        records.append(rec)
+    return records
+
+
+def previous_snapshot_records(cache: dict, outages_full) -> List[dict]:
+    """Минулий знімок + ще не догаслі ранні скасування (для повтору після збою розсилки)."""
+    cache = cache or {}
+    if "snapshot" in cache and isinstance(cache.get("snapshot"), list):
+        prev = list(cache.get("snapshot") or [])
+    else:
+        prev = bootstrap_snapshot_from_ids(cache.get("ids") or [], outages_full)
+    pending = list(cache.get("pending_cancels") or [])
+    merged: List[dict] = []
+    seen = set()
+    for rec in pending + prev:
+        if not isinstance(rec, dict):
+            continue
+        key = str(rec.get("key") or "") or make_outage_key(rec)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        item = dict(rec)
+        item["key"] = key
+        merged.append(item)
+    return merged
+
+
+def select_early_cancellations(
+    prev_records: List[dict],
+    current_outages: List[dict],
+    now: Optional[datetime] = None,
+) -> List[dict]:
+    """Записи, які були в попередньому знімку і зникли з API до datePlanIn.
+
+    Не скасовуємо, якщо на ту саму адресу+день API вже віддав інший id
+    (ЖОЕ так «продовжує» аварію). Точне покриття будинку перевіряється
+    пізніше, окремо для кожного підписника.
+    """
+    current_keys = {make_outage_key(o) for o in current_outages}
+    # ГПВ не маскує скасування аварії/ремонту: інший id погодинного графіка
+    # на тій самій вулиці — не «продовження» запису.
+    current_days = {
+        addr_day_key(o) for o in current_outages if should_notify_outage(o)
+    }
+    current_days.discard("")
+
+    early: List[dict] = []
+    seen = set()
+    for rec in prev_records or []:
+        if not isinstance(rec, dict):
+            continue
+        key = str(rec.get("key") or "") or make_outage_key(rec)
+        if not key or key in seen or key in current_keys:
+            continue
+        seen.add(key)
+        if not should_notify_outage(rec):
+            continue
+        adk = addr_day_key(rec)
+        if adk and adk in current_days:
+            continue
+        if not plan_still_open(rec, now=now):
+            continue
+        item = dict(rec)
+        item["key"] = key
+        item["_cancelled"] = True
+        item["_cancel_reason"] = "gone_before_plan_end"
+        early.append(item)
+    return early
+
+
+def still_covered_for_addr(
+    gone: dict,
+    current_outages: List[dict],
+    street_id,
+    street_name: str,
+    house: str,
+) -> bool:
+    """Чи лишилось для цього будинку інше відключення на той самий день / інтервал.
+
+    Тоді старий id просто змінили, а не зняли. ГПВ покриттям не вважається.
+    """
+    gone_iv = _outage_interval_utc(gone)
+    gone_day = (gone.get("dateEvent") or gone.get("datePlanIn") or "")[:10]
+    for current in current_outages:
+        if not should_notify_outage(current):
+            continue
+        if not matches_street(current, street_id, street_name):
+            continue
+        if not matches_building(current, house):
+            continue
+        cur_day = (current.get("dateEvent") or current.get("datePlanIn") or "")[:10]
+        if gone_day and cur_day and gone_day == cur_day:
+            return True
+        if _intervals_overlap(gone_iv, _outage_interval_utc(current)):
+            return True
+    return False
+
+
+def cancel_notify_dedup_key(outage: dict, house: str = "") -> str:
+    """Окремий від появи ключ, інакше «вже слали про відключення» з’їсть скасування."""
+    return "gone|" + notify_dedup_key(outage, house)
+
+
+def _fetch_pair(
+    client: httpx.Client,
+    *,
+    city_id: Optional[int] = None,
+    otg_id: Optional[int] = None,
+) -> Tuple[List[dict], bool]:
+    """Обидва ендпоінти мають успішно прочитатись.
+
+    Порожня відповідь 200 — це справжнє «записів немає».
+    Помилка аварій або планів — неповний знімок: кеш не чіпаємо
+    і не розсилаємо «усе скасовано».
+    """
+    try:
+        if city_id:
+            accidents = _fetch_pages_by_city(client, "/pw_accidents", int(city_id))
+            planned = _fetch_pages_by_city(client, "/pw_accident_planeds", int(city_id))
+        else:
+            accidents = _fetch_all_pages(client, "/pw_accidents", int(otg_id), None)
+            planned = _fetch_all_pages(client, "/pw_accident_planeds", int(otg_id), None)
+    except Exception as e:
+        log.error(
+            "Fetch incomplete city=%s otg=%s: %s",
+            city_id,
+            otg_id,
+            e,
+        )
+        return [], False
+    for acc in accidents:
+        acc["_source"] = "accidents"
+    for plan in planned:
+        plan["_source"] = "planeds"
+    return accidents + planned, True
+
+
+def build_cancel_message(items: List[Tuple[dict, dict]]) -> List[str]:
+    """Окреме сповіщення про зняття. Без блока «світла не буде» — запису вже немає."""
+    header = "✅ <b>Скасовані відключення по твоїх адресах:</b>"
+    grouped: List[Tuple[dict, dict]] = []
+    group_at: Dict[str, int] = {}
+    for outage, addr in items:
+        user_house = str(addr.get("house") or addr.get("building") or "").strip()
+        ev_key = "gone|" + _msg_dedup_key(outage, user_house)
+        if ev_key in group_at:
+            prev, _prev_addr = grouped[group_at[ev_key]]
+            prev["buildingNames"] = merge_building_names(
+                prev.get("buildingNames") or "",
+                outage.get("buildingNames") or "",
+            )
+            if not (prev.get("koment") or "").strip() and (outage.get("koment") or "").strip():
+                prev["koment"] = outage.get("koment")
+            continue
+        group_at[ev_key] = len(grouped)
+        item = dict(outage)
+        item["_cancelled"] = True
+        grouped.append((item, addr))
+    blocks = [
+        format_outage(outage, user_house=str(addr.get("house") or addr.get("building") or "").strip())
+        for outage, addr in grouped
+    ]
+    return pack_html_messages(blocks, header)
+
+
 def main() -> int:
     mongo_uri = os.getenv("MONGO_URI")
     if not mongo_uri:
@@ -1413,7 +1735,7 @@ def main() -> int:
         timeout=30,
         headers={
             "Accept": "application/ld+json",
-            "User-Agent": "ztoe-outages-monitor/1.3",
+            "User-Agent": "ztoe-outages-monitor/1.5",
         },
     )
 
@@ -1422,34 +1744,48 @@ def main() -> int:
     # - по otg_id (для адрес без city_id)
     city_outages_cache: Dict[int, List[dict]] = {}
     otg_outages_cache: Dict[int, List[dict]] = {}
+    city_fetch_ok: Dict[int, bool] = {}
+    otg_fetch_ok: Dict[int, bool] = {}
 
     unique_cities = sorted({cid for (_, cid) in groups if cid})
     try:
         for city_id in unique_cities:
-            try:
-                city_outages_cache[city_id] = fetch_outages_by_city(http, city_id)
-                log.info("city=%s fetched_total=%s", city_id, len(city_outages_cache[city_id]))
-            except Exception as e:
-                log.error("Fetch city=%s: %s", city_id, e)
-                city_outages_cache[city_id] = []
+            items, ok = _fetch_pair(http, city_id=city_id)
+            city_outages_cache[city_id] = items
+            city_fetch_ok[city_id] = ok
+            if ok:
+                log.info("city=%s fetched_total=%s", city_id, len(items))
+            else:
+                log.error("city=%s fetch failed, cache kept", city_id)
 
         # otg-фетч лише для груп без city_id
         otgs_without_city = sorted({otg for (otg, cid) in groups if not cid})
         for otg_id in otgs_without_city:
-            try:
-                otg_outages_cache[otg_id] = fetch_all_outages(http, otg_id, None)
-                log.info("otg=%s (no city) fetched_total=%s", otg_id, len(otg_outages_cache[otg_id]))
-            except Exception as e:
-                log.error("Fetch otg=%s: %s", otg_id, e)
-                otg_outages_cache[otg_id] = []
+            items, ok = _fetch_pair(http, otg_id=otg_id)
+            otg_outages_cache[otg_id] = items
+            otg_fetch_ok[otg_id] = ok
+            if ok:
+                log.info("otg=%s (no city) fetched_total=%s", otg_id, len(items))
+            else:
+                log.error("otg=%s fetch failed, cache kept", otg_id)
 
         for (otg_id, city_id), group_pairs in groups.items():
             if city_id:
+                fetch_ok = bool(city_fetch_ok.get(city_id))
                 outages = list(city_outages_cache.get(city_id) or [])
             else:
+                fetch_ok = bool(otg_fetch_ok.get(otg_id))
                 outages = list(otg_outages_cache.get(otg_id) or [])
 
             groups_checked += 1
+            if not fetch_ok:
+                # Порожній список через помилку HTTP — не «усе зникло».
+                log.error(
+                    "otg=%s city=%s: неповний fetch, кеш не оновлюю і скасування не рахую",
+                    otg_id,
+                    city_id,
+                )
+                continue
             current_ids = {make_outage_key(o) for o in outages}
             current_fps = {content_fingerprint(o) for o in outages}
             current_soft = {soft_fingerprint(o) for o in outages}
@@ -1549,14 +1885,18 @@ def main() -> int:
                 )
                 new_outages = list(new_outages) + plan_updates
 
+            prev_records = previous_snapshot_records(cache, outages_full)
+            early = select_early_cancellations(prev_records, outages)
+
             log.info(
-                "otg=%s city=%s fetched=%s cache_fps=%s new=%s plan_upd=%s",
+                "otg=%s city=%s fetched=%s cache_fps=%s new=%s plan_upd=%s gone_early=%s",
                 otg_id,
                 city_id,
                 len(outages),
                 len(prev_fps),
                 max(0, len(new_outages) - len(plan_updates)),
                 len(plan_updates),
+                len(early),
             )
 
             # Bulk upsert full docs (для /check)
@@ -1683,7 +2023,62 @@ def main() -> int:
                             addr.get("house") or addr.get("building"),
                         )
 
-            # Кеш завжди оновлюємо (інакше втрачаємо plan_by_addr_day і «не бачимо» продовжень)
+            # Запис був у попередньому знімку, з API зник, а datePlanIn ще попереду.
+            matched_cancel = 0
+            if early:
+                for user, addr in group_pairs:
+                    tid = user.get("telegram_id")
+                    if not tid:
+                        continue
+                    street_id = addr.get("street_id") or addr.get("streetId")
+                    street_name = (addr.get("street_name") or addr.get("street") or "").strip().lower()
+                    house = str(addr.get("house") or addr.get("building") or "")
+                    already_keys = {
+                        d["dedup_key"]
+                        for d in notified_col.find(
+                            {"telegram_id": int(tid)},
+                            projection={"dedup_key": 1, "_id": 0},
+                        )
+                    }
+                    for outage in early:
+                        if not matches_street(outage, street_id, street_name):
+                            continue
+                        if not matches_building(outage, house):
+                            continue
+                        if still_covered_for_addr(outage, outages, street_id, street_name, house):
+                            log.info(
+                                "skip cancel, address still covered tid=%s key=%s",
+                                tid,
+                                outage.get("key"),
+                            )
+                            continue
+                        dkey = cancel_notify_dedup_key(outage, house)
+                        if dkey in already_keys:
+                            continue
+                        already_run = False
+                        for x in cancelled.get(tid, []):
+                            prev_o = x[0] if isinstance(x, tuple) else x
+                            if cancel_notify_dedup_key(prev_o, house) == dkey:
+                                already_run = True
+                                break
+                        if already_run:
+                            continue
+                        outage_copy = dict(outage)
+                        outage_copy["_cancelled"] = True
+                        cancelled.setdefault(tid, []).append((outage_copy, addr))
+                        already_keys.add(dkey)
+                        matched_cancel += 1
+                log.info(
+                    "otg=%s city=%s cancel_matched=%s gone_early=%s",
+                    otg_id,
+                    city_id,
+                    matched_cancel,
+                    len(early),
+                )
+
+            # Кеш оновлюємо лише після повного fetch.
+            # snapshot — те, що API віддав зараз; pending_cancels — зниклі до кінця,
+            # щоб повторити розсилку, якщо Telegram не прийняв повідомлення.
             soft_stored = merge_soft_fps(current_soft, prev_soft, SOFT_FPS_MAX)
             plan_by_addr_day = {}
             for o in outages:
@@ -1702,6 +2097,8 @@ def main() -> int:
                         "fps": list(current_fps),
                         "soft_fps": soft_stored,
                         "plan_by_addr_day": plan_by_addr_day,
+                        "snapshot": [snapshot_from_outage(o) for o in outages],
+                        "pending_cancels": [snapshot_from_outage(o) for o in early],
                         "updated_at": datetime.now(timezone.utc),
                         "count": len(current_ids),
                     }
@@ -1784,7 +2181,9 @@ def main() -> int:
             if tid_u is not None:
                 _user_by_tid[int(tid_u)] = _u
 
-    n_events = sum(len(v) for v in notified.values())
+    n_new = sum(len(v) for v in notified.values())
+    n_cancels = sum(len(v) for v in cancelled.values())
+    n_events = n_new + n_cancels
     log_chat = (
         os.getenv("TELEGRAM_LOG_CHANNEL_ID")
         or os.getenv("ADMIN_CHAT_ID")
@@ -1806,42 +2205,57 @@ def main() -> int:
             write_timeout=20.0,
         )
         bot = Bot(token=bot_token, request=request)
-        try:
-            for tid, item_list in notified.items():
-                texts = build_notify_message(db, item_list)
-                silent = is_quiet_now(_user_by_tid.get(int(tid)))
-                failed = False
-                for part_i, text in enumerate(texts):
-                    try:
-                        await bot.send_message(
-                            chat_id=tid,
-                            text=fit_telegram_html(text),
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                            disable_notification=silent,
-                        )
-                    except Exception as e:
-                        log.error(
-                            "Send fail %s part %s/%s: %s",
-                            tid,
-                            part_i + 1,
-                            len(texts),
-                            e,
-                        )
-                        failed = True
-                        break
-                    if part_i + 1 < len(texts):
-                        await asyncio.sleep(0.25)
-                if failed:
-                    continue
 
-                for outage, addr in item_list:
-                    if not isinstance(addr, dict):
-                        continue
-                    try:
-                        remember_user_notified(notified_col, int(tid), outage, addr)
-                    except Exception as e:
-                        log.error("mark notified fail %s: %s", tid, e)
+        async def _send_parts(tid, texts: List[str], silent: bool) -> bool:
+            for part_i, text in enumerate(texts):
+                try:
+                    await bot.send_message(
+                        chat_id=tid,
+                        text=fit_telegram_html(text),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        disable_notification=silent,
+                    )
+                except Exception as e:
+                    log.error(
+                        "Send fail %s part %s/%s: %s",
+                        tid,
+                        part_i + 1,
+                        len(texts),
+                        e,
+                    )
+                    return False
+                if part_i + 1 < len(texts):
+                    await asyncio.sleep(0.25)
+            return True
+
+        def _mark(tid, item_list) -> None:
+            for outage, addr in item_list:
+                if not isinstance(addr, dict):
+                    continue
+                try:
+                    remember_user_notified(notified_col, int(tid), outage, addr)
+                except Exception as e:
+                    log.error("mark notified fail %s: %s", tid, e)
+
+        try:
+            tids = list(dict.fromkeys([*notified.keys(), *cancelled.keys()]))
+            for tid in tids:
+                new_items = notified.get(tid) or []
+                gone_items = cancelled.get(tid) or []
+                silent = is_quiet_now(_user_by_tid.get(int(tid)))
+                ok_any = False
+                if new_items and await _send_parts(tid, build_notify_message(db, new_items), silent):
+                    ok_any = True
+                    _mark(tid, new_items)
+                if gone_items:
+                    if new_items:
+                        await asyncio.sleep(0.25)
+                    if await _send_parts(tid, build_cancel_message(gone_items), silent):
+                        ok_any = True
+                        _mark(tid, gone_items)
+                if not ok_any:
+                    continue
 
                 sent += 1
                 if silent:
@@ -1849,10 +2263,10 @@ def main() -> int:
                 else:
                     sent_sound += 1
                 log.info(
-                    "Надіслано %s (outages=%s parts=%s silent=%s)",
+                    "Надіслано %s (new=%s cancel=%s silent=%s)",
                     tid,
-                    len(item_list),
-                    len(texts),
+                    len(new_items),
+                    len(gone_items),
                     silent,
                 )
                 await asyncio.sleep(0.35)
@@ -1861,7 +2275,7 @@ def main() -> int:
                 f"✅ Перевірка відключень\n"
                 f"Підписників: {len(users)}\n"
                 f"Локацій: {groups_checked}\n"
-                f"Подій для розсилки: {n_events}\n"
+                f"Подій для розсилки: {n_events} (нових {n_new}, скасувань {n_cancels})\n"
                 f"Сповіщень: {sent} (🔊={sent_sound} 🔇={sent_quiet})"
             )
             log.info("%s", summary.replace("\n", " | "))
@@ -1881,7 +2295,13 @@ def main() -> int:
 
     asyncio.run(_dispatch())
 
-    log.info("Готово groups=%s sent=%s events=%s", groups_checked, sent, n_events)
+    log.info(
+        "Готово groups=%s sent=%s events=%s cancels=%s",
+        groups_checked,
+        sent,
+        n_events,
+        n_cancels,
+    )
     return 0
 
 
