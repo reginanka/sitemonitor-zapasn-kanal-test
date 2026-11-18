@@ -985,43 +985,182 @@ def pack_html_messages(
     header: str,
     limit: int = TG_TEXT_LIMIT,
 ) -> List[str]:
-    """Складає блоки в кілька повідомлень, кожне ≤ limit і з закритими тегами."""
+    """Складає блоки в кілька повідомлень, кожне ≤ limit і з закритими тегами.
+
+    Завеликий блок (довгий список будинків) ділиться на частини, а не обрізається.
+    """
     msgs: List[str] = []
     cur = header.strip()
     cont = "⚠️ <b>Продовження:</b>"
+    budget = limit - len(cont) - 4
     for raw in blocks:
-        block = (raw or "").strip()
-        if not block:
-            continue
-        if len(block) > limit - len(cont) - 4:
-            block = fit_telegram_html(block, limit - len(cont) - 4)
-        candidate = f"{cur}\n\n{block}" if cur else block
-        if len(candidate) <= limit:
-            cur = candidate
-            continue
-        if cur:
-            msgs.append(fit_telegram_html(cur, limit))
-        cur = f"{cont}\n\n{block}"
-        if len(cur) > limit:
-            cur = fit_telegram_html(block, limit)
+        for block in _split_block_for_telegram((raw or "").strip(), max(200, budget)):
+            if not block:
+                continue
+            candidate = f"{cur}\n\n{block}" if cur else block
+            if len(candidate) <= limit:
+                cur = candidate
+                continue
+            if cur:
+                msgs.append(cur)
+            cur = f"{cont}\n\n{block}"
+            if len(cur) > limit:
+                cur = block
     if cur:
-        msgs.append(fit_telegram_html(cur, limit))
+        msgs.append(cur)
     return [m for m in msgs if m]
+
+
+def _split_block_for_telegram(block: str, limit: int) -> List[str]:
+    """Ділить один HTML-блок, не викидаючи хвіст списку будинків."""
+    block = (block or "").strip()
+    if not block or len(block) <= limit:
+        return [block] if block else []
+
+    m = re.match(
+        r"^(?P<pre>.*?)<blockquote(?P<attrs>\s[^>]*)?>(?P<body>.*)</blockquote>\s*$",
+        block,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not m:
+        return _pack_plain_chunks(block, limit)
+
+    pre = (m.group("pre") or "").strip()
+    open_tag = f"<blockquote{m.group('attrs') or ''}>"
+    close_tag = "</blockquote>"
+    body = (m.group("body") or "").strip()
+    overhead = len(open_tag) + len(close_tag) + 1
+    first_limit = limit - overhead - (len(pre) + 1 if pre else 0)
+    rest_limit = limit - overhead
+    first_limit = max(120, first_limit)
+    rest_limit = max(120, rest_limit)
+    parts = _pack_plain_chunks(body, min(first_limit, rest_limit))
+    out: List[str] = []
+    for i, part in enumerate(parts):
+        quoted = f"{open_tag}{part}{close_tag}"
+        if i == 0 and pre:
+            quoted = f"{pre}\n{quoted}"
+        if len(quoted) > limit:
+            # запасний розріз уже всередині частини
+            for sub in _pack_plain_chunks(part, max(80, limit - overhead - len(pre) - 1)):
+                piece = f"{open_tag}{sub}{close_tag}"
+                if i == 0 and pre and not out:
+                    piece = f"{pre}\n{piece}"
+                out.append(piece)
+        else:
+            out.append(quoted)
+    return out
+
+
+def _pack_plain_chunks(text: str, limit: int) -> List[str]:
+    atoms: List[str] = []
+    for line in (text or "").split("\n"):
+        if len(line) <= limit or "<" in line:
+            atoms.append(line)
+            continue
+        buf = ""
+        bits = line.split(", ")
+        for i, bit in enumerate(bits):
+            piece = bit if i == len(bits) - 1 else bit + ", "
+            if buf and len(buf) + len(piece) > limit:
+                atoms.append(buf.rstrip())
+                buf = piece
+            else:
+                buf += piece
+        if buf:
+            atoms.append(buf.rstrip())
+    if not atoms:
+        return []
+    chunks: List[str] = []
+    cur = ""
+    for atom in atoms:
+        nxt = atom if not cur else cur + "\n" + atom
+        if cur and len(nxt) > limit:
+            chunks.append(cur)
+            cur = atom
+        else:
+            cur = nxt
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _building_identity(token: str) -> str:
+    """'12 А' == '12а' == '12-А'. '6' і '6А - Г' лишаються різними."""
+    return (
+        (token or "")
+        .strip()
+        .lower()
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("–", "")
+        .replace("—", "")
+    )
+
+
+def merge_building_names(*lists: str) -> str:
+    """Зліва направо: номери з наступного запису дописуються, якщо їх ще не було."""
+    seen: set = set()
+    out: List[str] = []
+    for raw in lists:
+        for part in (raw or "").replace(";", ",").split(","):
+            part = " ".join(part.split())
+            if not part:
+                continue
+            key = _building_identity(part)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(part)
+    return ", ".join(out)
+
+
+def _msg_dedup_key(outage: dict, house: str) -> str:
+    """Одна адреса + той самий початок і кінець.
+
+    Шкільна і ШКІЛЬНА зливаються. Якщо в іншому записі відключення довше
+    (інший datePlanIn / dateEvent) — ключ інший, сповіщення йде окремо.
+    """
+    street = outage.get("street") or {}
+    sname = _norm_street(street.get("name") or "")
+    city = (outage.get("city") or {}).get("id") or (outage.get("city") or {}).get("name") or ""
+    start = (outage.get("dateEvent") or "")[:16]
+    end = (outage.get("datePlanIn") or "")[:16]
+    hse = (house or "").strip().lower().lstrip("0") or "0"
+    return f"{city}|{sname}|{hse}|{start}|{end}"
 
 
 def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
     """
     items: [(outage, addr), ...]
-    Повертає одне або кілька HTML-повідомлень (ліміт Telegram 4096).
-    Кожен блок (подія або графік на день) не розрізається, поки вміщається.
+    Усі події, без стелі «перші 10».
+    Ділиться на кілька повідомлень лише коли не влазить у 4096 символів Telegram.
     """
     header = "⚠️ <b>Нові відключення по твоїх адресах:</b>"
     blocks: List[str] = []
     seen_sched: set = set()
+    grouped: List[Tuple[dict, dict]] = []
+    group_at: Dict[str, int] = {}
+    for outage, addr in items:
+        user_house = str(addr.get("house") or addr.get("building") or "").strip()
+        ev_key = _msg_dedup_key(outage, user_house)
+        # Той самий інтервал — не друге повідомлення, а допис номерів будинків.
+        # Довший (або інший) інтервал має інший ключ і лишається окремою подією.
+        if ev_key in group_at:
+            prev, _prev_addr = grouped[group_at[ev_key]]
+            prev["buildingNames"] = merge_building_names(
+                prev.get("buildingNames") or "",
+                outage.get("buildingNames") or "",
+            )
+            if not (prev.get("koment") or "").strip() and (outage.get("koment") or "").strip():
+                prev["koment"] = outage.get("koment")
+            continue
+        group_at[ev_key] = len(grouped)
+        grouped.append((dict(outage), addr))
+
     # «сьогодні» по Києву (UTC+2 зимою; для відсікання минулих днів достатньо)
     today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
-    shown = items[:10]
-    for outage, addr in shown:
+    for outage, addr in grouped:
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
         blocks.append(format_outage(outage, user_house=user_house))
         ymds = _outage_span_ymds(outage, from_ymd=today_ymd)
@@ -1041,9 +1180,6 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
                     blocks.append(block)
             except Exception as e:
                 log.warning("schedule block: %s", e)
-    extra = len(items) - len(shown)
-    if extra > 0:
-        blocks.append(f"…і ще {extra} подій за цими адресами")
     return pack_html_messages(blocks, header)
 
 
