@@ -2,13 +2,13 @@
 Монітор публічного каналу ЖОЕ (URL у секреті ZTOE_CHANNEL_URL): нові пости → канал + DM підписникам бота.
 
 Логіка:
-  1. Тягнемо публічну веб-версію каналу, збираємо пости (data-post="<канал>/<id>").
-  2. last_id беремо з Mongo: колекція `channel_monitor_state` (_id = назва каналу)
-     в тій самій БД (MONGO_DB), що й решта модулів. Чужі колекції НЕ чіпаємо.
-  3. Перший запуск — лише запам'ятовуємо найбільший id, нічого не шлемо.
-  4. Усі id > last_id (за зростанням): беремо текст, шлемо в канал і юзерам бота,
-     і тільки потім двигаємо last_id (якщо канал не прийняв — зупиняємось,
-     наступний запуск повторить).
+1. Тягнемо публічну веб-версію каналу, збираємо пости (data-post="<канал>/<id>").
+2. last_id беремо з Mongo: колекція `channel_monitor_state` (_id = назва каналу)
+   в тій самій БД (MONGO_DB), що й решта модулів. Чужі колекції НЕ чіпаємо.
+3. Перший запуск — лише запам'ятовуємо найбільший id, нічого не шлемо.
+4. Усі id > last_id (за зростанням): беремо текст, шлемо в канал і юзерам бота,
+   і тільки потім двигаємо last_id (якщо канал не прийняв — зупиняємось,
+   наступний запуск повторить).
 
 Пересилаємо ТІЛЬКИ пости, текст яких містить одну з фраз із RELEVANT_PHRASES
 (порівняння нечутливе до регістру, емодзі, розділових знаків і зайвих пробілів).
@@ -18,19 +18,18 @@
 (повідомлення йде як caption до фото — одне повідомлення).
 
 Лог проходу:
-  - якщо була активність (нові пости / ініціалізація / помилки) → гілка 12135
-  - якщо просто перевірка без нових постів → гілка 13196
-  Лог-група: TELEGRAM_LOG_CHANNEL_ID
+- якщо була активність (нові пости / ініціалізація / помилки) → гілка 12135
+- якщо просто перевірка без нових постів → гілка 13196
+Лог-група: TELEGRAM_LOG_CHANNEL_ID
 
 Env:
-  MONGO_URI, MONGO_DB          — як у решти модулів
-  TELEGRAM_BOT_TOKEN           — бот, що пише в канал
-  TELEGRAM_CHANNEL_ID          — канал-приймач
-  ZTOE_BOT_TOKEN               — бот для DM підписникам (+ логи)
-  TELEGRAM_LOG_CHANNEL_ID      — лог-група
-  ZTOE_CHANNEL_URL             — https://t.me/s/<канал> (обов'язково, лише в секретах)
+  MONGO_URI, MONGO_DB       — як у решти модулів
+  TELEGRAM_BOT_TOKEN        — бот, що пише в канал
+  TELEGRAM_CHANNEL_ID       — канал-приймач
+  ZTOE_BOT_TOKEN            — бот для DM підписникам (+ логи)
+  TELEGRAM_LOG_CHANNEL_ID   — лог-група
+  ZTOE_CHANNEL_URL          — https://t.me/s/<канал> (обов'язково, лише в секретах)
 """
-
 from __future__ import annotations
 
 import html
@@ -60,17 +59,20 @@ def _channel_from_url(url: str) -> str:
 CHANNEL_URL = (os.getenv("ZTOE_CHANNEL_URL") or "").strip()
 if not CHANNEL_URL:
     raise RuntimeError("Немає секрету ZTOE_CHANNEL_URL")
+
 SOURCE_CHANNEL = _channel_from_url(CHANNEL_URL)  # назва каналу для data-post і посилань на пости
 PAGE_URL = f"https://t.me/s/{SOURCE_CHANNEL}"
 STATE_COLLECTION = "channel_monitor_state"
+
 # kind не входить у PREF_DEFAULTS бота → user_wants() віддає True кожному з notify=true.
 # Якщо колись додасте окремий перемикач у боті — просто додайте ключ у PREF_DEFAULTS.
 NOTIFY_KIND = "ztoe_news"
+
 TEXT_LIMIT = 3500  # запас до 4096 під шапку/посилання
 
 # Гілки (topics) у лог-групі
-LOG_THREAD_ID_ACTIVITY = 12135   # були нові пости / ініціалізація / помилки
-LOG_THREAD_ID_IDLE = 13196       # просто перевірка без нових постів
+LOG_THREAD_ID_ACTIVITY = 12135  # були нові пости / ініціалізація / помилки
+LOG_THREAD_ID_IDLE = 13196      # просто перевірка без нових постів
 
 # Ліміт Telegram — 4096 символів на повідомлення (після HTML-екранування); з запасом 4000.
 # Якщо лог довший — він відправляється файлом .txt
@@ -94,18 +96,31 @@ RELEVANT_PHRASES = (
 )
 
 # ---------- лог ----------
-
 _LOG_LINES: List[str] = []
 
 # Службові маркери: текст між ними в лозі загортається в розкриту цитату (<blockquote expandable>)
 _Q_OPEN = "\x01"
 _Q_CLOSE = "\x02"
 
+# Службові маркери для клікабельного посилання: _L_OPEN <url> _L_SEP <текст> _L_CLOSE
+_L_OPEN = "\x03"
+_L_SEP = "\x04"
+_L_CLOSE = "\x05"
+_LINK_RE = re.compile(f"{_L_OPEN}(.*?){_L_SEP}(.*?){_L_CLOSE}", re.DOTALL)
+
+
+def _link(url: str, text: str) -> str:
+    """Повертає маркований фрагмент, який send_log_to_thread перетворить на <a href>."""
+    url = url.replace(_L_OPEN, "").replace(_L_SEP, "").replace(_L_CLOSE, "")
+    text = text.replace(_L_OPEN, "").replace(_L_SEP, "").replace(_L_CLOSE, "")
+    return f"{_L_OPEN}{url}{_L_SEP}{text}{_L_CLOSE}"
+
 
 def log_to_buffer(msg: str) -> None:
     """Пише і в спільний буфер log_utils, і в локальний (для відправки в гілку)."""
     _LOG_LINES.append(msg)
-    _log_to_buffer(msg)
+    # У спільний буфер (GitHub Actions тощо) — без маркерів: «текст (url)»
+    _log_to_buffer(_LINK_RE.sub(r"\2 (\1)", msg))
 
 
 def send_log_to_thread(title: str, message_thread_id: int) -> None:
@@ -119,16 +134,22 @@ def send_log_to_thread(title: str, message_thread_id: int) -> None:
         return
 
     raw = "\n".join(_LOG_LINES)
-    plain = raw.replace(_Q_OPEN, "").replace(_Q_CLOSE, "")  # для .txt без розмітки
+
+    # для .txt без розмітки: «текст (url)»
+    plain = _LINK_RE.sub(r"\2 (\1)", raw).replace(_Q_OPEN, "").replace(_Q_CLOSE, "")
+
     body_html = (
         html.escape(raw)
         .replace(_Q_CLOSE + "\n", "</blockquote>")
         .replace(_Q_CLOSE, "</blockquote>")
         .replace(_Q_OPEN, "<blockquote expandable>")
     )
-    text = f"<b>{html.escape(title)}</b>\n\n{body_html}"
-    base = f"https://api.telegram.org/bot{token}"
+    # html.escape вже екранував лапки та & в URL — безпечно для href
+    body_html = _LINK_RE.sub(r'<a href="\1">\2</a>', body_html)
 
+    text = f"<b>{html.escape(title)}</b>\n\n{body_html}"
+
+    base = f"https://api.telegram.org/bot{token}"
     try:
         if len(text) <= LOG_MESSAGE_LIMIT:
             r = requests.post(
@@ -163,7 +184,6 @@ def send_log_to_thread(title: str, message_thread_id: int) -> None:
 
 
 # ---------- парсинг ----------
-
 def _post_text(el) -> str:
     """Текст самого поста (не прев'ю відповіді/репосту)."""
     for t in el.select(".tgme_widget_message_text"):
@@ -217,7 +237,6 @@ def fetch_posts() -> Dict[int, dict]:
 
 
 # ---------- фільтр ----------
-
 def _norm(text: str) -> str:
     """Нижній регістр; лишаємо тільки літери й цифри (емодзі, пунктуація, пробіли, \u200b геть)."""
     return "".join(ch for ch in (text or "").casefold() if ch.isalnum())
@@ -232,7 +251,6 @@ def is_relevant(text: str) -> bool:
 
 
 # ---------- відправка ----------
-
 def format_message(post: dict) -> str:
     text = post["text"]
     if len(text) > TEXT_LIMIT:
@@ -266,6 +284,7 @@ def send_to_users(message: str) -> Tuple[int, int, int]:
     if not token:
         log_to_buffer("⚠️ Немає ZTOE_BOT_TOKEN — DM не шлю")
         return 0, 0, 0
+
     users = [u for u in load_notify_users(NOTIFY_KIND) if u.get("telegram_id") is not None]
     if not users:
         log_to_buffer("ℹ️ Немає підписників бота для DM")
@@ -292,7 +311,6 @@ def send_to_users(message: str) -> Tuple[int, int, int]:
 
 
 # ---------- стан ----------
-
 def save_last_id(col, last_id: int) -> None:
     col.update_one(
         {"_id": SOURCE_CHANNEL},
@@ -302,7 +320,6 @@ def save_last_id(col, last_id: int) -> None:
 
 
 # ---------- main ----------
-
 def run() -> bool:
     """
     Повертає True, якщо була активність (нові пости, ініціалізація, помилки тощо).
@@ -311,8 +328,8 @@ def run() -> bool:
     col = get_db()[STATE_COLLECTION]
     posts = fetch_posts()
     ids: List[int] = sorted(posts)
-    state = col.find_one({"_id": SOURCE_CHANNEL})
 
+    state = col.find_one({"_id": SOURCE_CHANNEL})
     page_max = ids[-1] if ids else 0
     log_to_buffer(f"📥 Сторінка: {len(ids)} постів, max_id={page_max}")
 
@@ -324,7 +341,6 @@ def run() -> bool:
 
     last = int(state["last_id"])
     new_ids = [i for i in ids if i > last]
-
     if not new_ids:
         log_to_buffer(f"ℹ️ Нових постів немає (last_id={last}, на сторінці до {page_max})")
         log_to_buffer("📌 Підсумок: прохід без змін, нічого не розсилали")
@@ -349,8 +365,9 @@ def run() -> bool:
         if reason:
             # Використовуємо оригінальний секрет (CHANNEL_URL),
             # щоб GitHub міг замаскувати його в Actions-логах.
-            # У Telegram-лог-групі посилання будуть клікабельними.
+            # У Telegram-лог-групі причина пропуску — клікабельне посилання на пост.
             post_url = f"{CHANNEL_URL.rstrip('/')}/{pid}"
+            reason_link = _link(post_url, reason)
 
             if reason == "не підходить під фільтр":
                 snippet = " ".join((p["text"] or "").split())  # в один рядок
@@ -360,17 +377,18 @@ def run() -> bool:
                     snippet = snippet[:200].rstrip() + "…"
                 snippet = snippet.replace(_Q_OPEN, "").replace(_Q_CLOSE, "")
                 log_to_buffer(
-                    f"⏭ #{pid} пропущено: {reason}\n"
-                    f"{post_url}\n"
+                    f"⏭ #{pid} пропущено: {reason_link}\n"
                     f"{_Q_OPEN}«{snippet}»{_Q_CLOSE}"
                 )
             else:
-                log_to_buffer(f"⏭ #{pid} пропущено: {reason}\n{post_url}")
+                log_to_buffer(f"⏭ #{pid} пропущено: {reason_link}")
+
             save_last_id(col, pid)
             skipped += 1
             continue
 
         message = format_message(p)
+
         if not send_to_channel(message):
             log_to_buffer(
                 f"❌ #{pid}: канал не прийняв, last_id НЕ рухаю — повторю наступного запуску"
@@ -383,10 +401,12 @@ def run() -> bool:
 
         sent_to_channel += 1
         log_to_buffer(f"✅ #{pid} відправлено в канал ({len(p['text'])} симв.) + фото")
+
         s, f, u = send_to_users(message)
         total_dm_sent += s
         total_dm_failed += f
         total_dm_users = u
+
         save_last_id(col, pid)
         log_to_buffer(f"💾 #{pid}: last_id оновлено в Mongo")
 
@@ -431,3 +451,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+  
