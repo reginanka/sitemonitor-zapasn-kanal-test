@@ -40,6 +40,7 @@ from __future__ import annotations
 import re
 
 import asyncio
+import html
 import logging
 import os
 import sys
@@ -367,6 +368,11 @@ def format_forecast_period(date_event: str, date_plan: str) -> str:
     return ""
 
 
+def h(value) -> str:
+    """Екранує текст для Telegram HTML. Інакше «<» у koment/будинках ламає parse_mode."""
+    return html.escape("" if value is None else str(value), quote=False)
+
+
 def format_outage(outage: dict, user_house: str = "") -> str:
     """
     Формує текст однієї події.
@@ -380,16 +386,17 @@ def format_outage(outage: dict, user_house: str = "") -> str:
       📌 Тип
       🔔 для будинків: ...
     """
-    city = (outage.get("city") or {}).get("name", "?")
-    street = (outage.get("street") or {}).get("name", "?")
-    buildings = (outage.get("buildingNames") or "").strip()
+    city = h((outage.get("city") or {}).get("name", "?"))
+    street = h((outage.get("street") or {}).get("name", "?"))
+    buildings = h((outage.get("buildingNames") or "").strip())
     date_event_raw = outage.get("dateEvent") or ""
     date_plan_raw = outage.get("datePlanIn") or ""
-    date_plan = (date_plan_raw or "")[:16].replace("T", " ")
+    date_plan = h((date_plan_raw or "")[:16].replace("T", " "))
     icon, type_name, type_desc = outage_notify_label(outage)
-    koment = (outage.get("koment") or "").strip()
+    type_name, type_desc = h(type_name), h(type_desc)
+    koment = h((outage.get("koment") or "").strip())
 
-    house = (user_house or "").strip()
+    house = h((user_house or "").strip())
     addr_line = f"{city}, {street}"
     if house:
         addr_line += f", {house}"
@@ -397,8 +404,8 @@ def format_outage(outage: dict, user_house: str = "") -> str:
     # --- видима шапка ---
     if outage.get("_plan_updated"):
         text = f"⏱ <b>Оновлення:</b> {addr_line}"
-        was = (outage.get("_plan_was") or "")[:16].replace("T", " ")
-        period = format_forecast_period(date_event_raw, date_plan_raw)
+        was = h((outage.get("_plan_was") or "")[:16].replace("T", " "))
+        period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if was and date_plan and was != date_plan:
             text += f"\n⏳ План: <s>{was}</s> → <b>{date_plan}</b>"
             if period:
@@ -407,7 +414,7 @@ def format_outage(outage: dict, user_house: str = "") -> str:
             text += f"\n📅 {period}"
     else:
         text = f"{icon} <b>{addr_line}</b>"
-        period = format_forecast_period(date_event_raw, date_plan_raw)
+        period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
             text += f"\n📅 {period}"
 
@@ -921,20 +928,102 @@ def format_schedule_block_for_notify(
     return f"<blockquote expandable>{body}</blockquote>"
 
 
-def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
+TG_TEXT_LIMIT = 4096
+_HTML_TAG_RE = re.compile(
+    r"<(/?)(blockquote|b|u|s|i|code|pre|a|tg-spoiler)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def fit_telegram_html(text: str, limit: int = TG_TEXT_LIMIT) -> str:
+    """Обрізає текст до ліміту Telegram і закриває теги, які розріз обірвав.
+
+    text[:4096] лишав <blockquote> без </blockquote> —
+    Telegram відповідав Can't parse entities.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+
+    def _stack(fragment: str) -> list:
+        stack: list = []
+        for m in _HTML_TAG_RE.finditer(fragment):
+            name = m.group(2).lower()
+            if m.group(1):
+                if name in stack:
+                    while stack and stack[-1] != name:
+                        stack.pop()
+                    if stack and stack[-1] == name:
+                        stack.pop()
+            else:
+                stack.append(name)
+        return stack
+
+    cut = text[:limit]
+    lt, gt = cut.rfind("<"), cut.rfind(">")
+    if lt > gt:
+        cut = cut[:lt]
+    nl = cut.rfind("\n")
+    if nl >= int(limit * 0.5):
+        cut = cut[:nl]
+    cut = cut.rstrip()
+    closers = "".join(f"</{name}>" for name in reversed(_stack(cut)))
+    if len(cut) + len(closers) > limit:
+        cut = cut[: max(0, limit - len(closers))]
+        lt, gt = cut.rfind("<"), cut.rfind(">")
+        if lt > gt:
+            cut = cut[:lt]
+        cut = cut.rstrip()
+        closers = "".join(f"</{name}>" for name in reversed(_stack(cut)))
+        if len(cut) + len(closers) > limit:
+            cut = cut[: max(0, limit - len(closers))].rstrip()
+    return (cut + closers).strip()
+
+
+def pack_html_messages(
+    blocks: List[str],
+    header: str,
+    limit: int = TG_TEXT_LIMIT,
+) -> List[str]:
+    """Складає блоки в кілька повідомлень, кожне ≤ limit і з закритими тегами."""
+    msgs: List[str] = []
+    cur = header.strip()
+    cont = "⚠️ <b>Продовження:</b>"
+    for raw in blocks:
+        block = (raw or "").strip()
+        if not block:
+            continue
+        if len(block) > limit - len(cont) - 4:
+            block = fit_telegram_html(block, limit - len(cont) - 4)
+        candidate = f"{cur}\n\n{block}" if cur else block
+        if len(candidate) <= limit:
+            cur = candidate
+            continue
+        if cur:
+            msgs.append(fit_telegram_html(cur, limit))
+        cur = f"{cont}\n\n{block}"
+        if len(cur) > limit:
+            cur = fit_telegram_html(block, limit)
+    if cur:
+        msgs.append(fit_telegram_html(cur, limit))
+    return [m for m in msgs if m]
+
+
+def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
     """
     items: [(outage, addr), ...]
-    Верх: список подій з датами.
-    Низ: графік на кожен день покриття (від сьогодні / старту до кінця плану).
+    Повертає одне або кілька HTML-повідомлень (ліміт Telegram 4096).
+    Кожен блок (подія або графік на день) не розрізається, поки вміщається.
     """
-    lines = ["⚠️ <b>Нові відключення по твоїх адресах:</b>", ""]
+    header = "⚠️ <b>Нові відключення по твоїх адресах:</b>"
+    blocks: List[str] = []
     seen_sched: set = set()
     # «сьогодні» по Києву (UTC+2 зимою; для відсікання минулих днів достатньо)
     today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
-    for outage, addr in items[:10]:
+    shown = items[:10]
+    for outage, addr in shown:
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
-        lines.append(format_outage(outage, user_house=user_house))
-        lines.append("")
+        blocks.append(format_outage(outage, user_house=user_house))
         ymds = _outage_span_ymds(outage, from_ymd=today_ymd)
         if not ymds:
             ymds = [_outage_day_ymd(outage)]
@@ -949,11 +1038,13 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> str:
             try:
                 block = format_schedule_block_for_notify(db, addr, outage, ymd=ymd)
                 if block:
-                    lines.append(block)
-                    lines.append("")
+                    blocks.append(block)
             except Exception as e:
                 log.warning("schedule block: %s", e)
-    return "\n".join(lines).strip()
+    extra = len(items) - len(shown)
+    if extra > 0:
+        blocks.append(f"…і ще {extra} подій за цими адресами")
+    return pack_html_messages(blocks, header)
 
 
 def _norm_street(name: str) -> str:
@@ -1581,18 +1672,31 @@ def main() -> int:
         bot = Bot(token=bot_token, request=request)
         try:
             for tid, item_list in notified.items():
-                text = build_notify_message(db, item_list)
+                texts = build_notify_message(db, item_list)
                 silent = is_quiet_now(_user_by_tid.get(int(tid)))
-                try:
-                    await bot.send_message(
-                        chat_id=tid,
-                        text=text[:4096],
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                        disable_notification=silent,
-                    )
-                except Exception as e:
-                    log.error("Send fail %s: %s", tid, e)
+                failed = False
+                for part_i, text in enumerate(texts):
+                    try:
+                        await bot.send_message(
+                            chat_id=tid,
+                            text=fit_telegram_html(text),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                            disable_notification=silent,
+                        )
+                    except Exception as e:
+                        log.error(
+                            "Send fail %s part %s/%s: %s",
+                            tid,
+                            part_i + 1,
+                            len(texts),
+                            e,
+                        )
+                        failed = True
+                        break
+                    if part_i + 1 < len(texts):
+                        await asyncio.sleep(0.25)
+                if failed:
                     continue
 
                 for outage, addr in item_list:
@@ -1609,9 +1713,10 @@ def main() -> int:
                 else:
                     sent_sound += 1
                 log.info(
-                    "Надіслано %s (outages=%s silent=%s)",
+                    "Надіслано %s (outages=%s parts=%s silent=%s)",
                     tid,
                     len(item_list),
+                    len(texts),
                     silent,
                 )
                 await asyncio.sleep(0.35)
