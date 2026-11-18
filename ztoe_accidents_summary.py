@@ -3,6 +3,8 @@
 Звіт про аварійні відключення в Житомирській області (ЖОЕ).
 
 - Тягне всі записи з /pw_accidents
+- Залишає лише справжні аварії (ГАВ/СГАВ) і лише ті, що ЗАРАЗ активні
+  (dateEvent ≤ now ≤ datePlanIn; якщо datePlanIn немає — після початку)
 - Рахує унікальні вулиці / нас. пункти по РЕМ
 - Сортує РЕМ за часткою району без світла (% вулиць), не за старою карткою
 - Під кожним РЕМ — населені пункти: % РЕМ і % вимкнення самого н.п.
@@ -1629,6 +1631,35 @@ def is_real_accident(doc: dict) -> bool:
     return t == 1
 
 
+def is_currently_active(doc: dict, now: datetime | None = None) -> bool:
+    """
+    True, якщо зараз (now) знаходиться в проміжку [dateEvent, datePlanIn].
+    Якщо datePlanIn немає — вважаємо активним, якщо dateEvent уже настав.
+    Записи без dateEvent відкидаємо.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    def _parse(s):
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
+    start = _parse(doc.get("dateEvent"))
+    end = _parse(doc.get("datePlanIn"))
+
+    if start is None:
+        return False
+    if start > now:
+        return False
+    if end is None:
+        return True
+    return now <= end
+
+
 def _note_city_rems(accidents: List[dict]) -> None:
     """city id → РЕМ з усіх записів API, включно з ГПВ. Картку міста не чіпаємо."""
     global _CITY_REM_VOTES, _CITY_REM_NAMES
@@ -1674,20 +1705,28 @@ def fetch_all_accidents() -> List[dict]:
             if isinstance(data, list):
                 log_to_buffer(f"API: list → {len(data)} записів")
                 _note_city_rems(data)
-                filtered = [x for x in data if is_real_accident(x)]
+                now = datetime.now(timezone.utc)
+                filtered = [
+                    x for x in data
+                    if is_real_accident(x) and is_currently_active(x, now)
+                ]
                 log_to_buffer(
                     f"Фільтр аварій: {len(data)} → {len(filtered)} "
-                    f"(відкинуто ГПВ/не-аварії: {len(data) - len(filtered)})"
+                    f"(відкинуто ГПВ/не-аварії/неактивні: {len(data) - len(filtered)})"
                 )
                 return filtered
             batch = data.get("hydra:member") or []
             if batch:
                 log_to_buffer(f"API: pagination=false → {len(batch)} записів")
                 _note_city_rems(batch)
-                filtered = [x for x in batch if is_real_accident(x)]
+                now = datetime.now(timezone.utc)
+                filtered = [
+                    x for x in batch
+                    if is_real_accident(x) and is_currently_active(x, now)
+                ]
                 log_to_buffer(
                     f"Фільтр аварій: {len(batch)} → {len(filtered)} "
-                    f"(відкинуто ГПВ/не-аварії: {len(batch) - len(filtered)})"
+                    f"(відкинуто ГПВ/не-аварії/неактивні: {len(batch) - len(filtered)})"
                 )
                 return filtered
         except Exception as e:
@@ -1713,10 +1752,14 @@ def fetch_all_accidents() -> List[dict]:
 
     _note_city_rems(items)
     raw_n = len(items)
-    items = [a for a in items if is_real_accident(a)]
+    now = datetime.now(timezone.utc)
+    items = [
+        a for a in items
+        if is_real_accident(a) and is_currently_active(a, now)
+    ]
     log_to_buffer(
         f"Фільтр аварій: {raw_n} → {len(items)} "
-        f"(відкинуто ГПВ/не-аварії: {raw_n - len(items)})"
+        f"(відкинуто ГПВ/не-аварії/неактивні: {raw_n - len(items)})"
     )
     return items
 
