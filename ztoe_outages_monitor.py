@@ -416,11 +416,16 @@ def format_outage(outage: dict, user_house: str = "") -> str:
 
     # --- видима шапка ---
     if outage.get("_cancelled"):
-        text = f"✅ <b>Скасовано:</b> {addr_line}"
-        text += "\nЗапис зник з графіка ЖОЕ до запланованого кінця."
+        # _fixed_early: період уже почався, світло повернули раніше кінця
+        if outage.get("_fixed_early"):
+            text = f"✅ <b>Усунуто раніше:</b> {addr_line}"
+            text += "\nСвітло повернули до закінчення запланованого періоду."
+        else:
+            text = f"✅ <b>Скасовано:</b> {addr_line}"
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
-            text += f"\n📅 {period}"
+            # період закреслюємо — його вже немає в графіку
+            text += f"\n📅 <s>{period}</s>"
     elif outage.get("_plan_updated"):
         text = f"⏱ <b>Оновлення:</b> {addr_line}"
         was = h((outage.get("_plan_was") or "")[:16].replace("T", " "))
@@ -1420,6 +1425,22 @@ def plan_still_open(outage: dict, now: Optional[datetime] = None) -> bool:
     return _to_utc(end) > now.astimezone(timezone.utc)
 
 
+def period_has_started(outage: dict, now: Optional[datetime] = None) -> bool:
+    """True, якщо dateEvent уже настав (або немає старту — вважаємо, що період «йде»).
+
+    Потрібно, щоб відрізнити «скасували до початку» від «полагодили раніше кінця».
+    """
+    start = _parse_iso_dt(str(outage.get("dateEvent") or ""))
+    if start is None:
+        # без старту не стверджуємо «ще не почалось»
+        return True
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_kyiv_zone())
+    return _to_utc(start) <= now.astimezone(timezone.utc)
+
+
 def _outage_interval_utc(outage: dict) -> Optional[Tuple[datetime, datetime]]:
     start = _parse_iso_dt(str(outage.get("dateEvent") or ""))
     end = _parse_iso_dt(str(outage.get("datePlanIn") or ""))
@@ -1585,6 +1606,9 @@ def select_early_cancellations(
         item["key"] = key
         item["_cancelled"] = True
         item["_cancel_reason"] = "gone_before_plan_end"
+        # Період уже йшов → світло повернули раніше; інакше — скасували до старту
+        if period_has_started(rec, now=now):
+            item["_fixed_early"] = True
         early.append(item)
     return early
 
