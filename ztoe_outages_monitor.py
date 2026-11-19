@@ -419,7 +419,7 @@ def format_outage(outage: dict, user_house: str = "") -> str:
         # _fixed_early: період уже почався, світло повернули раніше кінця
         if outage.get("_fixed_early"):
             text = f"✅ <b>Усунуто раніше:</b> {addr_line}"
-            text += "\nСвітло повернули до закінчення запланованого періоду."
+            text += "\nАварійні роботи завершили раніше."
         else:
             text = f"✅ <b>Скасовано:</b> {addr_line}"
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
@@ -1142,7 +1142,7 @@ def merge_building_names(*lists: str) -> str:
 def _msg_dedup_key(outage: dict, house: str) -> str:
     """Одна адреса + той самий початок і кінець.
 
-    Шкільна і ШКІЛЬНА зливаються. Якщо в іншому записі відключення довше
+    Звичайний регістр назви вулиці зоивається з капслоком. Якщо в іншому записі відключення довше
     (інший datePlanIn / dateEvent) — ключ інший, сповіщення йде окремо.
     """
     street = outage.get("street") or {}
