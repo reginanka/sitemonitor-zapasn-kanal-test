@@ -58,6 +58,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
@@ -1831,19 +1832,31 @@ def _human_run_summary(
     body = "\n\n".join(_human_group(rep) for rep in reports) or "Груп немає."
     who = ""
     if deliveries:
-        who = "\nКому надіслано:\n" + "\n".join(deliveries) + "\n"
+        who = "Кому надіслано:\n" + "\n".join(deliveries)
     text = (
         "✅ Перевірка відключень\n"
         f"Підписників: {users}. Локацій: {groups_checked}.\n\n"
         f"{body}\n\n"
         f"У розсилку пішло {n_events}: нових {n_new}, скасувань {n_cancels}.\n"
         f"Повідомлення отримали {sent} "
-        f"(зі звуком {sent_sound}, тихо {sent_quiet}).\n"
-        f"{who}"
+        f"(зі звуком {sent_sound}, тихо {sent_quiet})."
     )
-    if len(text) > 4000:
-        text = text[:3990].rstrip() + "\n…"
-    return text
+    if who:
+        text = text.rstrip() + "\n\n" + who
+    if len(text) <= TG_TEXT_LIMIT:
+        return text, None
+    short = (
+        "✅ Перевірка відключень\n"
+        f"Підписників: {users}. Локацій: {groups_checked}.\n"
+        f"У розсилку пішло {n_events}: нових {n_new}, скасувань {n_cancels}.\n"
+        f"Повідомлення отримали {sent} "
+        f"(зі звуком {sent_sound}, тихо {sent_quiet}).\n\n"
+        "Детальний звіт у файлі.\n\n"
+        + (who or "Кому надіслано:\nнемає")
+    )
+    if len(short) > TG_TEXT_LIMIT:
+        short = short[: TG_TEXT_LIMIT - 20].rstrip() + "\n… решта у файлі"
+    return short, text
 
 
 def main() -> int:
@@ -2455,7 +2468,7 @@ def main() -> int:
                 )
                 await asyncio.sleep(0.35)
 
-            summary = _human_run_summary(
+            summary, attachment = _human_run_summary(
                 group_reports,
                 users=len(users),
                 groups_checked=groups_checked,
@@ -2485,6 +2498,14 @@ def main() -> int:
                         text=summary,
                         message_thread_id=153,
                     )
+                    if attachment:
+                        doc = BytesIO(attachment.encode("utf-8"))
+                        doc.name = "outages-log.txt"
+                        await bot.send_document(
+                            chat_id=int(log_chat),
+                            document=doc,
+                            message_thread_id=153,
+                        )
                 except Exception as e:
                     log.warning("log channel: %s", e)
         finally:
