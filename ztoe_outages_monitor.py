@@ -1236,7 +1236,7 @@ def remember_user_notified(col, tid: int, outage: dict, addr: dict) -> None:
         try:
             col.delete_one({"_id": f"{int(tid)}:{orig}"})
         except Exception as e:
-            log.warning("drop appearance dedup %s: %s", tid, e)
+            log.warning("drop appearance dedup: %s", e)
     else:
         dkey = notify_dedup_key(outage, house)
     otg_raw = addr.get("otg_id") or addr.get("otgId") or 0
@@ -1744,6 +1744,108 @@ def build_cancel_message(items: List[Tuple[dict, dict]]) -> List[str]:
     return pack_html_messages(blocks, header)
 
 
+def _group_city_name(group_pairs, outages) -> str:
+    for _user, addr in group_pairs or []:
+        name = (addr.get("city_name") or addr.get("city") or "").strip()
+        if isinstance(name, str) and name:
+            return name
+    for outage in outages or []:
+        name = ((outage.get("city") or {}).get("name") or "").strip()
+        if name:
+            return name
+    return ""
+
+
+def _human_group(rep: dict) -> str:
+    title = (rep.get("city_name") or "").strip() or f"місто {rep.get('city_id')}"
+    if not rep.get("fetch_ok"):
+        return (
+            f"• {title}: ЖОЕ не відповіло, кеш не змінював. "
+            f"Адрес підписників: {rep.get('addrs', 0)}."
+        )
+    quiet = not any(
+        (
+            rep.get("new"),
+            rep.get("plan_upd"),
+            rep.get("gone_early"),
+            rep.get("matched"),
+            rep.get("cancel_matched"),
+            rep.get("unmatched"),
+        )
+    )
+    if quiet:
+        return (
+            f"• {title}: без змін. "
+            f"Записів у відповіді {rep['fetched']}, адрес {rep['addrs']}."
+        )
+    waiting = max(0, int(rep.get("gone_early") or 0) - int(rep.get("cancel_ready") or 0))
+    lines = [
+        f"• {title}",
+        (
+            f"У відповіді {rep['fetched']} записів, "
+            f"для сповіщень {rep['active']}. Адрес підписників: {rep['addrs']}."
+        ),
+        f"Нових: {rep['new']}. Оновлень часу: {rep['plan_upd']}.",
+        (
+            f"Зникли з видачі: {rep['gone_early']}. "
+            f"Скасування підтверджено: {rep.get('cancel_ready', 0)}. "
+            f"Ще чекають повторної перевірки: {waiting}."
+        ),
+    ]
+    if rep.get("skipped_planned") or rep.get("skipped_gpv"):
+        lines.append(
+            f"Пропущено вже відомих планових: {rep['skipped_planned']}, "
+            f"погодинних графіків: {rep['skipped_gpv']}."
+        )
+    lines.append(
+        f"Збіглося з адресами: {rep['matched']}. "
+        f"Скасувань у розсилку: {rep['cancel_matched']}."
+    )
+    if rep.get("covered_skip"):
+        lines.append(
+            "Не слав скасування, бо цю адресу вже покриває інший запис: "
+            f"{rep['covered_skip']}."
+        )
+    if rep.get("unmatched"):
+        lines.append(
+            "Зараз відключень на цих адресах немає: "
+            + "; ".join(rep["unmatched"])
+            + "."
+        )
+    return "\n".join(lines)
+
+
+def _human_run_summary(
+    reports: List[dict],
+    *,
+    users: int,
+    groups_checked: int,
+    n_events: int,
+    n_new: int,
+    n_cancels: int,
+    sent: int,
+    sent_sound: int,
+    sent_quiet: int,
+    deliveries: Optional[List[str]] = None,
+) -> str:
+    body = "\n\n".join(_human_group(rep) for rep in reports) or "Груп немає."
+    who = ""
+    if deliveries:
+        who = "\nКому надіслано:\n" + "\n".join(deliveries) + "\n"
+    text = (
+        "✅ Перевірка відключень\n"
+        f"Підписників: {users}. Локацій: {groups_checked}.\n\n"
+        f"{body}\n\n"
+        f"У розсилку пішло {n_events}: нових {n_new}, скасувань {n_cancels}.\n"
+        f"Повідомлення отримали {sent} "
+        f"(зі звуком {sent_sound}, тихо {sent_quiet}).\n"
+        f"{who}"
+    )
+    if len(text) > 4000:
+        text = text[:3990].rstrip() + "\n…"
+    return text
+
+
 def main() -> int:
     mongo_uri = os.getenv("MONGO_URI")
     if not mongo_uri:
@@ -1850,6 +1952,7 @@ def main() -> int:
                 group_reports.append({
                     "otg_id": otg_id,
                     "city_id": city_id,
+                    "city_name": _group_city_name(group_pairs, []),
                     "fetch_ok": False,
                     "addrs": len(group_pairs),
                 })
@@ -2131,6 +2234,7 @@ def main() -> int:
             group_reports.append({
                 "otg_id": otg_id,
                 "city_id": city_id,
+                "city_name": _group_city_name(group_pairs, outages),
                 "fetch_ok": True,
                 "fetched": len(outages),
                 "active": len(active_outages),
@@ -2289,8 +2393,7 @@ def main() -> int:
                     )
                 except Exception as e:
                     log.error(
-                        "Send fail %s part %s/%s: %s",
-                        tid,
+                        "Send fail part %s/%s: %s",
                         part_i + 1,
                         len(texts),
                         e,
@@ -2307,25 +2410,36 @@ def main() -> int:
                 try:
                     remember_user_notified(notified_col, int(tid), outage, addr)
                 except Exception as e:
-                    log.error("mark notified fail %s: %s", tid, e)
+                    log.error("mark notified fail: %s", e)
 
         try:
             tids = list(dict.fromkeys([*notified.keys(), *cancelled.keys()]))
+            deliveries: List[str] = []
             for tid in tids:
                 new_items = notified.get(tid) or []
                 gone_items = cancelled.get(tid) or []
                 silent = is_quiet_now(_user_by_tid.get(int(tid)))
-                ok_any = False
+                new_ok = False
+                cancel_ok = False
                 if new_items and await _send_parts(tid, build_notify_message(db, new_items), silent):
-                    ok_any = True
+                    new_ok = True
                     _mark(tid, new_items)
                 if gone_items:
                     if new_items:
                         await asyncio.sleep(0.25)
                     if await _send_parts(tid, build_cancel_message(gone_items), silent):
-                        ok_any = True
+                        cancel_ok = True
                         _mark(tid, gone_items)
-                if not ok_any:
+                mode = "тихо" if silent else "зі звуком"
+                if new_ok or cancel_ok:
+                    deliveries.append(
+                        f"{tid} — нові {len(new_items)}, скасування {len(gone_items)}, {mode}"
+                    )
+                else:
+                    deliveries.append(
+                        f"{tid} — не дійшло (нові {len(new_items)}, скасування {len(gone_items)})"
+                    )
+                if not (new_ok or cancel_ok):
                     continue
 
                 sent += 1
@@ -2334,51 +2448,34 @@ def main() -> int:
                 else:
                     sent_sound += 1
                 log.info(
-                    "Надіслано %s (new=%s cancel=%s silent=%s)",
-                    tid,
+                    "Надіслано new=%s cancel=%s silent=%s",
                     len(new_items),
                     len(gone_items),
                     silent,
                 )
                 await asyncio.sleep(0.35)
 
-            city_lines = []
-            for rep in group_reports:
-                if not rep.get("fetch_ok"):
-                    city_lines.append(
-                        f"• otg={rep['otg_id']} city={rep['city_id']}: "
-                        f"неповний fetch, кеш не чіпав (адрес {rep['addrs']})"
-                    )
-                    continue
-                line = (
-                    f"• otg={rep['otg_id']} city={rep['city_id']}\n"
-                    f"  fetched={rep['fetched']} active={rep['active']} "
-                    f"addrs={rep['addrs']}\n"
-                    f"  new={rep['new']} plan_upd={rep['plan_upd']} "
-                    f"gone={rep['gone_early']} cancel_ready={rep.get('cancel_ready', 0)}\n"
-                    f"  skipped_planned={rep['skipped_planned']} "
-                    f"skipped_gpv={rep['skipped_gpv']}\n"
-                    f"  matched={rep['matched']} cancel={rep['cancel_matched']}"
-                )
-                if rep.get("covered_skip"):
-                    line += f" covered_skip={rep['covered_skip']}"
-                if rep.get("unmatched"):
-                    line += "\n  без збігу: " + "; ".join(rep["unmatched"])
-                city_lines.append(line)
-
-            summary = (
-                "✅ Перевірка відключень\n"
-                f"Підписників: {len(users)}\n"
-                f"Локацій: {groups_checked}\n\n"
-                + ("\n\n".join(city_lines) if city_lines else "Груп немає")
-                + "\n\n"
-                f"Подій для розсилки: {n_events} "
-                f"(нових {n_new}, скасувань {n_cancels})\n"
-                f"Сповіщень: {sent} (звук={sent_sound} тихо={sent_quiet})"
+            summary = _human_run_summary(
+                group_reports,
+                users=len(users),
+                groups_checked=groups_checked,
+                n_events=n_events,
+                n_new=n_new,
+                n_cancels=n_cancels,
+                sent=sent,
+                sent_sound=sent_sound,
+                sent_quiet=sent_quiet,
+                deliveries=deliveries,
             )
-            if len(summary) > 4000:
-                summary = summary[:3990].rstrip() + "\n…"
-            log.info("%s", summary.replace("\n", " | "))
+            log.info(
+                "підсумок subscribers=%s locations=%s events=%s sent=%s sound=%s quiet=%s",
+                len(users),
+                groups_checked,
+                n_events,
+                sent,
+                sent_sound,
+                sent_quiet,
+            )
 
             if log_chat:
                 try:
