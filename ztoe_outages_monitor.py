@@ -82,6 +82,9 @@ OUTAGES_RETENTION_HOURS = int(os.getenv("OUTAGES_RETENTION_HOURS", "48"))
 SOFT_FPS_MAX = int(os.getenv("SOFT_FPS_MAX", "3000"))
 OUTAGES_CACHE_RETENTION_DAYS = int(os.getenv("OUTAGES_CACHE_RETENTION_DAYS", "30"))
 USER_NOTIFIED_TTL_DAYS = int(os.getenv("USER_NOTIFIED_TTL_DAYS", "7"))
+# Скільки успішних прогонів підряд запис має бути відсутній в API,
+# перш ніж слати «скасовано». 1 = як раніше (перший пропуск уже сповіщення).
+CANCEL_MISS_RUNS = max(1, int(os.getenv("CANCEL_MISS_RUNS", "2")))
 
 
 def merge_soft_fps(current_soft: Set[str], prev_soft: Set[str], limit: int = SOFT_FPS_MAX) -> List[str]:
@@ -1641,6 +1644,39 @@ def still_covered_for_addr(
     return False
 
 
+def pending_cancel_doc(item: dict) -> dict:
+    """Знімок зниклого запису + лічильник пропусків (скільки успішних fetch його не було)."""
+    doc = snapshot_from_outage(item)
+    doc["key"] = str(item.get("key") or doc.get("key") or "")
+    try:
+        doc["miss"] = int(item.get("miss") or 1)
+    except (TypeError, ValueError):
+        doc["miss"] = 1
+    return doc
+
+
+def apply_cancel_miss_streak(gone: List[dict], need: int = CANCEL_MISS_RUNS) -> Tuple[List[dict], List[dict]]:
+    """Перший пропуск лише запам'ятовуємо. Сповіщення — з N-го підряд.
+
+    Повертає (confirmed, pending). pending пишеться в кеш навіть для ще
+    не підтверджених, щоб наступний успішний прогін збільшив лічильник.
+    Якщо запис повернувся в API, його вже немає в gone — streak обривається.
+    """
+    confirmed: List[dict] = []
+    pending: List[dict] = []
+    for item in gone or []:
+        try:
+            miss = int(item.get("miss") or 0) + 1
+        except (TypeError, ValueError):
+            miss = 1
+        item = dict(item)
+        item["miss"] = miss
+        pending.append(item)
+        if miss >= need:
+            confirmed.append(item)
+    return confirmed, pending
+
+
 def cancel_notify_dedup_key(outage: dict, house: str = "") -> str:
     """Окремий від появи ключ, інакше «вже слали про відключення» з’їсть скасування."""
     return "gone|" + notify_dedup_key(outage, house)
@@ -1754,6 +1790,7 @@ def main() -> int:
     notified: Dict[int, list] = {}
     cancelled: Dict[int, list] = {}
     groups_checked = 0
+    group_reports: List[dict] = []
 
     # Один HTTP-клієнт на весь прогін
     http = httpx.Client(
@@ -1810,6 +1847,12 @@ def main() -> int:
                     otg_id,
                     city_id,
                 )
+                group_reports.append({
+                    "otg_id": otg_id,
+                    "city_id": city_id,
+                    "fetch_ok": False,
+                    "addrs": len(group_pairs),
+                })
                 continue
             current_ids = {make_outage_key(o) for o in outages}
             current_fps = {content_fingerprint(o) for o in outages}
@@ -1824,19 +1867,16 @@ def main() -> int:
             new_outages = [o for o in outages if content_fingerprint(o) in new_fps]
 
             filtered = []
+            skipped_gpv = 0
+            skipped_planned = 0
             for o in new_outages:
                 # ГПВ (switchSubReason=2) — це графік, не «нова аварія»
                 if not should_notify_outage(o):
-                    log.info(
-                        "skip GPV/non-notify id=%s sub=%s type=%s",
-                        o.get("id"),
-                        o.get("switchSubReason"),
-                        o.get("typeOff"),
-                    )
+                    skipped_gpv += 1
                     continue
                 soft = soft_fingerprint(o)
                 if type_family(o.get("typeOff")) == "planned" and soft in prev_soft:
-                    log.info("skip planned after known soft=%s", soft)
+                    skipped_planned += 1
                     continue
                 filtered.append(o)
             new_outages = filtered
@@ -1891,37 +1931,26 @@ def main() -> int:
                 oo["datePlanIn"] = new_plan if len(new_plan) == 16 else (o.get("datePlanIn") or new_plan)
                 plan_updates.append(oo)
                 seen_plan_adk.add(adk)
-                log.info(
-                    "otg=%s city=%s plan change (addr_day max): %s → %s adk=%s id=%s",
-                    otg_id,
-                    city_id,
-                    old_plan,
-                    new_plan,
-                    adk,
-                    o.get("id"),
-                )
 
             if plan_updates:
-                log.info(
-                    "otg=%s city=%s plan_updates=%s",
-                    otg_id,
-                    city_id,
-                    len(plan_updates),
-                )
                 new_outages = list(new_outages) + plan_updates
 
             prev_records = previous_snapshot_records(cache, outages_full)
-            early = select_early_cancellations(prev_records, outages)
+            gone = select_early_cancellations(prev_records, outages)
+            early, pending_gone = apply_cancel_miss_streak(gone)
 
             log.info(
-                "otg=%s city=%s fetched=%s cache_fps=%s new=%s plan_upd=%s gone_early=%s",
+                "otg=%s city=%s fetched=%s new=%s plan_upd=%s gone_early=%s "
+                "cancel_ready=%s skipped_planned=%s skipped_gpv=%s",
                 otg_id,
                 city_id,
                 len(outages),
-                len(prev_fps),
                 max(0, len(new_outages) - len(plan_updates)),
                 len(plan_updates),
+                len(gone),
                 len(early),
+                skipped_planned,
+                skipped_gpv,
             )
 
             # Bulk upsert full docs (для /check)
@@ -2033,23 +2062,10 @@ def main() -> int:
                     len(group_pairs),
                     len(active_outages),
                 )
-                if active_outages and not matched_fps:
-                    sample = []
-                    for o in active_outages[:5]:
-                        st = (o.get("street") or {}).get("name") or "?"
-                        bld = (o.get("buildingNames") or "")[:40]
-                        sample.append(f"{st}|{bld}|type={o.get('typeOff')}")
-                    log.info("no street/house match; API sample: %s", " || ".join(sample))
-                    for user, addr in group_pairs:
-                        log.info(
-                            "  user street=%r id=%s house=%r",
-                            addr.get("street_name") or addr.get("street"),
-                            addr.get("street_id") or addr.get("streetId"),
-                            addr.get("house") or addr.get("building"),
-                        )
 
             # Запис був у попередньому знімку, з API зник, а datePlanIn ще попереду.
             matched_cancel = 0
+            covered_skip = 0
             if early:
                 for user, addr in group_pairs:
                     tid = user.get("telegram_id")
@@ -2071,11 +2087,7 @@ def main() -> int:
                         if not matches_building(outage, house):
                             continue
                         if still_covered_for_addr(outage, outages, street_id, street_name, house):
-                            log.info(
-                                "skip cancel, address still covered tid=%s key=%s",
-                                tid,
-                                outage.get("key"),
-                            )
+                            covered_skip += 1
                             continue
                         dkey = cancel_notify_dedup_key(outage, house)
                         if dkey in already_keys:
@@ -2094,12 +2106,46 @@ def main() -> int:
                         already_keys.add(dkey)
                         matched_cancel += 1
                 log.info(
-                    "otg=%s city=%s cancel_matched=%s gone_early=%s",
+                    "otg=%s city=%s cancel_matched=%s gone_early=%s covered_skip=%s",
                     otg_id,
                     city_id,
                     matched_cancel,
                     len(early),
+                    covered_skip,
                 )
+
+            unmatched: List[str] = []
+            if active_outages and not matched_fps:
+                seen_addr = set()
+                for _user, addr in group_pairs:
+                    street = (addr.get("street_name") or addr.get("street") or "?").strip()
+                    house = str(addr.get("house") or addr.get("building") or "").strip()
+                    label = f"{street} {house}".strip()
+                    if label in seen_addr:
+                        continue
+                    seen_addr.add(label)
+                    unmatched.append(label)
+                    if len(unmatched) >= 8:
+                        break
+
+            group_reports.append({
+                "otg_id": otg_id,
+                "city_id": city_id,
+                "fetch_ok": True,
+                "fetched": len(outages),
+                "active": len(active_outages),
+                "addrs": len(group_pairs),
+                "new": max(0, len(new_outages) - len(plan_updates)),
+                "plan_upd": len(plan_updates),
+                "gone_early": len(gone),
+                "cancel_ready": len(early),
+                "skipped_planned": skipped_planned,
+                "skipped_gpv": skipped_gpv,
+                "matched": len(matched_fps),
+                "cancel_matched": matched_cancel,
+                "covered_skip": covered_skip,
+                "unmatched": unmatched,
+            })
 
             # Кеш оновлюємо лише після повного fetch.
             # snapshot — те, що API віддав зараз; pending_cancels — зниклі до кінця,
@@ -2123,7 +2169,7 @@ def main() -> int:
                         "soft_fps": soft_stored,
                         "plan_by_addr_day": plan_by_addr_day,
                         "snapshot": [snapshot_from_outage(o) for o in outages],
-                        "pending_cancels": [snapshot_from_outage(o) for o in early],
+                        "pending_cancels": [pending_cancel_doc(o) for o in pending_gone],
                         "updated_at": datetime.now(timezone.utc),
                         "count": len(current_ids),
                     }
@@ -2296,13 +2342,42 @@ def main() -> int:
                 )
                 await asyncio.sleep(0.35)
 
+            city_lines = []
+            for rep in group_reports:
+                if not rep.get("fetch_ok"):
+                    city_lines.append(
+                        f"• otg={rep['otg_id']} city={rep['city_id']}: "
+                        f"неповний fetch, кеш не чіпав (адрес {rep['addrs']})"
+                    )
+                    continue
+                line = (
+                    f"• otg={rep['otg_id']} city={rep['city_id']}\n"
+                    f"  fetched={rep['fetched']} active={rep['active']} "
+                    f"addrs={rep['addrs']}\n"
+                    f"  new={rep['new']} plan_upd={rep['plan_upd']} "
+                    f"gone={rep['gone_early']} cancel_ready={rep.get('cancel_ready', 0)}\n"
+                    f"  skipped_planned={rep['skipped_planned']} "
+                    f"skipped_gpv={rep['skipped_gpv']}\n"
+                    f"  matched={rep['matched']} cancel={rep['cancel_matched']}"
+                )
+                if rep.get("covered_skip"):
+                    line += f" covered_skip={rep['covered_skip']}"
+                if rep.get("unmatched"):
+                    line += "\n  без збігу: " + "; ".join(rep["unmatched"])
+                city_lines.append(line)
+
             summary = (
-                f"✅ Перевірка відключень\n"
+                "✅ Перевірка відключень\n"
                 f"Підписників: {len(users)}\n"
-                f"Локацій: {groups_checked}\n"
-                f"Подій для розсилки: {n_events} (нових {n_new}, скасувань {n_cancels})\n"
-                f"Сповіщень: {sent} (🔊={sent_sound} 🔇={sent_quiet})"
+                f"Локацій: {groups_checked}\n\n"
+                + ("\n\n".join(city_lines) if city_lines else "Груп немає")
+                + "\n\n"
+                f"Подій для розсилки: {n_events} "
+                f"(нових {n_new}, скасувань {n_cancels})\n"
+                f"Сповіщень: {sent} (звук={sent_sound} тихо={sent_quiet})"
             )
+            if len(summary) > 4000:
+                summary = summary[:3990].rstrip() + "\n…"
             log.info("%s", summary.replace("\n", " | "))
 
             if log_chat:
