@@ -47,6 +47,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -77,8 +78,19 @@ PAGE_URL = f"https://t.me/s/{SOURCE_CHANNEL}"
 # Якщо секрету немає — беремо ім'я з ZTOE_CHANNEL_URL.
 LINK_CHANNEL = (os.getenv("ZTOE_CHANNEL_NAME") or "").strip().lstrip("@") or SOURCE_CHANNEL
 
-# Посилання для футера повідомлень, що йдуть у канал
-SITE_URL = (os.environ.get("URL") or "").strip()
+def _site_root(url: str) -> str:
+    """https://домен/сторінка?x=1 → https://домен (без шляху, параметрів і якоря)."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if "://" not in u:
+        u = "https://" + u
+    p = urlparse(u)
+    return f"{p.scheme}://{p.netloc}" if p.netloc else ""
+
+
+# Посилання для футера повідомлень (канал і DM); URL обрізається до кореня сайту
+SITE_URL = _site_root(os.environ.get("URL") or "")
 SUBSCRIBE_URL = (os.environ.get("SUBSCRIBE") or "").strip()
 
 STATE_COLLECTION = "channel_monitor_state"
