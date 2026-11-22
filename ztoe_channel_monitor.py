@@ -17,8 +17,9 @@
 При відправці релевантного поста додається картинка assets/channel.jpg
 (повідомлення йде як caption до фото — одне повідомлення).
 
-Повідомлення в КАНАЛ додатково містить внизу відступ та рядок посилань
-«🔗 Сайт "ЖОЕ" | ⚡️ ПІДПИСАТИСЯ». У DM користувачам цього футера немає.
+Повідомлення (і в канал, і в DM) містить внизу відступ, рядок посилань
+«🔗 Сайт "ЖОЕ" | ⚡️ ПІДПИСАТИСЯ» та час/дату поста «🕐 ГГ:ХХ ДД.ММ» (за Києвом,
+час публікації поста в джерельному каналі; якщо його не вдалось прочитати — поточний).
 
 Лог проходу:
 - якщо була активність (нові пости / ініціалізація / помилки) → гілка 12135
@@ -32,9 +33,10 @@ Env:
   ZTOE_BOT_TOKEN            — бот для DM підписникам (+ логи)
   TELEGRAM_LOG_CHANNEL_ID   — лог-група
   ZTOE_CHANNEL_URL          — https://t.me/s/<канал> (обов'язково, лише в секретах)
-  URL                       — посилання для «🔗 Сайт "ЖОЕ"» у футері каналу
-  SUBSCRIBE                 — посилання для «⚡️ ПІДПИСАТИСЯ» у футері каналу
-                              (якщо будь-яке з двох не задано — футер не додається)
+  URL                       — посилання для «🔗 Сайт "ЖОЕ"» у футері
+  SUBSCRIBE                 — посилання для «⚡️ ПІДПИСАТИСЯ» у футері
+                              (якщо будь-яке з двох не задано — рядка посилань не буде,
+                              час «🕐» додається завжди)
 """
 from __future__ import annotations
 
@@ -45,6 +47,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -215,8 +218,31 @@ def _post_text(el) -> str:
     return ""
 
 
+def _kyiv_tz():
+    for name in ("Europe/Kyiv", "Europe/Kiev"):
+        try:
+            return ZoneInfo(name)
+        except Exception:  # noqa: BLE001
+            continue
+    return timezone.utc
+
+
+KYIV_TZ = _kyiv_tz()
+
+
+def _post_dt(el) -> Optional[datetime]:
+    """Час публікації поста з веб-версії каналу (<time datetime="...">), або None."""
+    t = el.select_one("a.tgme_widget_message_date time[datetime]") or el.select_one("time[datetime]")
+    if not t:
+        return None
+    try:
+        return datetime.fromisoformat(t["datetime"].replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def parse_posts(page: str) -> Dict[int, dict]:
-    """{id: {text, forwarded, service}} для всіх постів на сторінці."""
+    """{id: {text, forwarded, service, dt}} для всіх постів на сторінці."""
     soup = BeautifulSoup(page, "html.parser")
     pat = re.compile(rf"^{re.escape(SOURCE_CHANNEL)}/(\d+)$", re.IGNORECASE)
     out: Dict[int, dict] = {}
@@ -231,6 +257,7 @@ def parse_posts(page: str) -> Dict[int, dict]:
             "text": _post_text(el),
             "forwarded": bool(el.select_one(".tgme_widget_message_forwarded_from")),
             "service": "service" in classes or "service" in wrap_classes,
+            "dt": _post_dt(el),
         }
     return out
 
@@ -268,34 +295,33 @@ def is_relevant(text: str) -> bool:
 
 
 # ---------- відправка ----------
-def format_message(post: dict) -> str:
-    """Базове повідомлення (для DM користувачам) — без футера з посиланнями."""
-    text = post["text"]
-    if len(text) > TEXT_LIMIT:
-        text = text[:TEXT_LIMIT].rstrip() + "…"
-    return f"<b>ЖОЕ інформує -</b>\n\n{html.escape(text)}"
-
-
-def build_channel_footer() -> str:
+def build_footer(post_dt: Optional[datetime]) -> str:
     """
-    Футер лише для повідомлень у канал: порожній рядок-відступ + рядок посилань.
-    Якщо ZTOE_SITE_URL / ZTOE_SUBSCRIBE_URL не задані — повертає "" (футера не буде).
+    Футер для всіх повідомлень (канал і DM): відступ + рядок посилань + «🕐 ГГ:ХХ ДД.ММ».
+    Якщо URL / SUBSCRIBE не задані — посилань не буде, час усе одно додається.
     """
-    if not SITE_URL or not SUBSCRIBE_URL:
-        return ""
     parts: List[str] = []
-    parts.append("")  # Додатковий відступ після всіх черг дати
+    parts.append("")  # Додатковий відступ
     # Посилання
-    parts.append(
-        f'<a href="{html.escape(SITE_URL, quote=True)}">🔗 Сайт "ЖОЕ"</a> | '
-        f'<a href="{html.escape(SUBSCRIBE_URL, quote=True)}">⚡️ ПІДПИСАТИСЯ </a>'
-    )
+    if SITE_URL and SUBSCRIBE_URL:
+        parts.append(
+            f'<a href="{html.escape(SITE_URL, quote=True)}">🔗 Сайт "ЖОЕ"</a> | '
+            f'<a href="{html.escape(SUBSCRIBE_URL, quote=True)}">⚡️ ПІДПИСАТИСЯ</a>'
+        )
+    # Час і дата поста (за Києвом)
+    dt = post_dt or datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    parts.append(f"🕐 {dt.astimezone(KYIV_TZ):%H:%M %d.%m}")
     return "\n" + "\n".join(parts)
 
 
-def format_channel_message(post: dict) -> str:
-    """Повідомлення для каналу = базове + футер з посиланнями."""
-    return format_message(post) + build_channel_footer()
+def format_message(post: dict) -> str:
+    """Повідомлення і для каналу, і для DM: текст + відступ + посилання + час."""
+    text = post["text"]
+    if len(text) > TEXT_LIMIT:
+        text = text[:TEXT_LIMIT].rstrip() + "…"
+    return f"<b>ЖОЕ інформує -</b>\n\n{html.escape(text)}" + build_footer(post.get("dt"))
 
 
 def _get_photo_list() -> List[str]:
@@ -389,7 +415,7 @@ def run() -> bool:
     log_to_buffer(f"🔔 Нових постів: {len(new_ids)} ({new_ids[0]}…{new_ids[-1]}), last_id={last}")
 
     if not SITE_URL or not SUBSCRIBE_URL:
-        log_to_buffer("⚠️ Не задано URL / SUBSCRIBE — футер у канал не додається")
+        log_to_buffer("⚠️ Не задано URL / SUBSCRIBE — посилання у футері не додаються")
 
     sent_to_channel = 0
     skipped = 0
@@ -429,10 +455,9 @@ def run() -> bool:
             skipped += 1
             continue
 
-        message = format_message(p)                 # для DM — без футера
-        channel_message = format_channel_message(p)  # для каналу — з відступом і посиланнями
+        message = format_message(p)  # однаковий для каналу і DM: посилання + час внизу
 
-        if not send_to_channel(channel_message):
+        if not send_to_channel(message):
             log_to_buffer(
                 f"❌ #{pid}: канал не прийняв, last_id НЕ рухаю — повторю наступного запуску"
             )
