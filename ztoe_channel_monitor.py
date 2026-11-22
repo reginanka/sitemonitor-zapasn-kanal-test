@@ -17,6 +17,9 @@
 При відправці релевантного поста додається картинка assets/channel.jpg
 (повідомлення йде як caption до фото — одне повідомлення).
 
+Повідомлення в КАНАЛ додатково містить внизу відступ та рядок посилань
+«🔗 Сайт "ЖОЕ" | ⚡️ ПІДПИСАТИСЯ». У DM користувачам цього футера немає.
+
 Лог проходу:
 - якщо була активність (нові пости / ініціалізація / помилки) → гілка 12135
 - якщо просто перевірка без нових постів → гілка 13196
@@ -29,6 +32,9 @@ Env:
   ZTOE_BOT_TOKEN            — бот для DM підписникам (+ логи)
   TELEGRAM_LOG_CHANNEL_ID   — лог-група
   ZTOE_CHANNEL_URL          — https://t.me/s/<канал> (обов'язково, лише в секретах)
+  URL                       — посилання для «🔗 Сайт "ЖОЕ"» у футері каналу
+  SUBSCRIBE                 — посилання для «⚡️ ПІДПИСАТИСЯ» у футері каналу
+                              (якщо будь-яке з двох не задано — футер не додається)
 """
 from __future__ import annotations
 
@@ -67,6 +73,10 @@ PAGE_URL = f"https://t.me/s/{SOURCE_CHANNEL}"
 # Посилання вигляду https://t.me/<канал>/<id> (без /s/) відкривається прямо в застосунку Telegram.
 # Якщо секрету немає — беремо ім'я з ZTOE_CHANNEL_URL.
 LINK_CHANNEL = (os.getenv("ZTOE_CHANNEL_NAME") or "").strip().lstrip("@") or SOURCE_CHANNEL
+
+# Посилання для футера повідомлень, що йдуть у канал
+SITE_URL = (os.environ.get("URL") or "").strip()
+SUBSCRIBE_URL = (os.environ.get("SUBSCRIBE") or "").strip()
 
 STATE_COLLECTION = "channel_monitor_state"
 
@@ -259,10 +269,33 @@ def is_relevant(text: str) -> bool:
 
 # ---------- відправка ----------
 def format_message(post: dict) -> str:
+    """Базове повідомлення (для DM користувачам) — без футера з посиланнями."""
     text = post["text"]
     if len(text) > TEXT_LIMIT:
         text = text[:TEXT_LIMIT].rstrip() + "…"
     return f"<b>ЖОЕ інформує -</b>\n\n{html.escape(text)}"
+
+
+def build_channel_footer() -> str:
+    """
+    Футер лише для повідомлень у канал: порожній рядок-відступ + рядок посилань.
+    Якщо ZTOE_SITE_URL / ZTOE_SUBSCRIBE_URL не задані — повертає "" (футера не буде).
+    """
+    if not SITE_URL or not SUBSCRIBE_URL:
+        return ""
+    parts: List[str] = []
+    parts.append("")  # Додатковий відступ після всіх черг дати
+    # Посилання
+    parts.append(
+        f'<a href="{html.escape(SITE_URL, quote=True)}">🔗 Сайт "ЖОЕ"</a> | '
+        f'<a href="{html.escape(SUBSCRIBE_URL, quote=True)}">⚡️ ПІДПИСАТИСЯ </a>'
+    )
+    return "\n" + "\n".join(parts)
+
+
+def format_channel_message(post: dict) -> str:
+    """Повідомлення для каналу = базове + футер з посиланнями."""
+    return format_message(post) + build_channel_footer()
 
 
 def _get_photo_list() -> List[str]:
@@ -355,6 +388,9 @@ def run() -> bool:
 
     log_to_buffer(f"🔔 Нових постів: {len(new_ids)} ({new_ids[0]}…{new_ids[-1]}), last_id={last}")
 
+    if not SITE_URL or not SUBSCRIBE_URL:
+        log_to_buffer("⚠️ Не задано URL / SUBSCRIBE — футер у канал не додається")
+
     sent_to_channel = 0
     skipped = 0
     total_dm_sent = 0
@@ -393,9 +429,10 @@ def run() -> bool:
             skipped += 1
             continue
 
-        message = format_message(p)
+        message = format_message(p)                 # для DM — без футера
+        channel_message = format_channel_message(p)  # для каналу — з відступом і посиланнями
 
-        if not send_to_channel(message):
+        if not send_to_channel(channel_message):
             log_to_buffer(
                 f"❌ #{pid}: канал не прийняв, last_id НЕ рухаю — повторю наступного запуску"
             )
@@ -457,4 +494,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-   
