@@ -22,6 +22,8 @@ jobs:
       ZTOE_BOT_TOKEN: ${{ secrets.ZTOE_BOT_TOKEN }}
       TELEGRAM_LOG_CHANNEL_ID: ${{ secrets.TELEGRAM_LOG_CHANNEL_ID }}
       ZTOE_CHANNEL_URL: ${{ secrets.ZTOE_CHANNEL_URL }}
+      URL: ${{ secrets.URL }}
+      SUBSCRIBE: ${{ secrets.SUBSCRIBE }}
 
     steps:
       - name: Checkout repository
