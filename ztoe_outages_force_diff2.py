@@ -151,15 +151,9 @@ def addr_day_key_from_parts(
     buildings: str,
     day: str,
 ) -> str:
-    sid = street_id or _norm(street_name)
-    parts = sorted(
-        {
-            p.strip().lower()
-            for p in (buildings or "").replace(";", ",").split(",")
-            if p.strip()
-        }
-    )
-    return f"{city_id or ''}|{sid}|{','.join(parts)}|{day}"
+    # Як у monitor v1.6+: city|street|day — без списку будинків
+    sid = street_id if street_id not in (None, "") else _norm(street_name)
+    return f"{city_id or ''}|{sid}|{day}"
 
 
 def snapshot_rec(t: dict, *, fake_id: int) -> dict:
