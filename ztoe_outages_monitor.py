@@ -15,9 +15,13 @@
   або міняє id/час замість оновлення. Ми агрегуємо non-GPV записи по addr_day
   і порівнюємо агреговані (start, end) з попереднім знімком.
 - Зміна min(start)/max(end) на тому самому addr_day → «⏱ Зміна періоду»
-  з Було/Стало; блок графіка знизу — актуальне об’єднання інтервалів.
-- Якщо в агрегації є пізніший старт з /pw_accidents (напр. 09:28 при плані 08:00)
-  → у тексті додається «ℹ️ Фактичний старт робіт: 09:28».
+  з Було/Стало (лише якщо рядки після форматування різняться);
+  блок графіка знизу — актуальне об’єднання інтервалів.
+- Інтервал той самий, але з’явився пізніший старт з /pw_accidents
+  (напр. план 08:00–18:00 уже був, accident 09:28) → окреме
+  «ℹ️ Фактичний старт робіт» без Було/Стало (дедуп actual|…).
+- Якщо план+accident в одному першому fetch → нове сповіщення з рядком
+  «Фактичний старт» у звичайному тексті.
 - Новий addr_day → нове сповіщення. Повне зникнення addr_day до datePlanIn
   (після CANCEL_MISS_RUNS пропусків) → «Скасовано».
 - Після успішного повного fetch записи, яких більше немає в API для цієї
@@ -538,6 +542,14 @@ def format_outage(outage: dict, user_house: str = "") -> str:
         if period:
             # період закреслюємо — його вже немає в графіку
             text += f"\n📅 <s>{period}</s>"
+    elif outage.get("_actual_start_only"):
+        # Прогнозний інтервал той самий, з’явився лише фактичний старт з accidents
+        text = f"ℹ️ <b>Фактичний старт робіт:</b> {addr_line}"
+        if actual_hhmm:
+            text += f"\n🕐 {h(actual_hhmm)}"
+        period = h(format_forecast_period(date_event_raw, date_plan_raw))
+        if period:
+            text += f"\n📅 {period}"
     elif outage.get("_plan_updated"):
         text = f"⏱ <b>Зміна періоду:</b> {addr_line}"
         was_event = outage.get("_was_dateEvent") or ""
@@ -548,6 +560,7 @@ def format_outage(outage: dict, user_house: str = "") -> str:
             if was:
                 was_period = was
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
+        # Було/Стало лише коли після форматування рядки реально різняться
         if was_period and period and was_period != period:
             text += f"\n⏳ Було: <s>{was_period}</s>"
             text += f"\n📅 Стало: {period}"
@@ -555,7 +568,7 @@ def format_outage(outage: dict, user_house: str = "") -> str:
             text += f"\n📅 {period}"
         elif was_period:
             text += f"\n⏳ Було: <s>{was_period}</s>"
-        # Фактичний старт робіт (план був раніше, accidents приніс точніший час)
+        # Фактичний старт (разом зі справжньою зміною меж інтервалу)
         if actual_hhmm:
             text += f"\nℹ️ Фактичний старт робіт: {h(actual_hhmm)}"
     else:
@@ -1359,6 +1372,8 @@ def remember_user_notified(col, tid: int, outage: dict, addr: dict) -> None:
             col.delete_one({"_id": f"{int(tid)}:{orig}"})
         except Exception as e:
             log.warning("drop appearance dedup: %s", e)
+    elif outage.get("_actual_start_only"):
+        dkey = actual_start_notify_dedup_key(outage, house)
     else:
         dkey = notify_dedup_key(outage, house)
     otg_raw = addr.get("otg_id") or addr.get("otgId") or 0
@@ -1804,6 +1819,21 @@ def cancel_notify_dedup_key(outage: dict, house: str = "") -> str:
     return "gone|" + notify_dedup_key(outage, house)
 
 
+def actual_start_notify_dedup_key(outage: dict, house: str = "") -> str:
+    """Окремий ключ: поява фактичного старту не блокується старим «план на 08:00–18:00»."""
+    actual = _fmt_hhmm_from_iso(str(outage.get("_actual_start") or ""))
+    return "actual|" + notify_dedup_key(outage, house) + f"|{actual}"
+
+
+def outage_notify_dedup_key(outage: dict, house: str = "") -> str:
+    """Єдиний вхід для дедупу залежно від типу події."""
+    if outage.get("_cancelled"):
+        return cancel_notify_dedup_key(outage, house)
+    if outage.get("_actual_start_only"):
+        return actual_start_notify_dedup_key(outage, house)
+    return notify_dedup_key(outage, house)
+
+
 def _fetch_pair(
     client: httpx.Client,
     *,
@@ -1889,6 +1919,7 @@ def _human_group(rep: dict) -> str:
         (
             rep.get("new"),
             rep.get("plan_upd"),
+            rep.get("actual_start"),
             rep.get("gone_early"),
             rep.get("matched"),
             rep.get("cancel_matched"),
@@ -1908,7 +1939,10 @@ def _human_group(rep: dict) -> str:
             f"У відповіді {rep['fetched']} записів, "
             f"для сповіщень {rep['active']}. Адрес підписників: {rep['addrs']}."
         ),
-        f"Нових: {rep['new']}. Оновлень часу: {rep['plan_upd']}.",
+        (
+            f"Нових: {rep['new']}. Оновлень часу: {rep['plan_upd']}. "
+            f"Фактичний старт: {rep.get('actual_start', 0)}."
+        ),
         (
             f"Зникли з видачі: {rep['gone_early']}. "
             f"Скасування підтверджено: {rep.get('cancel_ready', 0)}. "
@@ -2168,6 +2202,7 @@ def main() -> int:
             cur_agg = aggregate_by_addr_day(outages)
             new_outages: list = []
             plan_updates: list = []
+            actual_start_notices: list = []
             seen_adk: set = set()
 
             for adk, agg in cur_agg.items():
@@ -2187,10 +2222,13 @@ def main() -> int:
                     new_outages.append(agg)
                     continue
 
-                # Той самий addr_day: зміна інтервалу → «зміна періоду»
-                if (old_start and cur_start and old_start[:16] != cur_start[:16]) or (
-                    old_end and cur_end and old_end[:16] != cur_end[:16]
-                ):
+                interval_changed = (
+                    (old_start and cur_start and old_start[:16] != cur_start[:16])
+                    or (old_end and cur_end and old_end[:16] != cur_end[:16])
+                )
+
+                if interval_changed:
+                    # Реальний зсув min(start)/max(end) → «зміна періоду»
                     oo = dict(agg)
                     oo["_plan_updated"] = True
                     oo["_plan_was"] = old_end
@@ -2198,23 +2236,30 @@ def main() -> int:
                     oo["_was_datePlanIn"] = old_end
                     oo["_plan_reason"] = "addr_day_agg"
                     plan_updates.append(oo)
-                # інтервал без змін — мовчки (навіть якщо з’явився новий id)
+                elif agg.get("_actual_start"):
+                    # Інтервал той самий, але з’явився/є фактичний старт з accidents
+                    # (план 08:00–18:00 уже був → окремо кажемо «почали о 09:28»)
+                    oo = dict(agg)
+                    oo["_actual_start_only"] = True
+                    actual_start_notices.append(oo)
+                # інтервал без змін і без фактичного старту — мовчки
 
-            if plan_updates:
-                new_outages = list(new_outages) + plan_updates
+            if plan_updates or actual_start_notices:
+                new_outages = list(new_outages) + plan_updates + actual_start_notices
 
             prev_records = prev_records_early
             gone = select_early_cancellations(prev_records, outages)
             early, pending_gone = apply_cancel_miss_streak(gone)
 
             log.info(
-                "otg=%s city=%s fetched=%s new=%s plan_upd=%s gone_early=%s "
-                "cancel_ready=%s skipped_planned=%s skipped_gpv=%s",
+                "otg=%s city=%s fetched=%s new=%s plan_upd=%s actual_start=%s "
+                "gone_early=%s cancel_ready=%s skipped_planned=%s skipped_gpv=%s",
                 otg_id,
                 city_id,
                 len(outages),
-                max(0, len(new_outages) - len(plan_updates)),
+                max(0, len(new_outages) - len(plan_updates) - len(actual_start_notices)),
                 len(plan_updates),
+                len(actual_start_notices),
                 len(gone),
                 len(early),
                 skipped_planned,
@@ -2339,25 +2384,38 @@ def main() -> int:
                         if not matches_building(outage, house):
                             continue
 
-                        dkey = notify_dedup_key(outage, house)
+                        # «Лише фактичний старт» — тільки якщо користувач уже знає
+                        # про цей інтервал (base dedup є). Інакше — повне нове
+                        # сповіщення з рядком «Фактичний старт» у звичайному тексті.
+                        outage_for_user = outage
+                        if outage.get("_actual_start_only"):
+                            base_dkey = notify_dedup_key(outage, house)
+                            if base_dkey not in already_keys:
+                                outage_for_user = dict(outage)
+                                outage_for_user.pop("_actual_start_only", None)
+
+                        dkey = outage_notify_dedup_key(outage_for_user, house)
                         if dkey in already_keys:
                             continue
 
                         # внутрішній дедуп у межах одного прогону
-                        fp = content_fingerprint(outage)
+                        fp = content_fingerprint(outage_for_user)
                         already_run = False
                         for x in notified.get(tid, []):
                             prev_o = x[0] if isinstance(x, tuple) else x
-                            if content_fingerprint(prev_o) == fp:
+                            if content_fingerprint(prev_o) == fp and not (
+                                outage_for_user.get("_actual_start_only")
+                                or prev_o.get("_actual_start_only")
+                            ):
                                 already_run = True
                                 break
-                            if notify_dedup_key(prev_o, house) == dkey:
+                            if outage_notify_dedup_key(prev_o, house) == dkey:
                                 already_run = True
                                 break
                         if already_run:
                             continue
 
-                        outage_copy = dict(outage)
+                        outage_copy = dict(outage_for_user)
                         if uqk:
                             outage_copy["_user_queue"] = uqk
 
@@ -2450,8 +2508,12 @@ def main() -> int:
                 "fetched": len(outages),
                 "active": len(active_outages),
                 "addrs": len(group_pairs),
-                "new": max(0, len(new_outages) - len(plan_updates)),
+                "new": max(
+                    0,
+                    len(new_outages) - len(plan_updates) - len(actual_start_notices),
+                ),
                 "plan_upd": len(plan_updates),
+                "actual_start": len(actual_start_notices),
                 "gone_early": len(gone),
                 "cancel_ready": len(early),
                 "skipped_planned": skipped_planned,
