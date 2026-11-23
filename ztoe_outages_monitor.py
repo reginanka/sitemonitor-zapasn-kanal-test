@@ -544,7 +544,7 @@ def format_outage(outage: dict, user_house: str = "") -> str:
             text = f"📍 {addr_line}"
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
-            text += f"\n📅 {period}"
+            text += f"\n📅 <s>{period}</s>"
     elif outage.get("_finished_early"):
         # Кінець урізали, і новий кінець уже в минулому — роботи вже не йдуть
         text = f"📍 {addr_line}"
