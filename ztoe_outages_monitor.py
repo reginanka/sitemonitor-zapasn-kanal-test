@@ -10,12 +10,14 @@
   а не «нове + скасовано»
 - спільний httpx.Client, bulk_write, prune зниклих з Mongo після успішного fetch
 
-Архітектура сповіщень (v1.6):
+Архітектура сповіщень (v1.7):
 - ЖОЕ часто тримає кілька записів на день (план 08:00–17:00 + accident 09:28–18:00)
   або міняє id/час замість оновлення. Ми агрегуємо non-GPV записи по addr_day
   і порівнюємо агреговані (start, end) з попереднім знімком.
 - Зміна min(start)/max(end) на тому самому addr_day → «⏱ Зміна періоду»
   з Було/Стало; блок графіка знизу — актуальне об’єднання інтервалів.
+- Якщо в агрегації є пізніший старт з /pw_accidents (напр. 09:28 при плані 08:00)
+  → у тексті додається «ℹ️ Фактичний старт робіт: 09:28».
 - Новий addr_day → нове сповіщення. Повне зникнення addr_day до datePlanIn
   (після CANCEL_MISS_RUNS пропусків) → «Скасовано».
 - Після успішного повного fetch записи, яких більше немає в API для цієї
@@ -337,6 +339,16 @@ def _iso_sort_key(s: str) -> str:
     return s[:19] if s else ""
 
 
+def _fmt_hhmm_from_iso(s: str) -> str:
+    """Витягує HH:MM з ISO-рядка (для «Фактичний старт: 09:28»)."""
+    s = _iso_sort_key(s)
+    if len(s) >= 16 and s[10] in ("T", " "):
+        return s[11:16]
+    if len(s) >= 5 and s[2] == ":":
+        return s[:5]
+    return ""
+
+
 def aggregate_by_addr_day(outages: List[dict]) -> Dict[str, dict]:
     """
     Зливає non-GPV записи по addr_day в один логічний інтервал.
@@ -344,6 +356,7 @@ def aggregate_by_addr_day(outages: List[dict]) -> Dict[str, dict]:
     Повертає {addr_day_key: aggregated_outage}:
       dateEvent = найраніший start, datePlanIn = найпізніший end,
       buildingNames — об’єднання, _member_keys — id усіх сирих записів,
+      _actual_start — якщо є пізніший старт з accidents (фактичний початок робіт),
       _was_* заповнюється ззовні при детекції змін.
     """
     groups: Dict[str, List[dict]] = {}
@@ -390,6 +403,27 @@ def aggregate_by_addr_day(outages: List[dict]) -> Dict[str, dict]:
                     break
         agg["_member_keys"] = [make_outage_key(m) for m in members]
         agg["_addr_day"] = adk
+
+        # Фактичний старт: пізніший dateEvent з /pw_accidents (коли план був раніше)
+        # Приклад: план 08:00 + accidents 09:28 → _actual_start = 09:28
+        if len(members) > 1 and starts:
+            min_start = min(starts)
+            actual_candidates = []
+            for m in members:
+                src = (m.get("_source") or m.get("source") or "").lower()
+                s = _iso_sort_key(m.get("dateEvent") or "")
+                if not s or s <= min_start:
+                    continue
+                # accidents або typeOff=0 з пізнішим стартом вважаємо фактичним
+                try:
+                    t = int(m.get("typeOff"))
+                except (TypeError, ValueError):
+                    t = -1
+                if src == "accidents" or (src != "planeds" and t == 0):
+                    actual_candidates.append(s)
+            if actual_candidates:
+                agg["_actual_start"] = min(actual_candidates)
+
         result[adk] = agg
     return result
 
@@ -491,6 +525,8 @@ def format_outage(outage: dict, user_house: str = "") -> str:
         addr_line += f", {house}"
 
     # --- видима шапка ---
+    actual_hhmm = _fmt_hhmm_from_iso(str(outage.get("_actual_start") or ""))
+
     if outage.get("_cancelled"):
         # _fixed_early: період уже почався, світло повернули раніше кінця
         if outage.get("_fixed_early"):
@@ -519,11 +555,17 @@ def format_outage(outage: dict, user_house: str = "") -> str:
             text += f"\n📅 {period}"
         elif was_period:
             text += f"\n⏳ Було: <s>{was_period}</s>"
+        # Фактичний старт робіт (план був раніше, accidents приніс точніший час)
+        if actual_hhmm:
+            text += f"\nℹ️ Фактичний старт робіт: {h(actual_hhmm)}"
     else:
         text = f"{icon} <b>{addr_line}</b>"
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
             text += f"\n📅 {period}"
+        # Якщо злили план + фактичний старт у одному fetch — коротко пояснити
+        if actual_hhmm:
+            text += f"\nℹ️ Фактичний старт робіт: {h(actual_hhmm)}"
 
     # --- деталі (тип, koment, список будинків) ---
     details: list[str] = []
