@@ -2364,18 +2364,21 @@ def main() -> int:
                     or (old_end and cur_end and old_end[:16] != cur_end[:16])
                 )
 
-                shortened_and_over = (
-                    bool(old_end and cur_end and cur_end[:16] < old_end[:16])
-                    and kyiv_moment_passed(cur_end)
-                )
+                shortened = bool(old_end and cur_end and cur_end[:16] < old_end[:16])
+                new_end_passed = shortened and kyiv_moment_passed(cur_end)
+                old_end_passed = shortened and kyiv_moment_passed(old_end)
 
-                if shortened_and_over:
-                    # 18:00 → 17:00, а 17:00 уже минуло: не «зміна графіка», а кінець робіт
+                if new_end_passed and not old_end_passed:
+                    # 18:00 → 17:00, зараз між 17:00 і 18:00: роботи закінчили раніше плану
                     oo = dict(agg)
                     oo["_finished_early"] = True
                     oo["_was_dateEvent"] = old_start
                     oo["_was_datePlanIn"] = old_end
                     finished_notices.append(oo)
+                elif new_end_passed and old_end_passed:
+                    # Обидва кінці вже в минулому (зараз 20:00, було до 18:00, стало до 17:00).
+                    # Задня правка — не «зміна періоду» і не «завершили».
+                    pass
                 elif interval_changed:
                     # Реальний зсув min(start)/max(end) → «зміна періоду»
                     oo = dict(agg)
