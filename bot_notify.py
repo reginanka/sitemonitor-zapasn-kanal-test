@@ -902,11 +902,14 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
     has_scheduled = bool(scheduled)
     has_extra = bool(emerg or repair or other)
 
-    # Черга без адреси або лише ГПВ — підсумок у цитаті, без «Деталі»
-    if addr.get("queue_only") or (has_scheduled and not has_extra) or not has_extra:
+    # queue_only або немає відключень — простий підсумок
+    if addr.get("queue_only") or not all_merged:
         return f"{head}\n<blockquote>{summary}</blockquote>"
 
-    # Лише ремонт/аварія (без погодинних) — компактний тег
+    # Один тип — компактно з тегом
+    if has_scheduled and not has_extra:
+        return f"{head}\n<blockquote>{summary} (⏰ Погодинні)</blockquote>"
+
     if not has_scheduled and has_extra:
         tags: List[str] = []
         if emerg:
@@ -916,7 +919,6 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
         if other and not emerg and not repair:
             tags.append("⚪Інше")
         tag = f" ({' '.join(tags)})" if tags else ""
-        # summary тут з префіксом «Світла не буде» — для компакту лишаємо час окремо
         if all_merged:
             ranges = ", ".join(f"{a}-{b}" for a, b in all_merged)
             compact = (
@@ -927,6 +929,7 @@ def _schedule_block(lab: str, addr: dict, date_str: str) -> str:
             compact = summary + tag
         return f"{head}\n<blockquote>{compact}</blockquote>"
 
+    # Змішано — деталі
     extra_lines = []
     if emerg:
         extra_lines.append(_format_slots_line("⚠️ Аварійні", emerg))
@@ -1116,9 +1119,9 @@ def _outage_under_header(
     has_scheduled = bool(scheduled)
     has_extra = bool(emerg or repair or other)
 
-    # Лише ГПВ — без деталей
+    # Лише ГПВ — компактно з тегом, без «Деталі»
     if has_scheduled and not has_extra:
-        return f"{head}\n<blockquote>{summary}</blockquote>"
+        return f"{head}\n<blockquote>{summary} (⏰ Погодинні)</blockquote>"
 
     # Лише ремонт / аварія / інше (немає погодинних) — компактний тег у тому ж рядку
     if not has_scheduled and has_extra:
