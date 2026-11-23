@@ -1006,6 +1006,12 @@ def build_changes_text(
     Не спамить: якщо для черг користувача на дату немає реальних items
     (ні new, ні added/removed з інтервалами) — дата/черга просто пропускається.
     Якщо після фільтрації нічого не лишилось — повертає порожній рядок.
+
+    Якщо зміни — лише нові дати без інтервалів, текст короткий
+    (без шапки «ОНОВЛЕННЯ ГРАФІКА»):
+      🆕 Для черг 4.2 додали новий графік на
+      📅 24.11.2026
+    Додали/скасували відключення лишаються зі старою шапкою.
     """
     changes = changes or {}
     labs_order: List[str] = []
@@ -1022,6 +1028,9 @@ def build_changes_text(
 
     body_blocks: List[str] = []
     labs_with_any_change: List[str] = []
+    # True, доки немає жодної зміни інтервалів — тоді віддаємо короткий текст.
+    only_new_schedule = True
+    short_new_blocks: List[str] = []
 
     for d in dates:
         new_sched_labs: List[str] = []
@@ -1040,7 +1049,11 @@ def build_changes_text(
             # На цю дату для черг користувача нічого немає — пропуск
             continue
 
-        block: List[str] = [f"📅 {_html_esc(_fmt_date_display(d))}", ""]
+        if detail_labs:
+            only_new_schedule = False
+
+        date_disp = _html_esc(_fmt_date_display(d))
+        block: List[str] = [f"📅 {date_disp}", ""]
 
         if new_sched_labs:
             labs_txt = ", ".join(_html_esc(x) for x in new_sched_labs)
@@ -1051,6 +1064,12 @@ def build_changes_text(
             for lab in new_sched_labs:
                 if lab not in labs_with_any_change:
                     labs_with_any_change.append(lab)
+            # Короткий варіант лише коли на цю дату немає змін інтервалів.
+            if not detail_labs:
+                short_new_blocks.append(
+                    f"🆕 Для черг <b>{labs_txt}</b> додали новий графік на\n"
+                    f"📅 {date_disp}"
+                )
 
         for lab, items in detail_labs:
             if lab in new_sched_labs:
@@ -1067,6 +1086,9 @@ def build_changes_text(
     if not body_blocks:
         # Немає жодної реальної зміни для черг цього користувача
         return ""
+
+    if only_new_schedule and short_new_blocks:
+        return "\n\n".join(short_new_blocks)
 
     labs_str = ", ".join(_html_esc(x) for x in labs_with_any_change) if labs_with_any_change else "—"
     header = f"Для черг {labs_str} 🔔 <b>ОНОВЛЕННЯ ГРАФІКА ВІДКЛЮЧЕНЬ!</b>"
@@ -1284,27 +1306,47 @@ CAPTION_LIMIT = 1024
 TEXT_LIMIT = 4096
 
 
+def _is_short_new_schedule_intro(line: str) -> bool:
+    """Рядок короткого сповіщення «новий графік», який має лишитись разом із датою.
+
+    Старе формулювання «на цей день» сюди не входить — воно стоїть ПІСЛЯ дати
+    і не повинно прилипати до наступного дня.
+    """
+    s = (line or "").strip()
+    return (
+        s.startswith("🆕")
+        and "додали новий графік" in s
+        and "цей день" not in s
+    )
+
+
 def _split_header_and_days(text: str) -> tuple[str, list[str]]:
-    """Шапка (зміни / статус) і блоки, що починаються з рядка 📅 — як у /check."""
+    """Шапка (зміни / статус) і блоки, що починаються з рядка 📅 — як у /check.
+
+    Коротке «🆕 … додали новий графік на» + наступний рядок 📅 — один блок,
+    інакше plan_dm_messages вставить порожній рядок і розірве кілька дат.
+    """
     lines = (text or "").splitlines()
-    first = None
-    for i, line in enumerate(lines):
-        if line.strip().startswith("📅"):
-            first = i
-            break
-    if first is None:
+    date_idxs = [i for i, line in enumerate(lines) if line.strip().startswith("📅")]
+    if not date_idxs:
         return (text or "").strip(), []
-    header = "\n".join(lines[:first]).strip()
+
+    def _block_start(date_i: int) -> int:
+        j = date_i - 1
+        while j >= 0 and not lines[j].strip():
+            j -= 1
+        if j >= 0 and _is_short_new_schedule_intro(lines[j]):
+            return j
+        return date_i
+
+    starts = [_block_start(i) for i in date_idxs]
+    header = "\n".join(lines[: starts[0]]).strip()
     days: list[str] = []
-    buf: list[str] = []
-    for line in lines[first:]:
-        if line.strip().startswith("📅") and buf:
-            days.append("\n".join(buf).strip())
-            buf = [line]
-        else:
-            buf.append(line)
-    if buf and "\n".join(buf).strip():
-        days.append("\n".join(buf).strip())
+    for n, start in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        chunk = "\n".join(lines[start:end]).strip()
+        if chunk:
+            days.append(chunk)
     return header, days
 
 
