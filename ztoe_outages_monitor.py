@@ -504,8 +504,11 @@ def format_outage(outage: dict, user_house: str = "") -> str:
     """
     Формує текст однієї події.
 
+    Тип події (нове / зміна / старт / скасування) — у заголовку повідомлення,
+    тут лише адреса 📍 і деталі, без дублювання типу в шапці блоку.
+
     Видима частина:
-      🔴 Місто, вул. X, 33
+      📍 Місто, вул. X, 33
       📅 Прогнозований період: ...
 
     Під expandable-цитатою (якщо є що ховати):
@@ -518,7 +521,6 @@ def format_outage(outage: dict, user_house: str = "") -> str:
     buildings = h((outage.get("buildingNames") or "").strip())
     date_event_raw = outage.get("dateEvent") or ""
     date_plan_raw = outage.get("datePlanIn") or ""
-    date_plan = h((date_plan_raw or "")[:16].replace("T", " "))
     icon, type_name, type_desc = outage_notify_label(outage)
     type_name, type_desc = h(type_name), h(type_desc)
     koment = h((outage.get("koment") or "").strip())
@@ -528,7 +530,7 @@ def format_outage(outage: dict, user_house: str = "") -> str:
     if house:
         addr_line += f", {house}"
 
-    # --- видима шапка ---
+    # --- видима шапка (тип — у header повідомлення, тут 📍 + деталі) ---
     actual_hhmm = _fmt_hhmm_from_iso(str(outage.get("_actual_start") or ""))
 
     if outage.get("_cancelled"):
@@ -537,21 +539,20 @@ def format_outage(outage: dict, user_house: str = "") -> str:
             text = f"✅ <b>Усунуто раніше:</b> {addr_line}"
             text += "\nАварійні роботи завершили раніше."
         else:
-            text = f"✅ <b>Скасовано:</b> {addr_line}"
+            text = f"📍 {addr_line}"
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
-            # період закреслюємо — його вже немає в графіку
-            text += f"\n📅 <s>{period}</s>"
+            text += f"\n📅 {period}"
     elif outage.get("_actual_start_only"):
-        # Прогнозний інтервал той самий, з’явився лише фактичний старт з accidents
-        text = f"ℹ️ <b>Фактичний старт робіт:</b> {addr_line}"
+        # Інтервал той самий — лише факт старту (заголовок повідомлення вже про це)
+        text = f"📍 {addr_line}"
         if actual_hhmm:
-            text += f"\n🕐 {h(actual_hhmm)}"
+            text += f"\n🕐 Фактичний старт робіт: {h(actual_hhmm)}"
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
             text += f"\n📅 {period}"
     elif outage.get("_plan_updated"):
-        text = f"⏱ <b>Зміна періоду:</b> {addr_line}"
+        text = f"📍 {addr_line}"
         was_event = outage.get("_was_dateEvent") or ""
         was_plan = outage.get("_plan_was") or outage.get("_was_datePlanIn") or ""
         was_period = h(format_forecast_period(was_event, was_plan)) if (was_event or was_plan) else ""
@@ -568,15 +569,14 @@ def format_outage(outage: dict, user_house: str = "") -> str:
             text += f"\n📅 {period}"
         elif was_period:
             text += f"\n⏳ Було: <s>{was_period}</s>"
-        # Фактичний старт (разом зі справжньою зміною меж інтервалу)
         if actual_hhmm:
             text += f"\nℹ️ Фактичний старт робіт: {h(actual_hhmm)}"
     else:
+        # Нова подія — іконка типу + адреса
         text = f"{icon} <b>{addr_line}</b>"
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
             text += f"\n📅 {period}"
-        # Якщо злили план + фактичний старт у одному fetch — коротко пояснити
         if actual_hhmm:
             text += f"\nℹ️ Фактичний старт робіт: {h(actual_hhmm)}"
 
@@ -1292,22 +1292,27 @@ def _msg_dedup_key(outage: dict, house: str) -> str:
     return f"{city}|{sname}|{hse}|{start}|{end}"
 
 
-def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
-    """
-    items: [(outage, addr), ...]
-    Усі події, без стелі «перші 10».
-    Ділиться на кілька повідомлень лише коли не влазить у 4096 символів Telegram.
-    """
-    header = "⚠️ <b>Нові відключення по твоїх адресах:</b>"
+def _build_notify_blocks(
+    db,
+    items: List[Tuple[dict, dict]],
+    *,
+    with_schedule: bool = True,
+) -> List[str]:
+    """Збирає HTML-блоки подій (+ графіків) без заголовка."""
     blocks: List[str] = []
     seen_sched: set = set()
     grouped: List[Tuple[dict, dict]] = []
     group_at: Dict[str, int] = {}
     for outage, addr in items:
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
-        ev_key = _msg_dedup_key(outage, user_house)
+        if outage.get("_actual_start_only"):
+            kind = "actual"
+        elif outage.get("_plan_updated"):
+            kind = "plan"
+        else:
+            kind = "event"
+        ev_key = f"{kind}|" + _msg_dedup_key(outage, user_house)
         # Той самий інтервал — не друге повідомлення, а допис номерів будинків.
-        # Довший (або інший) інтервал має інший ключ і лишається окремою подією.
         if ev_key in group_at:
             prev, _prev_addr = grouped[group_at[ev_key]]
             prev["buildingNames"] = merge_building_names(
@@ -1320,11 +1325,12 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
         group_at[ev_key] = len(grouped)
         grouped.append((dict(outage), addr))
 
-    # «сьогодні» по Києву (UTC+2 зимою; для відсікання минулих днів достатньо)
     today_ymd = datetime.now(timezone(timedelta(hours=2))).strftime("%Y-%m-%d")
     for outage, addr in grouped:
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
         blocks.append(format_outage(outage, user_house=user_house))
+        if not with_schedule:
+            continue
         ymds = _outage_span_ymds(outage, from_ymd=today_ymd)
         if not ymds:
             ymds = [_outage_day_ymd(outage)]
@@ -1332,17 +1338,68 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
         city = (addr.get("city_name") or "")
         street = (addr.get("street_name") or "")
         for ymd in ymds:
-            key = f"{lab}|{ymd}|{city}|{street}"
-            if key in seen_sched:
+            skey = f"{lab}|{ymd}|{city}|{street}"
+            if skey in seen_sched:
                 continue
-            seen_sched.add(key)
+            seen_sched.add(skey)
             try:
                 block = format_schedule_block_for_notify(db, addr, outage, ymd=ymd)
                 if block:
                     blocks.append(block)
             except Exception as e:
                 log.warning("schedule block: %s", e)
-    return pack_html_messages(blocks, header)
+    return blocks
+
+
+def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
+    """
+    items: [(outage, addr), ...]
+
+    Окремі заголовки без дублювання типу в тілі:
+      • нові → «Нові відключення…»
+      • зміна інтервалу → «Зміна періоду запланованих робіт…»
+      • лише фактичний старт → «Планові роботи … розпочато»
+    """
+    if not items:
+        return []
+    actual_items = [
+        (o, a) for o, a in items if isinstance(o, dict) and o.get("_actual_start_only")
+    ]
+    plan_items = [
+        (o, a)
+        for o, a in items
+        if isinstance(o, dict) and o.get("_plan_updated") and not o.get("_actual_start_only")
+    ]
+    new_items = [
+        (o, a)
+        for o, a in items
+        if isinstance(o, dict)
+        and not o.get("_actual_start_only")
+        and not o.get("_plan_updated")
+    ]
+    msgs: List[str] = []
+    if new_items:
+        msgs.extend(
+            pack_html_messages(
+                _build_notify_blocks(db, new_items),
+                "⚠️ <b>Нові відключення по твоїх адресах:</b>",
+            )
+        )
+    if plan_items:
+        msgs.extend(
+            pack_html_messages(
+                _build_notify_blocks(db, plan_items),
+                "⚠️ <b>Зміна періоду запланованих робіт по твоїх адресах:</b>",
+            )
+        )
+    if actual_items:
+        msgs.extend(
+            pack_html_messages(
+                _build_notify_blocks(db, actual_items),
+                "ℹ️ <b>Планові роботи по твоїх адресах розпочато:</b>",
+            )
+        )
+    return msgs
 
 
 def _norm_street(name: str) -> str:
