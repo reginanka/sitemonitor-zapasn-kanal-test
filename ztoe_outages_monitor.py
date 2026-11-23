@@ -1893,6 +1893,7 @@ def _human_group(rep: dict) -> str:
             rep.get("matched"),
             rep.get("cancel_matched"),
             rep.get("unmatched"),
+            rep.get("matched_addrs"),
         )
     )
     if quiet:
@@ -1923,6 +1924,11 @@ def _human_group(rep: dict) -> str:
         f"Збіглося з адресами: {rep['matched']}. "
         f"Скасувань у розсилку: {rep['cancel_matched']}."
     )
+    matched_addrs = rep.get("matched_addrs") or []
+    if matched_addrs:
+        lines.append(
+            "Збіг по адресах: " + "; ".join(matched_addrs) + "."
+        )
     if rep.get("covered_skip"):
         lines.append(
             "Не слав скасування, бо цю адресу вже покриває інший запис: "
@@ -2004,7 +2010,11 @@ def main() -> int:
         users = [u for u in users if user_wants(u, "accidents")]
     except Exception as e:
         log.warning("prefs filter failed: %s", e)
-    groups: Dict[Tuple[int, int], List[Tuple[dict, dict]]] = {}
+    # Групуємо по city_id (коли є) — інакше один і той самий населений пункт
+    # з різними otg_id у довіднику (типовий баг ЖОЕ для Коростеня тощо)
+    # дає два однакові звіти. Без city_id — по otg_id.
+    # Ключ: ("c", city_id) | ("o", otg_id)
+    groups: Dict[Tuple[str, int], List[Tuple[dict, dict]]] = {}
     for u in users:
         for addr in get_user_addresses(u):
             if not isinstance(addr, dict):
@@ -2018,10 +2028,13 @@ def main() -> int:
                 city_id = int(city_id) if city_id else 0
             except (TypeError, ValueError):
                 continue
-            groups.setdefault((otg_id, city_id), []).append((u, addr))
+            if city_id:
+                gkey: Tuple[str, int] = ("c", city_id)
+            else:
+                gkey = ("o", otg_id)
+            groups.setdefault(gkey, []).append((u, addr))
 
-    unique_otgs = sorted({otg for otg, _ in groups})
-    log.info("users=%s groups=%s unique_otgs=%s", len(users), len(groups), len(unique_otgs))
+    log.info("users=%s locations=%s", len(users), len(groups))
 
     notified: Dict[int, list] = {}
     cancelled: Dict[int, list] = {}
@@ -2045,7 +2058,7 @@ def main() -> int:
     city_fetch_ok: Dict[int, bool] = {}
     otg_fetch_ok: Dict[int, bool] = {}
 
-    unique_cities = sorted({cid for (_, cid) in groups if cid})
+    unique_cities = sorted({cid for kind, cid in groups if kind == "c"})
     try:
         for city_id in unique_cities:
             items, ok = _fetch_pair(http, city_id=city_id)
@@ -2057,7 +2070,7 @@ def main() -> int:
                 log.error("city=%s fetch failed, cache kept", city_id)
 
         # otg-фетч лише для груп без city_id
-        otgs_without_city = sorted({otg for (otg, cid) in groups if not cid})
+        otgs_without_city = sorted({oid for kind, oid in groups if kind == "o"})
         for otg_id in otgs_without_city:
             items, ok = _fetch_pair(http, otg_id=otg_id)
             otg_outages_cache[otg_id] = items
@@ -2067,13 +2080,35 @@ def main() -> int:
             else:
                 log.error("otg=%s fetch failed, cache kept", otg_id)
 
-        for (otg_id, city_id), group_pairs in groups.items():
-            if city_id:
+        # Сортуємо локації за назвою міста (для звіту в лог-групі)
+        def _group_sort_key(item: Tuple[Tuple[str, int], list]) -> str:
+            gkey, pairs = item
+            name = _group_city_name(pairs, [])
+            return (name or "").lower()
+
+        for gkey, group_pairs in sorted(groups.items(), key=_group_sort_key):
+            kind, loc_id = gkey
+            if kind == "c":
+                city_id = loc_id
+                # otg_id — лише для логів/старих кеш-ключів; fetch уже по city
+                try:
+                    otg_id = int(
+                        (group_pairs[0][1].get("otg_id")
+                         or group_pairs[0][1].get("otgId")
+                         or 0)
+                    )
+                except (TypeError, ValueError, IndexError):
+                    otg_id = 0
                 fetch_ok = bool(city_fetch_ok.get(city_id))
                 outages = list(city_outages_cache.get(city_id) or [])
+                # Кеш знімка — один на city_id (не дробимо по кривому otg)
+                cache_key = f"c_{city_id}"
             else:
+                otg_id = loc_id
+                city_id = 0
                 fetch_ok = bool(otg_fetch_ok.get(otg_id))
                 outages = list(otg_outages_cache.get(otg_id) or [])
+                cache_key = f"o_{otg_id}"
 
             groups_checked += 1
             if not fetch_ok:
@@ -2095,8 +2130,23 @@ def main() -> int:
             current_fps = {content_fingerprint(o) for o in outages}
             current_soft = {soft_fingerprint(o) for o in outages}
 
-            cache_key = f"{otg_id}_{city_id or 0}"
+            # Міграція зі старого ключа otg_city → city/otg
             cache = outages_col.find_one({"_id": cache_key}) or {}
+            if not cache and kind == "c":
+                # спробувати старі ключі з будь-яким otg для цього city
+                for legacy_otg in {
+                    int(a.get("otg_id") or a.get("otgId") or 0)
+                    for _, a in group_pairs
+                    if (a.get("otg_id") or a.get("otgId"))
+                }:
+                    legacy = outages_col.find_one({"_id": f"{legacy_otg}_{city_id}"})
+                    if legacy:
+                        cache = legacy
+                        break
+            elif not cache and kind == "o":
+                legacy = outages_col.find_one({"_id": f"{otg_id}_0"})
+                if legacy:
+                    cache = legacy
             prev_fps = set(cache.get("fps") or [])
             prev_soft = set(cache.get("soft_fps") or [])
 
@@ -2225,6 +2275,8 @@ def main() -> int:
                     log.warning("prune stale outages: %s", e)
 
             matched_fps: set = set()
+            matched_addrs: List[str] = []
+            matched_addrs_seen: set = set()
 
             # --- Per-user нотифікації по АГРЕГОВАНИХ активних відключеннях ---
             # Один логічний інтервал на addr_day — не шлемо окремо план і accident.
@@ -2248,6 +2300,10 @@ def main() -> int:
                     street_name = (addr.get("street_name") or addr.get("street") or "").strip().lower()
                     house = str(addr.get("house") or addr.get("building") or "")
                     uqk = user_queue_key(addr)
+                    addr_label = (
+                        f"{(addr.get('street_name') or addr.get('street') or '?').strip()} "
+                        f"{house}"
+                    ).strip()
 
                     # queue_key на full docs тільки для зматчених адрес
                     if uqk:
@@ -2308,6 +2364,9 @@ def main() -> int:
                         notified.setdefault(tid, []).append((outage_copy, addr))
                         matched_fps.add(fp)
                         already_keys.add(dkey)
+                        if addr_label and addr_label not in matched_addrs_seen:
+                            matched_addrs_seen.add(addr_label)
+                            matched_addrs.append(addr_label)
 
                 log.info(
                     "otg=%s city=%s matched_active=%s (addrs=%s active=%s)",
@@ -2398,6 +2457,7 @@ def main() -> int:
                 "skipped_planned": skipped_planned,
                 "skipped_gpv": skipped_gpv,
                 "matched": len(matched_fps),
+                "matched_addrs": matched_addrs,
                 "cancel_matched": matched_cancel,
                 "covered_skip": covered_skip,
                 "unmatched": unmatched,
@@ -2570,7 +2630,8 @@ def main() -> int:
             for tid in tids:
                 new_items = notified.get(tid) or []
                 gone_items = cancelled.get(tid) or []
-                silent = is_quiet_now(_user_by_tid.get(int(tid)))
+                u_doc = _user_by_tid.get(int(tid)) or {}
+                silent = is_quiet_now(u_doc)
                 new_ok = False
                 cancel_ok = False
                 if new_items and await _send_parts(tid, build_notify_message(db, new_items), silent):
@@ -2583,13 +2644,21 @@ def main() -> int:
                         cancel_ok = True
                         _mark(tid, gone_items)
                 mode = "тихо" if silent else "зі звуком"
+                # У повідомленні лог-групи: id + @username (якщо є).
+                # У stdout/GitHub Actions — без персональних даних.
+                uname = (
+                    (u_doc.get("username") or u_doc.get("user_name") or "")
+                    .strip()
+                    .lstrip("@")
+                )
+                who = f"{tid}" + (f" @{uname}" if uname else "")
                 if new_ok or cancel_ok:
                     deliveries.append(
-                        f"{tid} — нові {len(new_items)}, скасування {len(gone_items)}, {mode}"
+                        f"{who} — нові {len(new_items)}, скасування {len(gone_items)}, {mode}"
                     )
                 else:
                     deliveries.append(
-                        f"{tid} — не дійшло (нові {len(new_items)}, скасування {len(gone_items)})"
+                        f"{who} — не дійшло (нові {len(new_items)}, скасування {len(gone_items)})"
                     )
                 if not (new_ok or cancel_ok):
                     continue
@@ -2631,11 +2700,13 @@ def main() -> int:
 
             if log_chat:
                 try:
-                    # 153 — гілка «Аварії, ремонти крон»
+                    # 153 — звичайна гілка «Аварії, ремонти крон»
+                    # 17725 — коли є що розсилати (нові / скасування)
+                    thread_id = 17725 if n_events > 0 else 153
                     await bot.send_message(
                         chat_id=int(log_chat),
                         text=summary,
-                        message_thread_id=153,
+                        message_thread_id=thread_id,
                     )
                     if attachment:
                         doc = BytesIO(attachment.encode("utf-8"))
@@ -2643,7 +2714,7 @@ def main() -> int:
                         await bot.send_document(
                             chat_id=int(log_chat),
                             document=doc,
-                            message_thread_id=153,
+                            message_thread_id=thread_id,
                         )
                 except Exception as e:
                     log.warning("log channel: %s", e)
