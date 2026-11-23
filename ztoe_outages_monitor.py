@@ -534,10 +534,12 @@ def format_outage(outage: dict, user_house: str = "") -> str:
     actual_hhmm = _fmt_hhmm_from_iso(str(outage.get("_actual_start") or ""))
 
     if outage.get("_cancelled"):
-        # _fixed_early: період уже почався, світло повернули раніше кінця
+        # Запис зник з API до кінця плану.
+        # _fixed_early: період уже йшов — час завершення це прохід скрипта.
         if outage.get("_fixed_early"):
-            text = f"✅ <b>Усунуто раніше:</b> {addr_line}"
-            text += "\nАварійні роботи завершили раніше."
+            text = f"📍 {addr_line}"
+            done = datetime.now(_kyiv_zone()).strftime("%H:%M")
+            text += f"\n✅ Завершили о {h(done)}"
         else:
             text = f"📍 {addr_line}"
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
@@ -1632,9 +1634,11 @@ def _kyiv_zone():
 
 
 def _to_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_kyiv_zone())
-    return dt.astimezone(timezone.utc)
+    """Цифри з API — київський час, навіть якщо в ISO стоїть +00:00.
+
+    Інакше 18:00+00:00 стає 20:00 за Києвом і після 18:00 план ще «відкритий».
+    """
+    return _kyiv_wall(dt).astimezone(timezone.utc)
 
 
 def plan_still_open(outage: dict, now: Optional[datetime] = None) -> bool:
@@ -1973,8 +1977,34 @@ def _fetch_pair(
 
 
 def build_cancel_message(items: List[Tuple[dict, dict]]) -> List[str]:
-    """Окреме сповіщення про зняття. Без блока «світла не буде» — запису вже немає."""
-    header = "✅ <b>Скасовані відключення по твоїх адресах:</b>"
+    """Зняття з API. Без блока «світла не буде» — запису вже немає.
+
+    Якщо період уже почався — окремий заголовок і час проходу скрипта.
+    До старту — «скасовано».
+    """
+    early = [
+        pair for pair in items
+        if isinstance(pair[0], dict) and pair[0].get("_fixed_early")
+    ]
+    rest = [
+        pair for pair in items
+        if not (isinstance(pair[0], dict) and pair[0].get("_fixed_early"))
+    ]
+    msgs: List[str] = []
+    if rest:
+        msgs.extend(_pack_cancel_items(
+            rest,
+            "✅ <b>Скасовані відключення по твоїх адресах:</b>",
+        ))
+    if early:
+        msgs.extend(_pack_cancel_items(
+            early,
+            "✅ <b>Аварійні роботи завершили раніше запланованого періоду по твоїх адресах:</b>",
+        ))
+    return msgs
+
+
+def _pack_cancel_items(items: List[Tuple[dict, dict]], header: str) -> List[str]:
     grouped: List[Tuple[dict, dict]] = []
     group_at: Dict[str, int] = {}
     for outage, addr in items:
