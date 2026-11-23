@@ -543,6 +543,17 @@ def format_outage(outage: dict, user_house: str = "") -> str:
         period = h(format_forecast_period(date_event_raw, date_plan_raw))
         if period:
             text += f"\n📅 {period}"
+    elif outage.get("_finished_early"):
+        # Кінець урізали, і новий кінець уже в минулому — роботи вже не йдуть
+        text = f"📍 {addr_line}"
+        done_hhmm = _fmt_hhmm_from_iso(date_plan_raw)
+        if done_hhmm:
+            text += f"\n✅ Завершили о {h(done_hhmm)}"
+        was_event = outage.get("_was_dateEvent") or ""
+        was_plan = outage.get("_was_datePlanIn") or ""
+        was_period = h(format_forecast_period(was_event, was_plan)) if (was_event or was_plan) else ""
+        if was_period:
+            text += f"\n📅 Було: <s>{was_period}</s>"
     elif outage.get("_actual_start_only"):
         # Інтервал той самий — лише факт старту (заголовок повідомлення вже про це)
         text = f"📍 {addr_line}"
@@ -1307,6 +1318,8 @@ def _build_notify_blocks(
         user_house = str(addr.get("house") or addr.get("building") or "").strip()
         if outage.get("_actual_start_only"):
             kind = "actual"
+        elif outage.get("_finished_early"):
+            kind = "done"
         elif outage.get("_plan_updated"):
             kind = "plan"
         else:
@@ -1358,6 +1371,7 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
     Окремі заголовки без дублювання типу в тілі:
       • нові → «Нові відключення…»
       • зміна інтервалу → «Зміна періоду запланованих робіт…»
+      • кінець урізали і він уже минув → «Роботи … завершено»
       • лише фактичний старт → «Планові роботи … розпочато»
     """
     if not items:
@@ -1365,10 +1379,18 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
     actual_items = [
         (o, a) for o, a in items if isinstance(o, dict) and o.get("_actual_start_only")
     ]
+    done_items = [
+        (o, a)
+        for o, a in items
+        if isinstance(o, dict) and o.get("_finished_early") and not o.get("_actual_start_only")
+    ]
     plan_items = [
         (o, a)
         for o, a in items
-        if isinstance(o, dict) and o.get("_plan_updated") and not o.get("_actual_start_only")
+        if isinstance(o, dict)
+        and o.get("_plan_updated")
+        and not o.get("_actual_start_only")
+        and not o.get("_finished_early")
     ]
     new_items = [
         (o, a)
@@ -1376,6 +1398,7 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
         if isinstance(o, dict)
         and not o.get("_actual_start_only")
         and not o.get("_plan_updated")
+        and not o.get("_finished_early")
     ]
     msgs: List[str] = []
     if new_items:
@@ -1390,6 +1413,13 @@ def build_notify_message(db, items: List[Tuple[dict, dict]]) -> List[str]:
             pack_html_messages(
                 _build_notify_blocks(db, plan_items),
                 "⚠️ <b>Зміна періоду запланованих робіт по твоїх адресах:</b>",
+            )
+        )
+    if done_items:
+        msgs.extend(
+            pack_html_messages(
+                _build_notify_blocks(db, done_items, with_schedule=False),
+                "✅ <b>Роботи по твоїх адресах завершено:</b>",
             )
         )
     if actual_items:
@@ -1620,6 +1650,23 @@ def plan_still_open(outage: dict, now: Optional[datetime] = None) -> bool:
     elif now.tzinfo is None:
         now = now.replace(tzinfo=_kyiv_zone())
     return _to_utc(end) > now.astimezone(timezone.utc)
+
+
+def _kyiv_wall(dt: datetime) -> datetime:
+    """Годинник з API як київський, навіть якщо в ISO стоїть +00:00."""
+    return dt.replace(tzinfo=None).replace(tzinfo=_kyiv_zone())
+
+
+def kyiv_moment_passed(iso: str, now: Optional[datetime] = None) -> bool:
+    """True, якщо цей момент (як місцевий час ЖОЕ) уже настав."""
+    moment = _parse_iso_dt(iso or "")
+    if moment is None:
+        return False
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_kyiv_zone())
+    return _kyiv_wall(moment).astimezone(timezone.utc) <= now.astimezone(timezone.utc)
 
 
 def period_has_started(outage: dict, now: Optional[datetime] = None) -> bool:
@@ -1976,6 +2023,7 @@ def _human_group(rep: dict) -> str:
         (
             rep.get("new"),
             rep.get("plan_upd"),
+            rep.get("finished_early"),
             rep.get("actual_start"),
             rep.get("gone_early"),
             rep.get("matched"),
@@ -1998,6 +2046,7 @@ def _human_group(rep: dict) -> str:
         ),
         (
             f"Нових: {rep['new']}. Оновлень часу: {rep['plan_upd']}. "
+            f"Завершено: {rep.get('finished_early', 0)}. "
             f"Фактичний старт: {rep.get('actual_start', 0)}."
         ),
         (
@@ -2260,6 +2309,7 @@ def main() -> int:
             new_outages: list = []
             plan_updates: list = []
             actual_start_notices: list = []
+            finished_notices: list = []
             seen_adk: set = set()
 
             for adk, agg in cur_agg.items():
@@ -2284,7 +2334,19 @@ def main() -> int:
                     or (old_end and cur_end and old_end[:16] != cur_end[:16])
                 )
 
-                if interval_changed:
+                shortened_and_over = (
+                    bool(old_end and cur_end and cur_end[:16] < old_end[:16])
+                    and kyiv_moment_passed(cur_end)
+                )
+
+                if shortened_and_over:
+                    # 18:00 → 17:00, а 17:00 уже минуло: не «зміна графіка», а кінець робіт
+                    oo = dict(agg)
+                    oo["_finished_early"] = True
+                    oo["_was_dateEvent"] = old_start
+                    oo["_was_datePlanIn"] = old_end
+                    finished_notices.append(oo)
+                elif interval_changed:
                     # Реальний зсув min(start)/max(end) → «зміна періоду»
                     oo = dict(agg)
                     oo["_plan_updated"] = True
@@ -2301,21 +2363,30 @@ def main() -> int:
                     actual_start_notices.append(oo)
                 # інтервал без змін і без фактичного старту — мовчки
 
-            if plan_updates or actual_start_notices:
-                new_outages = list(new_outages) + plan_updates + actual_start_notices
+            if plan_updates or actual_start_notices or finished_notices:
+                new_outages = (
+                    list(new_outages) + plan_updates + actual_start_notices + finished_notices
+                )
 
             prev_records = prev_records_early
             gone = select_early_cancellations(prev_records, outages)
             early, pending_gone = apply_cancel_miss_streak(gone)
 
             log.info(
-                "otg=%s city=%s fetched=%s new=%s plan_upd=%s actual_start=%s "
+                "otg=%s city=%s fetched=%s new=%s plan_upd=%s finished=%s actual_start=%s "
                 "gone_early=%s cancel_ready=%s skipped_planned=%s skipped_gpv=%s",
                 otg_id,
                 city_id,
                 len(outages),
-                max(0, len(new_outages) - len(plan_updates) - len(actual_start_notices)),
+                max(
+                    0,
+                    len(new_outages)
+                    - len(plan_updates)
+                    - len(actual_start_notices)
+                    - len(finished_notices),
+                ),
                 len(plan_updates),
+                len(finished_notices),
                 len(actual_start_notices),
                 len(gone),
                 len(early),
@@ -2567,9 +2638,13 @@ def main() -> int:
                 "addrs": len(group_pairs),
                 "new": max(
                     0,
-                    len(new_outages) - len(plan_updates) - len(actual_start_notices),
+                    len(new_outages)
+                    - len(plan_updates)
+                    - len(actual_start_notices)
+                    - len(finished_notices),
                 ),
                 "plan_upd": len(plan_updates),
+                "finished_early": len(finished_notices),
                 "actual_start": len(actual_start_notices),
                 "gone_early": len(gone),
                 "cancel_ready": len(early),
