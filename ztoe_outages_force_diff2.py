@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-Тестовий «минулий» стан ремонтів для двох адрес, щоб ztoe_outages_monitor
-побачив зміну періоду і надіслав «⏱ Зміна періоду».
+Тестовий «минулий» стан ремонтів ТІЛЬКИ для двох адрес.
 
-Що робить:
-  1) Знаходить підписників з адресами:
-       - Коростень, вул. Білокоровицьке Шосе, 20
-       - Вересна, вул. Лесі Українки, 3
-  2) Для їх (otg_id, city_id) пише в outages_cache snapshot + plan_by_addr_day
-     зі СТАРИМИ інтервалами (іншими, ніж зараз у API).
-  3) Пише відповідні документи в outages (зліпок для /check і bootstrap).
-  4) Чистить user_outage_notified по цих telegram_id (інакше дедуп з’їсть
-     повторну розсилку).
+Мета: ztoe_outages_monitor побачив зміну періоду саме на них і надіслав
+«⏱ Зміна періоду», без «нових графіків» усій базі.
+
+ВАЖЛИВО:
+  - НЕ перезаписує весь outages_cache локації з нуля.
+  - Читає поточний cache, підміняє лише snapshot/plan_by_addr_day
+    для цільових вулиць+дня, решту записів лишає як є.
+  - Чистить user_outage_notified лише для зматчених telegram_id.
+
+Адреси:
+  - Коростень, вул. Білокоровицьке Шосе, 20
+  - Вересна, вул. Лесі Українки, 3
 
 НЕ чіпає: queue_schedules, users, ukrenergo*, accidents_summary, site_meta.
 
-Після запуску обов’язково:
-  python ztoe_outages_monitor.py
-  (workflow «ZTOE outages»)
-
   python ztoe_outages_force_diff.py
+  python ztoe_outages_monitor.py
 """
 
 from __future__ import annotations
@@ -28,24 +27,20 @@ import os
 import re
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from pymongo import MongoClient, UpdateOne
 
-# --- цільові адреси (нормалізовані) ---
-# (city_substr, street_substr, house, fake_start, fake_end, day)
-# fake_* — «було» у сповіщенні; API зараз віддає інші години → monitor побачить зміну.
 TARGETS = [
     {
         "label": "Коростень, Білокоровицьке Шосе, 20",
         "city_sub": "коростень",
         "street_subs": ("білокоровицьк", "білокровицьк"),
         "house": "20",
-        # API зараз ~08:00–18:00 (план 08–17 + accident до 18) → «було» коротше
+        # API зараз ширший інтервал → «було» коротше, щоб була зміна періоду
         "fake_start": "2026-11-23T08:00:00",
         "fake_end": "2026-11-23T16:00:00",
         "day": "2026-11-23",
-        # реалістичні id з API (для snapshot/outages)
         "fallback_city_id": 430,
         "fallback_otg_id": 7,
         "fallback_street_id": 7640,
@@ -63,7 +58,6 @@ TARGETS = [
         "city_sub": "вересна",
         "street_subs": ("лесі україн", "л.ukrain", "л.україн", "українк"),
         "house": "3",
-        # API зараз 12:00–16:00 → «було» інше
         "fake_start": "2026-11-23T09:00:00",
         "fake_end": "2026-11-23T14:00:00",
         "day": "2026-11-23",
@@ -126,6 +120,22 @@ def street_match(street_name: str, subs: Tuple[str, ...]) -> bool:
     return any(sub in n for sub in subs)
 
 
+def rec_matches_target(rec: dict, t: dict) -> bool:
+    """Чи snapshot/outage-запис стосується цільової вулиці."""
+    city = rec.get("city") if isinstance(rec.get("city"), dict) else {}
+    street = rec.get("street") if isinstance(rec.get("street"), dict) else {}
+    city_name = (city.get("name") or rec.get("city_name") or "").lower()
+    street_name = street.get("name") or rec.get("street_name") or ""
+    city_id = city.get("id") if city else rec.get("city_id")
+    street_id = street.get("id") if street else rec.get("street_id")
+
+    if t["city_sub"] not in city_name and int(city_id or 0) != int(t["fallback_city_id"]):
+        return False
+    if int(street_id or 0) == int(t["fallback_street_id"]):
+        return True
+    return street_match(street_name, t["street_subs"])
+
+
 def get_user_addresses(user: dict) -> list:
     if user.get("addresses"):
         return user["addresses"]
@@ -134,7 +144,7 @@ def get_user_addresses(user: dict) -> list:
     return []
 
 
-def addr_day_key(
+def addr_day_key_from_parts(
     city_id: Any,
     street_id: Any,
     street_name: str,
@@ -143,39 +153,37 @@ def addr_day_key(
 ) -> str:
     sid = street_id or _norm(street_name)
     parts = sorted(
-        {p.strip() for p in (buildings or "").replace(";", ",").split(",") if p.strip()}
+        {
+            p.strip().lower()
+            for p in (buildings or "").replace(";", ",").split(",")
+            if p.strip()
+        }
     )
-    return f"{city_id or ''}|{sid}|{','.join(p.lower() for p in parts)}|{day}"
+    return f"{city_id or ''}|{sid}|{','.join(parts)}|{day}"
 
 
-def snapshot_rec(
-    *,
-    source: str,
-    source_id: Any,
-    type_off: int,
-    city_id: int,
-    city_name: str,
-    street_id: int,
-    street_name: str,
-    otg_id: int,
-    otg_name: str,
-    buildings: str,
-    date_event: str,
-    date_plan: str,
-) -> dict:
-    key = f"{source}:{source_id}"
+def snapshot_rec(t: dict, *, fake_id: int) -> dict:
     return {
-        "key": key,
-        "id": source_id,
-        "_source": source,
-        "typeOff": type_off,
+        "key": f"planeds:{fake_id}",
+        "id": fake_id,
+        "_source": "planeds",
+        "typeOff": int(t["typeOff"]),
         "switchSubReason": 0,
-        "city": {"id": city_id, "name": city_name},
-        "street": {"id": street_id, "name": street_name},
-        "otg": {"id": otg_id, "name": otg_name},
-        "buildingNames": buildings,
-        "dateEvent": date_event,
-        "datePlanIn": date_plan,
+        "city": {
+            "id": int(t["fallback_city_id"]),
+            "name": t["fallback_city_name"],
+        },
+        "street": {
+            "id": int(t["fallback_street_id"]),
+            "name": t["fallback_street_name"],
+        },
+        "otg": {
+            "id": int(t["fallback_otg_id"]),
+            "name": t["fallback_otg_name"],
+        },
+        "buildingNames": t["fallback_buildings"],
+        "dateEvent": t["fake_start"],
+        "datePlanIn": t["fake_end"],
         "koment": "тестовий попередній графік (force_diff)",
     }
 
@@ -203,14 +211,98 @@ def outage_mongo_doc(rec: dict) -> dict:
         "queue": "",
         "subqueue": "",
         "fingerprint": (
-            f"{city.get('id')}|{street.get('id')}|{rec.get('buildingNames')}|"
+            f"{city.get('id')}|{street.get('id')}|seed|"
             f"{(rec.get('dateEvent') or '')[:13]}|planned"
         ),
         "soft_fp": (
-            f"{city.get('id')}|{street.get('id')}|{rec.get('buildingNames')}|"
+            f"{city.get('id')}|{street.get('id')}|seed|"
             f"{(rec.get('dateEvent') or '')[:13]}"
         ),
         "updated_at": datetime.now(timezone.utc),
+    }
+
+
+def patch_cache_doc(cache: dict, targets: List[dict], now: datetime) -> dict:
+    """
+    Зберігає всі чужі записи в snapshot/ids/fps/soft_fps/plan_by_addr_day.
+    Прибирає лише ті, що стосуються TARGET вулиць, і додає fake «було».
+    """
+    cache = dict(cache or {})
+    snapshot = list(cache.get("snapshot") or [])
+    ids = list(cache.get("ids") or [])
+    fps = list(cache.get("fps") or [])
+    soft_fps = list(cache.get("soft_fps") or [])
+    plan_by = {
+        str(k): str(v)
+        for k, v in (cache.get("plan_by_addr_day") or {}).items()
+    }
+
+    # 1) прибрати з snapshot записи цільових вулиць
+    new_snapshot = []
+    removed_keys: Set[str] = set()
+    for rec in snapshot:
+        if not isinstance(rec, dict):
+            continue
+        if any(rec_matches_target(rec, t) for t in targets):
+            key = str(rec.get("key") or "")
+            if key:
+                removed_keys.add(key)
+            continue
+        new_snapshot.append(rec)
+
+    ids = [i for i in ids if str(i) not in removed_keys]
+
+    # plan_by_addr_day: прибрати ключі цільових вулиць
+    cleaned_plan = {}
+    for adk, plan in plan_by.items():
+        parts = adk.split("|")
+        sid = parts[1] if len(parts) > 1 else ""
+        drop = False
+        for t in targets:
+            if sid and sid == str(t["fallback_street_id"]):
+                drop = True
+                break
+            if sid and any(sub in _norm(sid) for sub in t["street_subs"]):
+                drop = True
+                break
+        if not drop:
+            cleaned_plan[adk] = plan
+    plan_by = cleaned_plan
+
+    # 2) додати fake snapshot + plan_by для кожного target
+    for t in targets:
+        fake_id = 900000000 + int(t["fallback_street_id"]) + int(t["house"] or "0")
+        rec = snapshot_rec(t, fake_id=fake_id)
+        new_snapshot.append(rec)
+        ids.append(rec["key"])
+        adk = addr_day_key_from_parts(
+            t["fallback_city_id"],
+            t["fallback_street_id"],
+            t["fallback_street_name"],
+            t["fallback_buildings"],
+            t["day"],
+        )
+        plan_by[adk] = t["fake_end"][:16]
+        soft = (
+            f"{t['fallback_city_id']}|{t['fallback_street_id']}|seed|"
+            f"{t['fake_start'][:13]}"
+        )
+        if soft not in soft_fps:
+            soft_fps.append(soft)
+        fp = soft + "|planned"
+        if fp not in fps:
+            fps.append(fp)
+
+    return {
+        "ids": ids,
+        "fps": fps,
+        "soft_fps": soft_fps,
+        "plan_by_addr_day": plan_by,
+        "snapshot": new_snapshot,
+        "pending_cancels": list(cache.get("pending_cancels") or []),
+        "updated_at": now,
+        "count": len(ids),
+        "_seed": "force_diff_patch_targets_only",
     }
 
 
@@ -233,9 +325,8 @@ def main() -> int:
     users = list(users_col.find({}))
     print(f"[{now_s}] users у базі: {len(users)}")
 
-    # (otg_id, city_id) → list of (target, user, addr)
-    groups: Dict[Tuple[int, int], List[Tuple[dict, dict, dict]]] = {}
-    matched_tids: set = set()
+    group_targets: Dict[Tuple[int, int], List[dict]] = {}
+    matched_tids: Set[int] = set()
     matched_labels: List[str] = []
 
     for u in users:
@@ -263,7 +354,9 @@ def main() -> int:
                     continue
                 if not house_match(house, t["house"]):
                     continue
-                groups.setdefault((otg_id, city_id), []).append((t, u, addr))
+                group_targets.setdefault((otg_id, city_id), [])
+                if t not in group_targets[(otg_id, city_id)]:
+                    group_targets[(otg_id, city_id)].append(t)
                 if tid is not None:
                     matched_tids.add(int(tid))
                 matched_labels.append(
@@ -272,151 +365,89 @@ def main() -> int:
                 )
 
     if matched_labels:
-        print("Знайдені підписники:")
+        print("Знайдені підписники (тільки вони отримають тестову зміну):")
         for line in matched_labels:
             print(line)
     else:
         print(
-            "⚠️ Жодного підписника з цими адресами не знайдено. "
-            "Сіємо fallback-ключі кешу (otg/city з API), щоб monitor "
-            "усе одно мав «минулий» стан, якщо otg збіжиться."
+            "⚠️ Підписників з цими адресами не знайдено. "
+            "Патчимо лише fallback cache-ключі API — інші локації не чіпаємо."
         )
 
-    # Завжди додаємо fallback-групи з API ids (на випадок роз’їзду otg у users)
     for t in TARGETS:
-        key = (int(t["fallback_otg_id"]), int(t["fallback_city_id"]))
-        groups.setdefault(key, [])
-
-    seeded_cache = 0
-    seeded_outages = 0
-
-    for (otg_id, city_id), pairs in groups.items():
-        # який target сіємо для цієї групи
-        targets_for_group: List[dict] = []
-        if pairs:
-            seen = set()
-            for t, _u, _a in pairs:
-                if id(t) not in seen:
-                    seen.add(id(t))
-                    targets_for_group.append(t)
-        else:
-            # fallback: підібрати target за city_id
-            for t in TARGETS:
-                if int(t["fallback_city_id"]) == int(city_id) or int(t["fallback_otg_id"]) == int(
-                    otg_id
-                ):
-                    targets_for_group.append(t)
-
-        if not targets_for_group:
+        already = any(t in ts for ts in group_targets.values())
+        if already:
             continue
+        key = (int(t["fallback_otg_id"]), int(t["fallback_city_id"]))
+        group_targets.setdefault(key, []).append(t)
+        print(f"  fallback cache key {key[0]}_{key[1]} для {t['label']}")
 
+    patched_keys = 0
+    outage_upserts = 0
+
+    for (otg_id, city_id), targets in group_targets.items():
         cache_key = f"{otg_id}_{city_id or 0}"
-        snapshot: List[dict] = []
-        plan_by_addr_day: Dict[str, str] = {}
-        ids: List[str] = []
-        fps: List[str] = []
-        soft_fps: List[str] = []
-        outage_ops: List[UpdateOne] = []
+        existing = cache_col.find_one({"_id": cache_key}) or {}
+        before_snap = len(existing.get("snapshot") or [])
+        before_plan = len(existing.get("plan_by_addr_day") or {})
 
-        for t in targets_for_group:
-            # унікальний fake source_id, щоб не колізити з живими id API
+        patched = patch_cache_doc(existing, targets, now)
+        after_snap = len(patched.get("snapshot") or [])
+        after_plan = len(patched.get("plan_by_addr_day") or {})
+
+        cache_col.update_one(
+            {"_id": cache_key},
+            {"$set": patched},
+            upsert=True,
+        )
+        patched_keys += 1
+        print(
+            f"[{now_s}] PATCH cache[{cache_key}] "
+            f"targets={[t['label'] for t in targets]} "
+            f"snapshot {before_snap}→{after_snap} "
+            f"plan_by_addr_day {before_plan}→{after_plan}"
+        )
+
+        ops = []
+        for t in targets:
             fake_id = 900000000 + int(t["fallback_street_id"]) + int(t["house"] or "0")
-            rec = snapshot_rec(
-                source="planeds",
-                source_id=fake_id,
-                type_off=int(t["typeOff"]),
-                city_id=int(t["fallback_city_id"]),
-                city_name=t["fallback_city_name"],
-                street_id=int(t["fallback_street_id"]),
-                street_name=t["fallback_street_name"],
-                otg_id=int(t["fallback_otg_id"]),
-                otg_name=t["fallback_otg_name"],
-                buildings=t["fallback_buildings"],
-                date_event=t["fake_start"],
-                date_plan=t["fake_end"],
-            )
-            snapshot.append(rec)
-            ids.append(rec["key"])
-            adk = addr_day_key(
-                t["fallback_city_id"],
-                t["fallback_street_id"],
-                t["fallback_street_name"],
-                t["fallback_buildings"],
-                t["day"],
-            )
-            plan_by_addr_day[adk] = t["fake_end"][:16]
-            soft = (
-                f"{t['fallback_city_id']}|{t['fallback_street_id']}|"
-                f"{','.join(sorted({p.strip().lower() for p in t['fallback_buildings'].replace(';', ',').split(',') if p.strip()}))}|"
-                f"{t['fake_start'][:13]}"
-            )
-            soft_fps.append(soft)
-            fps.append(soft + "|planned")
-
+            rec = snapshot_rec(t, fake_id=fake_id)
             doc = outage_mongo_doc(rec)
-            outage_ops.append(
+            ops.append(
                 UpdateOne(
                     {"source": doc["source"], "source_id": doc["source_id"]},
                     {"$set": doc},
                     upsert=True,
                 )
             )
+        if ops:
+            outages_col.bulk_write(ops, ordered=False)
+            outage_upserts += len(ops)
 
-        cache_col.update_one(
-            {"_id": cache_key},
-            {
-                "$set": {
-                    "ids": ids,
-                    "fps": fps,
-                    "soft_fps": soft_fps,
-                    "plan_by_addr_day": plan_by_addr_day,
-                    "snapshot": snapshot,
-                    "pending_cancels": [],
-                    "updated_at": now,
-                    "count": len(ids),
-                    "_seed": "force_diff_test_prev_schedule",
-                }
-            },
-            upsert=True,
-        )
-        seeded_cache += 1
-        print(
-            f"[{now_s}] cache[{cache_key}]: snapshot={len(snapshot)} "
-            f"plan_by_addr_day={list(plan_by_addr_day.values())}"
-        )
-
-        if outage_ops:
-            outages_col.bulk_write(outage_ops, ordered=False)
-            seeded_outages += len(outage_ops)
-
-    # Дедуп: прибрати «вже слали» для знайдених користувачів (повністю їх ключі)
     cleared_n = 0
     if matched_tids:
         r = notified_col.delete_many({"telegram_id": {"$in": list(matched_tids)}})
         cleared_n = r.deleted_count
         print(
             f"[{now_s}] user_outage_notified: видалено {cleared_n} "
-            f"для tid={sorted(matched_tids)}"
+            f"лише для tid={sorted(matched_tids)}"
         )
     else:
-        print(
-            f"[{now_s}] user_outage_notified: не чіпав (немає зматчених tid). "
-            "Якщо сповіщення не прийдуть — очисти дедуп вручну або через повний wipe."
-        )
+        print(f"[{now_s}] user_outage_notified: не чіпав (немає зматчених tid)")
 
     print(
-        f"Готово: cache_keys={seeded_cache}, outages_upserts={seeded_outages}, "
-        f"notified_cleared={cleared_n}."
+        f"Готово: patched_cache_keys={patched_keys}, "
+        f"outages_upserts={outage_upserts}, notified_cleared={cleared_n}."
     )
     print(
-        "Далі запусти workflow «ZTOE outages» (ztoe_outages_monitor.py). "
-        "Очікуй «⏱ Зміна періоду» з Було/Стало для цих адрес."
+        "Інші адреси в cache не затирались — лише цільові вулиці "
+        "в snapshot і plan_by_addr_day."
     )
     print(
-        "Було (посіяно):\n"
-        "  • Білокоровицьке Шосе 20: 08:00–16:00\n"
-        "  • Лесі Українки 3: 09:00–14:00\n"
-        "Стало — те, що зараз віддає API (агреговано)."
+        "Далі: python ztoe_outages_monitor.py\n"
+        "Очікуй «⏱ Зміна періоду» лише для:\n"
+        "  • Білокоровицьке Шосе 20: було 08:00–16:00\n"
+        "  • Лесі Українки 3: було 09:00–14:00"
     )
     return 0
 
