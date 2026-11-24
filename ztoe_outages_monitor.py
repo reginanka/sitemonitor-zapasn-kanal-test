@@ -289,22 +289,20 @@ def make_outage_key(outage: dict) -> str:
 def content_fingerprint(outage: dict) -> str:
     street = outage.get("street") or {}
     sid = street.get("id") or (street.get("name") or "").strip().lower()
-    buildings = (outage.get("buildingNames") or "").strip().lower()
-    parts = sorted({p.strip() for p in buildings.replace(";", ",").split(",") if p.strip()})
+    parts = _building_parts_key(outage.get("buildingNames") or "")
     start = (outage.get("dateEvent") or "")[:13]
     fam = type_family(outage.get("typeOff"))
     city = (outage.get("city") or {}).get("id") or ""
-    return f"{city}|{sid}|{','.join(parts)}|{start}|{fam}"
+    return f"{city}|{sid}|{parts}|{start}|{fam}"
 
 
 def soft_fingerprint(outage: dict) -> str:
     street = outage.get("street") or {}
     sid = street.get("id") or (street.get("name") or "").strip().lower()
-    buildings = (outage.get("buildingNames") or "").strip().lower()
-    parts = sorted({p.strip() for p in buildings.replace(";", ",").split(",") if p.strip()})
+    parts = _building_parts_key(outage.get("buildingNames") or "")
     start = (outage.get("dateEvent") or "")[:13]
     city = (outage.get("city") or {}).get("id") or ""
-    return f"{city}|{sid}|{','.join(parts)}|{start}"
+    return f"{city}|{sid}|{parts}|{start}"
 
 
 def notify_dedup_key(outage: dict, house: str = "") -> str:
@@ -325,16 +323,16 @@ def notify_dedup_key(outage: dict, house: str = "") -> str:
 def addr_day_key(outage: dict) -> str:
     """
     Ключ «та сама адреса + той самий день» — незалежно від id і години старту.
-    Потрібен, щоб ловити продовження аварії, коли ЖОЕ закриває старий запис
-    і відкриває новий id з іншим dateEvent / datePlanIn.
+    Будинки зводяться (_building_parts_key): 32-а ≡ 32А ≡ 32 а.
+    Інакше ЖОЕ переписує той самий список — і виходить «скасовано» + «нове»
+    на ті самі години. Повне зникнення цього ключа з API й далі є скасуванням.
     """
     street = outage.get("street") or {}
     sid = street.get("id") or (street.get("name") or "").strip().lower()
-    buildings = (outage.get("buildingNames") or "").strip().lower()
-    parts = sorted({p.strip() for p in buildings.replace(";", ",").split(",") if p.strip()})
+    parts = _building_parts_key(outage.get("buildingNames") or "")
     city = (outage.get("city") or {}).get("id") or ""
     day = (outage.get("dateEvent") or outage.get("datePlanIn") or "")[:10]
-    return f"{city}|{sid}|{','.join(parts)}|{day}"
+    return f"{city}|{sid}|{parts}|{day}"
 
 
 def _iso_sort_key(s: str) -> str:
@@ -1273,6 +1271,16 @@ def _building_identity(token: str) -> str:
     )
 
 
+def _building_parts_key(buildings: str) -> str:
+    """Стабільний шматок addr_day / fingerprint: порожні токени і дублі написання зникають."""
+    parts = sorted({
+        _building_identity(p)
+        for p in (buildings or "").replace(";", ",").split(",")
+        if _building_identity(p)
+    })
+    return ",".join(parts)
+
+
 def merge_building_names(*lists: str) -> str:
     """Зліва направо: номери з наступного запису дописуються, якщо їх ще не було."""
     seen: set = set()
@@ -1455,12 +1463,9 @@ def remember_user_notified(col, tid: int, outage: dict, addr: dict) -> None:
     house = str(addr.get("house") or addr.get("building") or "")
     if outage.get("_cancelled"):
         dkey = cancel_notify_dedup_key(outage, house)
-        # Запис повернувся в API — появу треба сказати знову, старий ключ не блокує.
-        orig = notify_dedup_key(outage, house)
-        try:
-            col.delete_one({"_id": f"{int(tid)}:{orig}"})
-        except Exception as e:
-            log.warning("drop appearance dedup: %s", e)
+        # Появу не стираємо. «Скасовано» живе окремим ключем gone|…
+        # інакше той самий 08:00–17:00 після перезапису id піде ще раз як «Нове».
+        # Інші години — інший notify_dedup_key, сповіщення про зміну лишається.
     elif outage.get("_actual_start_only"):
         dkey = actual_start_notify_dedup_key(outage, house)
     else:
@@ -1940,6 +1945,64 @@ def outage_notify_dedup_key(outage: dict, house: str = "") -> str:
     if outage.get("_actual_start_only"):
         return actual_start_notify_dedup_key(outage, house)
     return notify_dedup_key(outage, house)
+
+
+def suppress_rewritten_pairs(notified: Dict[int, list], cancelled: Dict[int, list]) -> None:
+    """Пара «скасовано» + «нове» на ті самі години того самого будинку — не подія.
+
+    ЖОЕ часто міняє id і написання будинків, інтервал лишається.
+    Справжнє скасування без близнюка «нове» не чіпаємо.
+    Інший початок або кінець теж не чіпаємо: це вже інший ключ.
+    """
+    for tid in list(set(notified) | set(cancelled)):
+        news = list(notified.get(tid) or [])
+        gones = list(cancelled.get(tid) or [])
+        if not news or not gones:
+            continue
+        new_by_key: Dict[str, list] = {}
+        for item in news:
+            outage, addr = item
+            if not isinstance(outage, dict) or not isinstance(addr, dict):
+                continue
+            if (
+                outage.get("_plan_updated")
+                or outage.get("_finished_early")
+                or outage.get("_actual_start_only")
+            ):
+                continue
+            house = str(addr.get("house") or addr.get("building") or "")
+            new_by_key.setdefault(notify_dedup_key(outage, house), []).append(item)
+        drop_new: set = set()
+        drop_gone: set = set()
+        for item in gones:
+            outage, addr = item
+            if not isinstance(outage, dict) or not isinstance(addr, dict):
+                continue
+            house = str(addr.get("house") or addr.get("building") or "")
+            twins = new_by_key.get(notify_dedup_key(outage, house))
+            if not twins:
+                continue
+            drop_gone.add(id(item))
+            for twin in twins:
+                drop_new.add(id(twin))
+        if not drop_new and not drop_gone:
+            continue
+        kept_new = [it for it in news if id(it) not in drop_new]
+        kept_gone = [it for it in gones if id(it) not in drop_gone]
+        if kept_new:
+            notified[tid] = kept_new
+        else:
+            notified.pop(tid, None)
+        if kept_gone:
+            cancelled[tid] = kept_gone
+        else:
+            cancelled.pop(tid, None)
+        log.info(
+            "rewrite pair dropped tid=%s new=%s cancel=%s",
+            tid,
+            len(news) - len(kept_new),
+            len(gones) - len(kept_gone),
+        )
 
 
 def _fetch_pair(
@@ -2794,6 +2857,8 @@ def main() -> int:
             tid_u = _u.get("telegram_id")
             if tid_u is not None:
                 _user_by_tid[int(tid_u)] = _u
+
+    suppress_rewritten_pairs(notified, cancelled)
 
     n_new = sum(len(v) for v in notified.values())
     n_cancels = sum(len(v) for v in cancelled.values())
