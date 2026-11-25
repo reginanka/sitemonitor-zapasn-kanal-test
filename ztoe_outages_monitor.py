@@ -36,7 +36,15 @@ Cleanup:
 
 Env:
   OUTAGES_RETENTION_HOURS, SOFT_FPS_MAX, OUTAGES_CACHE_RETENTION_DAYS,
-  USER_NOTIFIED_TTL_DAYS, CANCEL_MISS_RUNS
+  USER_NOTIFIED_TTL_DAYS, CANCEL_MISS_RUNS, NOTIFY_HORIZON_DAYS
+
+NOTIFY_HORIZON_DAYS (default 2):
+  Сповіщати лише про події зі стартом (dateEvent) не далі ніж N днів від зараз.
+  0 = без обмеження.
+  Snapshot / pending_cancels / outages — повні (далекі теж пам’ятаємо).
+  «Нове / зміна / старт / finished» — лише в горизонті.
+  Далекі зникнення з API тримаємо в pending_cancels; «скасовано» шлемо
+  лише коли подія вже в горизонті і досі відсутня в API.
 """
 
 from __future__ import annotations
@@ -77,6 +85,10 @@ USER_NOTIFIED_TTL_DAYS = int(os.getenv("USER_NOTIFIED_TTL_DAYS", "7"))
 # Скільки успішних прогонів підряд запис має бути відсутній в API,
 # перш ніж слати «скасовано». 1 = як раніше (перший пропуск уже сповіщення).
 CANCEL_MISS_RUNS = max(1, int(os.getenv("CANCEL_MISS_RUNS", "2")))
+# Сповіщати лише про події зі стартом не далі ніж N днів від зараз (Київ).
+# 0 = без обмеження. Далекі зникнення тримаємо в pending_cancels;
+# «скасовано» шлемо лише коли подія вже в горизонті.
+NOTIFY_HORIZON_DAYS = max(0, int(os.getenv("NOTIFY_HORIZON_DAYS", "2")))
 
 
 def merge_soft_fps(current_soft: Set[str], prev_soft: Set[str], limit: int = SOFT_FPS_MAX) -> List[str]:
@@ -1694,6 +1706,29 @@ def period_has_started(outage: dict, now: Optional[datetime] = None) -> bool:
     return _to_utc(start) <= now.astimezone(timezone.utc)
 
 
+def is_within_notify_horizon(outage: dict, days: Optional[int] = None) -> bool:
+    """
+    True, якщо dateEvent у межах days від зараз (час Києва).
+
+    days=None → NOTIFY_HORIZON_DAYS; days<=0 → завжди True (фільтр вимкнено).
+    Немає розбірного старту → True (не ріжемо «сирі» записи).
+
+    Використовується лише на етапі розсилки. Snapshot / pending_cancels /
+    select_early_cancellations працюють з повним знімком API, щоб далекі
+    зникнення не губились і «скасовано» спрацювало, коли подія зайде у вікно.
+    """
+    if days is None:
+        days = NOTIFY_HORIZON_DAYS
+    if days <= 0:
+        return True
+    start = _parse_iso_dt(str(outage.get("dateEvent") or ""))
+    if start is None:
+        return True
+    now = datetime.now(_kyiv_zone())
+    start_k = _kyiv_wall(start)
+    return start_k <= now + timedelta(days=days)
+
+
 def _outage_interval_utc(outage: dict) -> Optional[Tuple[datetime, datetime]]:
     start = _parse_iso_dt(str(outage.get("dateEvent") or ""))
     end = _parse_iso_dt(str(outage.get("datePlanIn") or ""))
@@ -2603,6 +2638,10 @@ def main() -> int:
                     }
 
                     for outage in active_outages:
+                        # Горизонт сповіщень: далекі (dateEvent > зараз+Nд) не шлемо.
+                        # Snapshot їх пам’ятає — коли зайдуть у вікно, з’являться тут.
+                        if not is_within_notify_horizon(outage):
+                            continue
                         if not matches_street(outage, street_id, street_name):
                             continue
                         if not matches_building(outage, house):
@@ -2678,6 +2717,10 @@ def main() -> int:
                         )
                     }
                     for outage in early:
+                        # Далекі зникнення тримаємо в pending_cancels, але
+                        # «скасовано» шлемо лише коли dateEvent уже в горизонті.
+                        if not is_within_notify_horizon(outage):
+                            continue
                         if not matches_street(outage, street_id, street_name):
                             continue
                         if not matches_building(outage, house):
