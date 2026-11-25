@@ -2140,14 +2140,11 @@ def _group_city_name(group_pairs, outages) -> str:
     return ""
 
 
-def _human_group(rep: dict) -> str:
-    title = (rep.get("city_name") or "").strip() or f"місто {rep.get('city_id')}"
+def _group_is_quiet(rep: dict) -> bool:
+    """Тиха локація: успішний fetch і жодних подій/матчів для лога."""
     if not rep.get("fetch_ok"):
-        return (
-            f"• {title}: ЖОЕ не відповіло, кеш не змінював. "
-            f"Адрес підписників: {rep.get('addrs', 0)}."
-        )
-    quiet = not any(
+        return False
+    return not any(
         (
             rep.get("new"),
             rep.get("plan_upd"),
@@ -2160,55 +2157,71 @@ def _human_group(rep: dict) -> str:
             rep.get("matched_addrs"),
         )
     )
-    if quiet:
-        return (
-            f"• {title}: без змін. "
-            f"Записів у відповіді {rep['fetched']}, адрес {rep['addrs']}."
-        )
+
+
+def _pad(s: str, w: int) -> str:
+    s = str(s)
+    if len(s) > w:
+        return s[: max(0, w - 1)] + "…"
+    return s + " " * (w - len(s))
+
+
+def _rpad(s, w: int) -> str:
+    s = str(s)
+    if len(s) > w:
+        return s[:w]
+    return " " * (w - len(s)) + s
+
+
+def _human_group_table_row(rep: dict) -> Optional[str]:
+    """Один рядок таблиці локації або None якщо тиха (не показуємо)."""
+    title = (rep.get("city_name") or "").strip() or f"id:{rep.get('city_id') or rep.get('otg_id')}"
+    if not rep.get("fetch_ok"):
+        return None
+    if _group_is_quiet(rep):
+        return None
     waiting = max(0, int(rep.get("gone_early") or 0) - int(rep.get("cancel_ready") or 0))
-    lines = [
-        f"• {title}",
-        (
-            f"У відповіді {rep['fetched']} записів, "
-            f"для сповіщень {rep['active']}. Адрес підписників: {rep['addrs']}."
-        ),
-        (
-            f"Нових: {rep['new']}. Оновлень часу: {rep['plan_upd']}. "
-            f"Завершено: {rep.get('finished_early', 0)}. "
-            f"Фактичний старт: {rep.get('actual_start', 0)}."
-        ),
-        (
-            f"Зникли з видачі: {rep['gone_early']}. "
-            f"Скасування підтверджено: {rep.get('cancel_ready', 0)}. "
-            f"Ще чекають повторної перевірки: {waiting}."
-        ),
-    ]
-    if rep.get("skipped_planned") or rep.get("skipped_gpv"):
-        lines.append(
-            f"Пропущено вже відомих планових: {rep['skipped_planned']}, "
-            f"погодинних графіків: {rep['skipped_gpv']}."
-        )
-    lines.append(
-        f"Збіглося з адресами: {rep['matched']}. "
-        f"Скасувань у розсилку: {rep['cancel_matched']}."
+    return (
+        f"{_pad(title, 14)}│"
+        f"{_rpad(rep.get('fetched', 0), 4)}│"
+        f"{_rpad(rep.get('active', 0), 4)}│"
+        f"{_rpad(rep.get('new', 0), 3)}│"
+        f"{_rpad(rep.get('plan_upd', 0), 4)}│"
+        f"{_rpad(rep.get('finished_early', 0), 3)}│"
+        f"{_rpad(rep.get('actual_start', 0), 5)}│"
+        f"{_rpad(rep.get('gone_early', 0), 4)}│"
+        f"{_rpad(rep.get('cancel_ready', 0), 4)}│"
+        f"{_rpad(waiting, 3)}│"
+        f"{_rpad(rep.get('matched', 0), 4)}│"
+        f"{_rpad(rep.get('cancel_matched', 0), 5)}"
     )
+
+
+def _human_group_details(rep: dict) -> List[str]:
+    """Додаткові рядки під таблицею (адреси, пропуски) — лише для нетихих."""
+    if not rep.get("fetch_ok") or _group_is_quiet(rep):
+        return []
+    title = (rep.get("city_name") or "").strip() or f"id:{rep.get('city_id') or rep.get('otg_id')}"
+    lines: List[str] = []
     matched_addrs = rep.get("matched_addrs") or []
     if matched_addrs:
-        lines.append(
-            "Збіг по адресах: " + "; ".join(matched_addrs) + "."
-        )
+        lines.append(f"  {title} · збіг: " + "; ".join(matched_addrs))
     if rep.get("covered_skip"):
         lines.append(
-            "Не слав скасування, бо цю адресу вже покриває інший запис: "
-            f"{rep['covered_skip']}."
+            f"  {title} · не слав скасування (покрито іншим записом): "
+            f"{rep['covered_skip']}"
         )
     if rep.get("unmatched"):
         lines.append(
-            "Зараз відключень на цих адресах немає: "
+            f"  {title} · немає відключень на: "
             + "; ".join(rep["unmatched"])
-            + "."
         )
-    return "\n".join(lines)
+    if rep.get("skipped_planned") or rep.get("skipped_gpv"):
+        lines.append(
+            f"  {title} · пропущено планових: {rep.get('skipped_planned', 0)}, "
+            f"ГПВ: {rep.get('skipped_gpv', 0)}"
+        )
+    return lines
 
 
 def _human_run_summary(
@@ -2223,32 +2236,98 @@ def _human_run_summary(
     sent_sound: int,
     sent_quiet: int,
     deliveries: Optional[List[str]] = None,
-) -> str:
-    body = "\n\n".join(_human_group(rep) for rep in reports) or "Груп немає."
-    who = ""
-    if deliveries:
-        who = "Кому надіслано:\n" + "\n".join(deliveries)
-    text = (
-        "✅ Перевірка відключень\n"
-        f"Підписників: {users}. Локацій: {groups_checked}.\n\n"
-        f"{body}\n\n"
-        f"У розсилку пішло {n_events}: нових {n_new}, скасувань {n_cancels}.\n"
-        f"Повідомлення отримали {sent} "
-        f"(зі звуком {sent_sound}, тихо {sent_quiet})."
+) -> Tuple[str, Optional[str]]:
+    """Звіт у лог-групу: HTML + <pre>-таблиці. Тихі локації без подій — пропускаємо."""
+    fail_lines: List[str] = []
+    table_rows: List[str] = []
+    detail_lines: List[str] = []
+    shown = 0
+    quiet_n = 0
+    for rep in reports:
+        if not rep.get("fetch_ok"):
+            title = (rep.get("city_name") or "").strip() or f"id:{rep.get('city_id') or rep.get('otg_id')}"
+            fail_lines.append(
+                f"⚠ {title}: ЖОЕ не відповіло, кеш не змінював · адрес {rep.get('addrs', 0)}"
+            )
+            continue
+        if _group_is_quiet(rep):
+            quiet_n += 1
+            continue
+        row = _human_group_table_row(rep)
+        if row:
+            table_rows.append(row)
+            shown += 1
+        detail_lines.extend(_human_group_details(rep))
+
+    header = (
+        "✅ <b>Перевірка відключень</b>\n"
+        f"Підписників: <b>{users}</b> · Локацій: <b>{groups_checked}</b>"
+        f" (з подіями: <b>{shown}</b>"
+        + (f", без змін: {quiet_n}" if quiet_n else "")
+        + ")\n"
+        f"У розсилку: <b>{n_events}</b> (нових {n_new}, скасувань {n_cancels})\n"
+        f"Отримали: <b>{sent}</b> (звук {sent_sound}, тихо {sent_quiet})"
     )
-    if who:
-        text = text.rstrip() + "\n\n" + who
+
+    parts: List[str] = [header]
+
+    if fail_lines:
+        parts.append("<pre>" + html.escape("\n".join(fail_lines)) + "</pre>")
+
+    if table_rows:
+        col_hdr = (
+            f"{_pad('Місто', 14)}│"
+            f"{_rpad('API', 4)}│"
+            f"{_rpad('Акт', 4)}│"
+            f"{_rpad('Нов', 3)}│"
+            f"{_rpad('Змін', 4)}│"
+            f"{_rpad('Fin', 3)}│"
+            f"{_rpad('Старт', 5)}│"
+            f"{_rpad('Зник', 4)}│"
+            f"{_rpad('Скас', 4)}│"
+            f"{_rpad('Чек', 3)}│"
+            f"{_rpad('Збіг', 4)}│"
+            f"{_rpad('→Ск', 5)}"
+        )
+        sep = "─" * len(col_hdr)
+        table = "\n".join([col_hdr, sep, *table_rows])
+        parts.append("<pre>" + html.escape(table) + "</pre>")
+        if detail_lines:
+            parts.append("<pre>" + html.escape("\n".join(detail_lines)) + "</pre>")
+    elif not fail_lines:
+        parts.append("<pre>Немає локацій з подіями.</pre>")
+
+    if deliveries:
+        deliv_hdr = f"{_pad('Кому', 28)}│{_pad('Нові / Скас / Режим', 22)}"
+        deliv_sep = "─" * len(deliv_hdr)
+        deliv_rows: List[str] = []
+        for d in deliveries:
+            if " — " in d:
+                who, rest = d.split(" — ", 1)
+            else:
+                who, rest = d, ""
+            deliv_rows.append(f"{_pad(who.strip(), 28)}│{_pad(rest.strip(), 22)}")
+        deliv_body = "\n".join([deliv_hdr, deliv_sep, *deliv_rows])
+        parts.append(
+            "<b>Кому надіслано</b>\n<pre>"
+            + html.escape(deliv_body)
+            + "</pre>"
+        )
+
+    text = "\n".join(parts)
     if len(text) <= TG_TEXT_LIMIT:
         return text, None
-    short = (
-        "✅ Перевірка відключень\n"
-        f"Підписників: {users}. Локацій: {groups_checked}.\n"
-        f"У розсилку пішло {n_events}: нових {n_new}, скасувань {n_cancels}.\n"
-        f"Повідомлення отримали {sent} "
-        f"(зі звуком {sent_sound}, тихо {sent_quiet}).\n\n"
-        "Детальний звіт у файлі.\n\n"
-        + (who or "Кому надіслано:\nнемає")
-    )
+
+    short_parts = [header, "\nДетальний звіт у файлі."]
+    if deliveries:
+        short_parts.append(
+            "\n<b>Кому надіслано</b>\n<pre>"
+            + html.escape("\n".join(deliveries))
+            + "</pre>"
+        )
+    else:
+        short_parts.append("\nКому надіслано: немає")
+    short = "".join(short_parts)
     if len(short) > TG_TEXT_LIMIT:
         short = short[: TG_TEXT_LIMIT - 20].rstrip() + "\n… решта у файлі"
     return short, text
@@ -3038,9 +3117,13 @@ def main() -> int:
                     # 153 — звичайна гілка «Аварії, ремонти крон»
                     # 17725 — коли є що розсилати (нові / скасування)
                     thread_id = 17725 if n_events > 0 else 153
+                    # parse_mode=HTML обов’язковий: інакше <b>/<pre> приходять
+                    # як звичайний текст (не «річмеседж»).
                     await bot.send_message(
                         chat_id=int(log_chat),
-                        text=summary,
+                        text=fit_telegram_html(summary),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
                         message_thread_id=thread_id,
                     )
                     if attachment:
