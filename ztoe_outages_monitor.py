@@ -20,8 +20,17 @@
 - Інтервал той самий, але з’явився пізніший старт з /pw_accidents
   (напр. план 08:00–18:00 уже був, accident 09:28) → окреме
   «ℹ️ Фактичний старт робіт» без Було/Стало (дедуп actual|…).
+  Не шлемо, якщо цей старт уже «протух»: пізніший момент настав і від
+  ранішого минуло 2 год (план 08:00, факт 09:14 — тиша з 10:00;
+  о 11:00 чи 17:00 не нагадуємо).
+- План наздогнав уже надісланий фактичний старт
+  (було 08:00–17:00, стало 09:14–17:00) → не друга «зміна періоду».
+  Те саме, якщо старт повернули назад, але обидва ранкові часи вже
+  поза вікном (не до 08:00 і не між 08:00 і 10:00).
+  Кінець, який ще попереду, як і раніше дає «зміну періоду» /
+  «завершили раніше».
 - Якщо план+accident в одному першому fetch → нове сповіщення з рядком
-  «Фактичний старт» у звичайному тексті.
+  «Фактичний старт» у звичайному тексті (рядок ховаємо, якщо старт протух).
 - Новий addr_day → нове сповіщення. Повне зникнення addr_day до datePlanIn
   (після CANCEL_MISS_RUNS пропусків) → «Скасовано».
 - Після успішного повного fetch записи, яких більше немає в API для цієї
@@ -1725,6 +1734,134 @@ def kyiv_moment_passed(iso: str, now: Optional[datetime] = None) -> bool:
     return _kyiv_wall(moment).astimezone(timezone.utc) <= now.astimezone(timezone.utc)
 
 
+# Правка години старту має сенс, поки не минуло 2 год від ранішого з двох
+# часів. 08:00 ↔ 09:14: до 10:00 ще кажемо, з 10:00 / 11:00 / 17:00 — ні.
+# Аналог кінця графіка: обидва варіанти вже в минулому → не сповіщення.
+# Якщо пізніший старт ще попереду (08:00 → 12:00, зараз 11:00) — кажемо.
+START_REWRITE_QUIET_AFTER = timedelta(hours=2)
+
+
+def _kyiv_minute(iso: str) -> Optional[datetime]:
+    moment = _parse_iso_dt(_iso_sort_key(iso))
+    if moment is None:
+        return None
+    return _kyiv_wall(moment).replace(second=0, microsecond=0)
+
+
+def _now_kyiv_minute(now: Optional[datetime] = None) -> datetime:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_kyiv_zone())
+    return now.astimezone(_kyiv_zone()).replace(second=0, microsecond=0)
+
+
+def start_rewrite_is_stale(
+    old_start: str,
+    new_start: str,
+    now: Optional[datetime] = None,
+) -> bool:
+    """True, якщо зсув години початку вже ні на що не впливає.
+
+    Тиша, коли пізніший старт настав і від ранішого минуло ≥ 2 год.
+    """
+    a = _kyiv_minute(old_start)
+    b = _kyiv_minute(new_start)
+    if a is None or b is None or a == b:
+        return False
+    earlier, later = (a, b) if a <= b else (b, a)
+    current = _now_kyiv_minute(now)
+    if current < later:
+        return False
+    return current >= earlier + START_REWRITE_QUIET_AFTER
+
+
+def interval_change_is_stale_start(
+    old_start: str,
+    cur_start: str,
+    old_end: str,
+    cur_end: str,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Лише ранок початку переписали, і це вікно вже минуло.
+
+    Кінець зрушив і ще не в минулому — справжня зміна періоду, не тиша.
+    """
+    if not (old_start and cur_start and _iso_sort_key(old_start)[:16] != _iso_sort_key(cur_start)[:16]):
+        return False
+    if old_end and cur_end and _iso_sort_key(old_end)[:16] != _iso_sort_key(cur_end)[:16]:
+        if not (kyiv_moment_passed(old_end, now) and kyiv_moment_passed(cur_end, now)):
+            return False
+    return start_rewrite_is_stale(old_start, cur_start, now)
+
+
+def without_stale_actual(outage: dict, planned_start: str, now: Optional[datetime] = None) -> dict:
+    """Прибирає рядок «фактичний старт», якщо він уже не новина."""
+    act = str(outage.get("_actual_start") or "")
+    if not act or not start_rewrite_is_stale(planned_start, act, now):
+        return outage
+    outage = dict(outage)
+    outage.pop("_actual_start", None)
+    return outage
+
+
+def _previous_interval_phantom(outage: dict) -> dict:
+    phantom = dict(outage)
+    phantom["dateEvent"] = outage.get("_was_dateEvent") or ""
+    phantom["datePlanIn"] = outage.get("_was_datePlanIn") or outage.get("_plan_was") or ""
+    phantom.pop("_actual_start_only", None)
+    phantom.pop("_plan_updated", None)
+    return phantom
+
+
+def plan_change_repeats_actual_start(outage: dict, house: str, already_keys: Set[str]) -> bool:
+    """План лише наздогнав фактичний старт, який цій людині вже слали.
+
+    Було 08:00–17:00, стало 09:14–17:00 після «розпочато о 09:14» —
+    друге повідомлення нічого не додає. Якщо зрушив і кінець — лишаємо.
+    """
+    if not outage.get("_plan_updated"):
+        return False
+    old_start = _iso_sort_key(str(outage.get("_was_dateEvent") or ""))
+    new_start = _iso_sort_key(str(outage.get("dateEvent") or ""))
+    old_end = _iso_sort_key(str(outage.get("_was_datePlanIn") or outage.get("_plan_was") or ""))
+    new_end = _iso_sort_key(str(outage.get("datePlanIn") or ""))
+    if not old_start or not new_start or old_start[:16] == new_start[:16]:
+        return False
+    if old_end[:16] != new_end[:16]:
+        return False
+    phantom = _previous_interval_phantom(outage)
+    phantom["_actual_start"] = new_start
+    return actual_start_notify_dedup_key(phantom, house) in already_keys
+
+
+def _remember_suppressed(col, tid, outage: dict, addr: dict, already_keys: Set[str]) -> None:
+    """Фіксує поточний інтервал без відправки, щоб наступний прогін не прислав його як «нове»."""
+    try:
+        remember_user_notified(col, int(tid), outage, addr)
+    except Exception as e:
+        log.warning("suppress dedup: %s", e)
+        return
+    house = str(addr.get("house") or addr.get("building") or "")
+    already_keys.add(outage_notify_dedup_key(outage, house))
+
+
+def user_knows_previous_interval(outage: dict, house: str, already_keys: Set[str]) -> bool:
+    """Чи вже був текст про попередній інтервал цього addr_day (план або факт старту)."""
+    old_start = _iso_sort_key(str(outage.get("_was_dateEvent") or ""))
+    old_end = _iso_sort_key(str(outage.get("_was_datePlanIn") or outage.get("_plan_was") or ""))
+    if not old_start and not old_end:
+        return False
+    phantom = _previous_interval_phantom(outage)
+    if notify_dedup_key(phantom, house) in already_keys:
+        return True
+    new_start = _iso_sort_key(str(outage.get("dateEvent") or ""))
+    if not new_start:
+        return False
+    phantom["_actual_start"] = new_start
+    return actual_start_notify_dedup_key(phantom, house) in already_keys
+
+
 def period_has_started(outage: dict, now: Optional[datetime] = None) -> bool:
     """True, якщо dateEvent уже настав (або немає старту — вважаємо, що період «йде»).
 
@@ -2668,7 +2805,9 @@ def main() -> int:
             plan_updates: list = []
             actual_start_notices: list = []
             finished_notices: list = []
+            stale_start_rewrites: list = []
             seen_adk: set = set()
+            skipped_stale_start = 0
 
             for adk, agg in cur_agg.items():
                 if adk in seen_adk:
@@ -2684,7 +2823,8 @@ def main() -> int:
                     if type_family(agg.get("typeOff")) == "planned" and soft in prev_soft:
                         skipped_planned += 1
                         continue
-                    new_outages.append(agg)
+                    # Перший fetch о 17:00 не дописує «фактичний старт о 09:14»
+                    new_outages.append(without_stale_actual(agg, cur_start))
                     continue
 
                 interval_changed = (
@@ -2707,15 +2847,33 @@ def main() -> int:
                     # Обидва кінці вже в минулому (зараз 20:00, було до 18:00, стало до 17:00).
                     # Задня правка — не «зміна періоду» і не «завершили».
                     pass
+                elif interval_changed and interval_change_is_stale_start(
+                    old_start, cur_start, old_end, cur_end
+                ):
+                    # 08:00 → 09:14 (або назад), а вже 10:00 / 11:00 / 17:00.
+                    # Ранок минув — не «зміна періоду». Хто ще не чув про відключення,
+                    # отримає звичайне «нове» з актуальним інтервалом.
+                    skipped_stale_start += 1
+                    oo = without_stale_actual(dict(agg), cur_start)
+                    oo["_stale_start_rewrite"] = True
+                    oo["_was_dateEvent"] = old_start
+                    oo["_was_datePlanIn"] = old_end
+                    stale_start_rewrites.append(oo)
                 elif interval_changed:
                     # Реальний зсув min(start)/max(end) → «зміна періоду»
-                    oo = dict(agg)
+                    oo = without_stale_actual(dict(agg), old_start or cur_start)
                     oo["_plan_updated"] = True
                     oo["_plan_was"] = old_end
                     oo["_was_dateEvent"] = old_start
                     oo["_was_datePlanIn"] = old_end
                     oo["_plan_reason"] = "addr_day_agg"
                     plan_updates.append(oo)
+                elif agg.get("_actual_start") and start_rewrite_is_stale(
+                    cur_start, str(agg.get("_actual_start") or "")
+                ):
+                    # Факт 09:14 при плані 08:00 дізнались о 10:00+ — не новина.
+                    skipped_stale_start += 1
+                    agg.pop("_actual_start", None)
                 elif agg.get("_actual_start"):
                     # Інтервал той самий, але з’явився/є фактичний старт з accidents
                     # (план 08:00–18:00 уже був → окремо кажемо «почали о 09:28»)
@@ -2735,7 +2893,7 @@ def main() -> int:
 
             log.info(
                 "otg=%s city=%s fetched=%s new=%s plan_upd=%s finished=%s actual_start=%s "
-                "gone_early=%s cancel_ready=%s skipped_planned=%s skipped_gpv=%s",
+                "gone_early=%s cancel_ready=%s skipped_planned=%s skipped_gpv=%s stale_start=%s",
                 otg_id,
                 city_id,
                 len(outages),
@@ -2753,6 +2911,7 @@ def main() -> int:
                 len(early),
                 skipped_planned,
                 skipped_gpv,
+                skipped_stale_start,
             )
 
             # Bulk upsert full docs (для /check) + prune зниклих з API
@@ -2811,6 +2970,7 @@ def main() -> int:
             matched_fps: set = set()
             matched_addrs: List[str] = []
             matched_addrs_seen: set = set()
+            skipped_repeat_actual = 0
 
             # --- Per-user нотифікації по АГРЕГОВАНИХ активних відключеннях ---
             # Один логічний інтервал на addr_day — не шлемо окремо план і accident.
@@ -2819,7 +2979,8 @@ def main() -> int:
             # якщо його notify_dedup_key ще немає в user_outage_notified.
             active_by_adk = dict(cur_agg)  # addr_day → aggregated
             # Підмішати plan_updates/new (з прапорцями _plan_updated)
-            for o in new_outages:
+            # і протухлі правки старту (без «зміни періоду» для тих, хто вже знає).
+            for o in list(new_outages) + stale_start_rewrites:
                 adk = o.get("_addr_day") or addr_day_key(o)
                 if adk:
                     active_by_adk[adk] = o
@@ -2877,11 +3038,25 @@ def main() -> int:
                         if not matches_building(outage, house):
                             continue
 
-                        # «Лише фактичний старт» — тільки якщо користувач уже знає
-                        # про цей інтервал (base dedup є). Інакше — повне нове
-                        # сповіщення з рядком «Фактичний старт» у звичайному тексті.
+                        # Ранок уже минув (08:00 ↔ 09:14 після 10:00).
+                        # Хто знає попередній інтервал — мовчимо.
+                        # Хто адресу додав пізніше — звичайне «нове», не «зміна».
                         outage_for_user = outage
-                        if outage.get("_actual_start_only"):
+                        if outage.get("_stale_start_rewrite"):
+                            if user_knows_previous_interval(outage, house, already_keys):
+                                # Інакше наступний прогін побачить новий старт як «нове».
+                                _remember_suppressed(notified_col, tid, outage, addr, already_keys)
+                                skipped_repeat_actual += 1
+                                continue
+                            outage_for_user = dict(outage)
+                            outage_for_user.pop("_stale_start_rewrite", None)
+                        elif plan_change_repeats_actual_start(outage, house, already_keys):
+                            # Уже слали «розпочато о 09:14» — не дублювати
+                            # «було 08:00, стало 09:14» з тим самим кінцем.
+                            _remember_suppressed(notified_col, tid, outage, addr, already_keys)
+                            skipped_repeat_actual += 1
+                            continue
+                        elif outage.get("_actual_start_only"):
                             base_dkey = notify_dedup_key(outage, house)
                             if base_dkey not in already_keys:
                                 outage_for_user = dict(outage)
@@ -2920,12 +3095,13 @@ def main() -> int:
                             matched_addrs.append(addr_label)
 
                 log.info(
-                    "otg=%s city=%s matched_active=%s (addrs=%s active=%s)",
+                    "otg=%s city=%s matched_active=%s (addrs=%s active=%s repeat_skipped=%s)",
                     otg_id,
                     city_id,
                     len(matched_fps),
                     len(group_pairs),
                     len(active_outages),
+                    skipped_repeat_actual,
                 )
 
             # Запис був у попередньому знімку, з API зник, а datePlanIn ще попереду.
@@ -3055,7 +3231,7 @@ def main() -> int:
                 },
                 upsert=True,
             )
-            if new_outages and not matched_fps:
+            if new_outages and not matched_fps and not skipped_repeat_actual:
                 log.warning(
                     "otg=%s city=%s: new/plan=%s but 0 matched — адреса не збіглась",
                     otg_id,
