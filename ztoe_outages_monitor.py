@@ -2207,7 +2207,7 @@ def _th(val, *, align: str = "left") -> str:
 def _log_legend_html() -> str:
     """Легенда скорочень у таблицях логу (згортається через details)."""
     return (
-        "<details open>"
+        "<details>"
         "<summary>📖 Легенда позначок</summary>"
         "<p>"
         "<b>Підсумок:</b> У розсилку — події, які пішли підписникам; "
