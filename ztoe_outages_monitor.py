@@ -2156,18 +2156,19 @@ def _group_has_signal(rep: dict) -> bool:
     )
 
 
-def _td(val, *, align: str = "right", bold: bool = False) -> str:
+def _td(val, *, align: str | None = None) -> str:
+    """Комірка таблиці. Без вкладених тегів — Telegram Rich HTML їх часто відхиляє."""
     s = html.escape(str(val))
-    if bold:
-        s = f"<b>{s}</b>"
-    if align == "left":
-        return f'<td align="left">{s}</td>'
-    return f'<td align="right">{s}</td>'
+    if align in ("left", "right", "center"):
+        return f'<td align="{align}">{s}</td>'
+    return f"<td>{s}</td>"
 
 
-def _th(val, *, align: str = "left") -> str:
+def _th(val, *, align: str | None = None) -> str:
     s = html.escape(str(val))
-    return f'<th align="{align}">{s}</th>'
+    if align in ("left", "right", "center"):
+        return f'<th align="{align}">{s}</th>'
+    return f"<th>{s}</th>"
 
 
 def _human_run_summary(
@@ -2217,7 +2218,7 @@ def _human_run_summary(
         f"{_th('Показник')}{_th('Значення', align='right')}"
         "</tr>"
         "<tr>"
-        f"{_td('У розсилку', align='left')}{_td(n_events, bold=True)}"
+        f"{_td('У розсилку', align='left')}{_td(n_events)}"
         "</tr>"
         "<tr>"
         f"{_td('Нових', align='left')}{_td(n_new)}"
@@ -2226,7 +2227,7 @@ def _human_run_summary(
         f"{_td('Скасувань', align='left')}{_td(n_cancels)}"
         "</tr>"
         "<tr>"
-        f"{_td('Отримали', align='left')}{_td(sent, bold=True)}"
+        f"{_td('Отримали', align='left')}{_td(sent)}"
         "</tr>"
         "<tr>"
         f"{_td('Зі звуком / тихо', align='left')}{_td(f'{sent_sound} / {sent_quiet}')}"
@@ -2378,19 +2379,17 @@ def _human_run_summary(
         + "<table bordered striped>"
         "<caption>Підсумок</caption>"
         "<tr>"
-        f"{_th('Показник')}{_th('Значення', align='right')}"
+        f"{_th('Показник', align='left')}{_th('Значення', align='right')}"
         "</tr>"
         "<tr>"
-        f"{_td('У розсилку', align='left')}{_td(n_events, bold=True)}"
+        f"{_td('У розсилку', align='left')}{_td(n_events, align='right')}"
         "</tr>"
         "<tr>"
-        f"{_td('Отримали', align='left')}{_td(sent, bold=True)}"
+        f"{_td('Отримали', align='left')}{_td(sent, align='right')}"
         "</tr>"
         "</table>"
         + "\n<i>Детальний звіт у файлі.</i>"
     )
-    if len(short) > TG_TEXT_LIMIT:
-        short = short[: TG_TEXT_LIMIT - 20].rstrip() + "\n…"
     return short, text
 
 
@@ -3174,28 +3173,52 @@ def main() -> int:
             )
 
             if log_chat:
+                thread_id = 17725 if n_events > 0 else 153
+                chat_id = int(log_chat)
+                log_text = summary if len(summary) <= TG_TEXT_LIMIT else fit_telegram_html(summary)
                 try:
-                    # 153 — звичайна гілка «Аварії, ремонти крон»
-                    # 17725 — коли є що розсилати (нові / скасування)
-                    thread_id = 17725 if n_events > 0 else 153
-                    # Rich HTML: <table bordered striped> потребує parse_mode=HTML
+                    # Rich HTML: <table bordered striped> + parse_mode=HTML
                     await bot.send_message(
-                        chat_id=int(log_chat),
-                        text=fit_telegram_html(summary),
+                        chat_id=chat_id,
+                        text=log_text,
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                         message_thread_id=thread_id,
                     )
-                    if attachment:
+                except Exception as e:
+                    # Якщо HTML/table відхилили — шлемо plain, щоб лог усе одно дійшов
+                    log.warning(
+                        "log channel HTML fail thread=%s len=%s: %s — fallback plain",
+                        thread_id,
+                        len(summary or ""),
+                        e,
+                    )
+                    try:
+                        plain = (
+                            f"✅ Перевірка відключень\n"
+                            f"Підписників: {len(users)} · Локацій: {groups_checked}\n"
+                            f"У розсилку: {n_events} (нових {n_new}, скасувань {n_cancels})\n"
+                            f"Отримали: {sent} (звук {sent_sound}, тихо {sent_quiet})"
+                        )
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=plain,
+                            disable_web_page_preview=True,
+                            message_thread_id=thread_id,
+                        )
+                    except Exception as e2:
+                        log.warning("log channel plain fail: %s", e2)
+                if attachment:
+                    try:
                         doc = BytesIO(attachment.encode("utf-8"))
                         doc.name = "outages-log.txt"
                         await bot.send_document(
-                            chat_id=int(log_chat),
+                            chat_id=chat_id,
                             document=doc,
                             message_thread_id=thread_id,
                         )
-                except Exception as e:
-                    log.warning("log channel: %s", e)
+                    except Exception as e:
+                        log.warning("log channel doc: %s", e)
         finally:
             await bot.shutdown()
 
