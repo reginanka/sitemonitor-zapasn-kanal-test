@@ -75,6 +75,8 @@ GPV_COLLECTION = os.getenv("GPV_NOTIFIED_COLLECTION", "user_gpv_notified")
 GPV_LOG_THREAD_ID = int(os.getenv("GPV_LOG_THREAD_ID", "155"))
 GPV_LOG_THREAD_ALERT_ID = int(os.getenv("GPV_LOG_THREAD_ALERT_ID", "17725"))
 TG_TEXT_LIMIT = 4096
+# Rich Messages (sendRichMessage): до 32768 символів. Таблиці звичайний sendMessage не вміє.
+RICH_MSG_LIMIT = 32768
 
 
 def _api_base() -> str:
@@ -768,48 +770,359 @@ def remember_notified(col, tid: int, decisions: Sequence[Decision]) -> None:
             )
 
 
-def _human_summary(
+def _city_name(pairs, outages=None) -> str:
+    for _user, addr in pairs or []:
+        if not isinstance(addr, dict):
+            continue
+        name = (addr.get("city_name") or addr.get("city") or "").strip()
+        if isinstance(name, str) and name:
+            return name
+    for outage in outages or []:
+        name = ((outage.get("city") or {}).get("name") or "").strip()
+        if name:
+            return name
+    return ""
+
+
+def _decision_detail(d: Decision) -> str:
+    hours = _fmt_ranges([(w[1], w[2]) for w in d.windows]) or "—"
+    base = f"{addr_line(d.addr)} · {_fmt_ddmmyyyy(d.ymd)} · {hours}"
+    if d.kind == "mismatch":
+        slot = _fmt_ranges(d.slots) or "немає слотів"
+        return f"{base} (графік: {slot})"
+    return base
+
+
+def _td(val, *, align: str | None = None) -> str:
+    """Комірка таблиці. Без вкладених тегів — інакше Rich HTML ламається."""
+    s = html.escape(str(val))
+    if align in ("left", "right", "center"):
+        return f'<td align="{align}">{s}</td>'
+    return f"<td>{s}</td>"
+
+
+def _th(val, *, align: str = "left") -> str:
+    s = html.escape(str(val))
+    return f'<th align="{align}">{s}</th>'
+
+
+def _group_has_signal(rep: dict) -> bool:
+    """Локація, де є розбіжність або нове ГПВ. Чистий збіг із графіком — не рядок."""
+    if not rep.get("fetch_ok"):
+        return True
+    return bool(
+        rep.get("mismatch")
+        or rep.get("appeared")
+        or rep.get("queued_mismatch")
+        or rep.get("queued_appeared")
+    )
+
+
+def _log_legend_html() -> str:
+    return (
+        "<details>"
+        "<summary>📖 Легенда позначок</summary>"
+        "<p>"
+        "<b>Підсумок:</b> У розсилку — блоки адрес, які пішли підписникам після дедупу; "
+        "Розбіжностей / Нових ГПВ — з них; Збіглось — вікна, які цілком увійшли в графік "
+        "(тиша); Отримали — скільки людей прийняли повідомлення; "
+        "Зі звуком / тихо — з урахуванням quiet hours.<br/>"
+        "<b>Локації з подіями:</b> міста, де все збіглось, у таблицю не потрапляють. "
+        "Числа в цій таблиці — вікна, не люди.<br/>"
+        "• <b>API</b> — скільки записів повернув ЖОЕ (/pw_accidents)<br/>"
+        "• <b>ГПВ</b> — з них погодинні (switchSubReason=2 або «ГПВ» у коментарі)<br/>"
+        "• <b>Збіг</b> — вікна, які входять у slots черги на цей день<br/>"
+        "• <b>Розб</b> — вікна, яких у графіку черги немає<br/>"
+        "• <b>Нові</b> — ГПВ на адресах «не вимикають, крім аварійних»<br/>"
+        "• <b>Черг</b> — пропуск: черга на адресі ще порожня (це не «не вимикають»)<br/>"
+        "• <b>Граф</b> — пропуск: немає документа черги або цей день не в графіку<br/>"
+        "• <b>→Роз</b> — розбіжностей, що пішли в розсилку цього прогону<br/>"
+        "• <b>→Нов</b> — нових ГПВ, що пішли в розсилку цього прогону<br/>"
+        "Нуль у →Роз при ненульовій Розб — уже слали це вікно (дедуп).<br/>"
+        "<b>Деталі:</b> адреса, день, години ЖОЕ і графік черги."
+        "</p>"
+        "</details>"
+    )
+
+
+def _pack_rich_parts(parts: List[str], limit: int = RICH_MSG_LIMIT) -> List[str]:
+    """Складає HTML-блоки логу в кілька rich-повідомлень ≤ limit."""
+    if not parts:
+        return []
+    msgs: List[str] = []
+    cur = ""
+    cont = "⚠️ <b>Продовження звіту:</b>"
+    for part in parts:
+        part = (part or "").strip()
+        if not part:
+            continue
+        if len(part) > limit:
+            if cur:
+                msgs.append(cur)
+                cur = ""
+            chunk_budget = max(1000, limit - 80)
+            buf = ""
+            for line in part.split("\n"):
+                cand = line if not buf else buf + "\n" + line
+                if buf and len(cand) > chunk_budget:
+                    piece = buf if not msgs else f"{cont}\n\n{buf}"
+                    msgs.append(piece)
+                    buf = line
+                else:
+                    buf = cand
+            if buf:
+                piece = buf if not msgs else f"{cont}\n\n{buf}"
+                msgs.append(piece)
+            continue
+        sep = "\n\n" if cur else ""
+        candidate = f"{cur}{sep}{part}" if cur else part
+        if cur and len(candidate) > limit:
+            msgs.append(cur)
+            cur = f"{cont}\n\n{part}"
+            if len(cur) > limit:
+                msgs.append(cur)
+                cur = ""
+        else:
+            cur = candidate
+    if cur:
+        msgs.append(cur)
+    return msgs
+
+
+async def send_rich_html(
+    bot_token: str,
+    chat_id: int,
+    html_body: str,
+    *,
+    message_thread_id: int | None = None,
+) -> dict:
+    """Telegram Bot API sendRichMessage. Звичайний sendMessage таблиці не приймає."""
+    import httpx
+
+    payload: dict = {
+        "chat_id": chat_id,
+        "rich_message": {"html": html_body},
+    }
+    if message_thread_id is not None:
+        payload["message_thread_id"] = int(message_thread_id)
+    url = f"https://api.telegram.org/bot{bot_token}/sendRichMessage"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, json=payload)
+        data = r.json()
+        if not data.get("ok"):
+            desc = data.get("description") or r.text
+            raise RuntimeError(f"sendRichMessage failed: {desc}")
+        return data
+
+
+def _gpv_run_summary(
+    reports: List[dict],
     *,
     users: int,
-    locations: int,
-    fetch_fail: int,
-    gpv_records: int,
-    stats: Dict[str, int],
+    groups_checked: int,
+    n_events: int,
+    n_mismatch: int,
+    n_appeared: int,
     sent: int,
     sent_sound: int,
     sent_quiet: int,
-    dry: bool,
-    deliveries: Sequence[str],
-) -> str:
-    lines = [
-        "✅ <b>Перевірка ГПВ проти черг</b>",
-        f"Підписників: <b>{users}</b> · Локацій: <b>{locations}</b>",
-        (
-            f"Записів ГПВ: <b>{gpv_records}</b>"
-            + (f" · ЖОЕ не відповіло: <b>{fetch_fail}</b>" if fetch_fail else "")
-        ),
-        (
-            f"Збіглось із графіком (тиша): <b>{stats.get('match_windows', 0)}</b> · "
-            f"Розбіжностей: <b>{stats.get('mismatch_windows', 0)}</b> · "
-            f"Нових на адресах без графіка: <b>{stats.get('appeared_windows', 0)}</b>"
-        ),
-        (
-            f"Пропуск: немає черги {stats.get('skip_no_queue', 0)}, "
-            f"немає графіка на день {stats.get('skip_no_sched', 0)}, "
-            f"поза вікном {stats.get('skip_horizon', 0)}, "
-            f"минулі {stats.get('skip_past', 0)}"
-        ),
-        f"Отримали: <b>{sent}</b> (звук {sent_sound} / тихо {sent_quiet})"
-        + (" · dry-run" if dry else ""),
-    ]
+    stats: Dict[str, int],
+    deliveries: Optional[List[str]] = None,
+    dry: bool = False,
+) -> List[str]:
+    """Звіт у лог-групу тим самим Rich HTML, що й перевірка аварій.
+
+    Тихі локації (ГПВ збіглось із чергою, писати нікому) не додаємо.
+    """
+    signal_reps: List[dict] = []
+    fail_reps: List[dict] = []
+    quiet_n = 0
+    for rep in reports:
+        if not rep.get("fetch_ok"):
+            fail_reps.append(rep)
+            continue
+        if not _group_has_signal(rep):
+            quiet_n += 1
+            continue
+        signal_reps.append(rep)
+
+    header = (
+        "✅ <b>Перевірка ГПВ проти черг</b>\n"
+        f"Підписників: <b>{users}</b> · Локацій: <b>{groups_checked}</b>"
+        f" (з подіями: <b>{len(signal_reps)}</b>"
+        + (f", без змін: {quiet_n}" if quiet_n else "")
+        + ")"
+        + (" · dry-run" if dry else "")
+    )
+    parts: List[str] = [header]
+    skip_txt = (
+        f"немає черги {stats.get('skip_no_queue', 0)}, "
+        f"немає графіка {stats.get('skip_no_sched', 0)}, "
+        f"поза вікном {stats.get('skip_horizon', 0)}, "
+        f"минулі {stats.get('skip_past', 0)}"
+    )
+    parts.append(
+        "<table bordered striped>\n"
+        "<caption>Підсумок</caption>\n"
+        "<tr>"
+        f"{_th('Показник')}{_th('Значення', align='right')}"
+        "</tr>\n"
+        "<tr>"
+        f"{_td('У розсилку', align='left')}{_td(n_events)}"
+        "</tr>\n"
+        "<tr>"
+        f"{_td('Розбіжностей', align='left')}{_td(n_mismatch)}"
+        "</tr>\n"
+        "<tr>"
+        f"{_td('Нових ГПВ', align='left')}{_td(n_appeared)}"
+        "</tr>\n"
+        "<tr>"
+        f"{_td('Збіглось із графіком', align='left')}{_td(stats.get('match_windows', 0))}"
+        "</tr>\n"
+        "<tr>"
+        f"{_td('Пропущено', align='left')}{_td(skip_txt, align='left')}"
+        "</tr>\n"
+        "<tr>"
+        f"{_td('Отримали', align='left')}{_td(sent)}"
+        "</tr>\n"
+        "<tr>"
+        f"{_td('Зі звуком / тихо', align='left')}{_td(f'{sent_sound} / {sent_quiet}')}"
+        "</tr>\n"
+        "</table>"
+    )
+
+    if fail_reps:
+        fail_rows = []
+        for rep in fail_reps:
+            title = (rep.get("city_name") or "").strip() or f"id:{rep.get('city_id') or rep.get('otg_id')}"
+            fail_rows.append(
+                "<tr>"
+                f"{_td(title, align='left')}"
+                f"{_td(rep.get('addrs', 0))}"
+                "</tr>\n"
+            )
+        parts.append(
+            "<table bordered striped>\n"
+            "<caption>⚠️ ЖОЕ не відповіло</caption>\n"
+            "<tr>"
+            f"{_th('Місто')}{_th('Адрес', align='right')}"
+            "</tr>\n"
+            + "".join(fail_rows)
+            + "</table>"
+        )
+
+    if signal_reps:
+        rows = []
+        for rep in signal_reps:
+            title = (rep.get("city_name") or "").strip() or f"id:{rep.get('city_id') or rep.get('otg_id')}"
+            rows.append(
+                "<tr>"
+                f"{_td(title, align='left')}"
+                f"{_td(rep.get('fetched', 0))}"
+                f"{_td(rep.get('gpv', 0))}"
+                f"{_td(rep.get('match', 0))}"
+                f"{_td(rep.get('mismatch', 0))}"
+                f"{_td(rep.get('appeared', 0))}"
+                f"{_td(rep.get('skip_no_queue', 0))}"
+                f"{_td(rep.get('skip_no_sched', 0))}"
+                f"{_td(rep.get('queued_mismatch', 0))}"
+                f"{_td(rep.get('queued_appeared', 0))}"
+                "</tr>\n"
+            )
+        parts.append(
+            "<table bordered striped>\n"
+            "<caption>Локації з подіями</caption>\n"
+            "<tr>"
+            f"{_th('Місто')}"
+            f"{_th('API', align='right')}"
+            f"{_th('ГПВ', align='right')}"
+            f"{_th('Збіг', align='right')}"
+            f"{_th('Розб', align='right')}"
+            f"{_th('Нові', align='right')}"
+            f"{_th('Черг', align='right')}"
+            f"{_th('Граф', align='right')}"
+            f"{_th('→Роз', align='right')}"
+            f"{_th('→Нов', align='right')}"
+            "</tr>\n"
+            + "".join(rows)
+            + "</table>"
+        )
+
+        detail_rows = []
+        for rep in signal_reps:
+            title = (rep.get("city_name") or "").strip() or f"id:{rep.get('city_id') or rep.get('otg_id')}"
+            mis = rep.get("detail_mismatch") or []
+            app = rep.get("detail_appeared") or []
+            if mis:
+                extra = rep.get("detail_mismatch_more") or 0
+                text = "; ".join(mis)
+                if extra:
+                    text += f"; … ще {extra}"
+                detail_rows.append(
+                    "<tr>"
+                    f"{_td(title, align='left')}"
+                    f"{_td('розбіжність', align='left')}"
+                    f"{_td(text, align='left')}"
+                    "</tr>\n"
+                )
+            if app:
+                extra = rep.get("detail_appeared_more") or 0
+                text = "; ".join(app)
+                if extra:
+                    text += f"; … ще {extra}"
+                detail_rows.append(
+                    "<tr>"
+                    f"{_td(title, align='left')}"
+                    f"{_td('нове ГПВ', align='left')}"
+                    f"{_td(text, align='left')}"
+                    "</tr>\n"
+                )
+            if rep.get("skip_no_queue") or rep.get("skip_no_sched"):
+                detail_rows.append(
+                    "<tr>"
+                    f"{_td(title, align='left')}"
+                    f"{_td('пропущено', align='left')}"
+                    f"{_td('немає черги ' + str(rep.get('skip_no_queue', 0)) + ', немає графіка ' + str(rep.get('skip_no_sched', 0)), align='left')}"
+                    "</tr>\n"
+                )
+        if detail_rows:
+            parts.append(
+                "<table bordered striped>\n"
+                "<caption>Деталі</caption>\n"
+                "<tr>"
+                f"{_th('Місто')}{_th('Тип')}{_th('Значення')}"
+                "</tr>\n"
+                + "".join(detail_rows)
+                + "</table>"
+            )
+    elif not fail_reps:
+        parts.append("<i>Немає локацій з подіями.</i>")
+
     if deliveries:
-        lines.append("")
-        lines.append("<b>Кому:</b>")
-        for row in deliveries[:40]:
-            lines.append(h(row))
-        if len(deliveries) > 40:
-            lines.append(h(f"… ще {len(deliveries) - 40}"))
-    return "\n".join(lines)
+        d_rows = []
+        for d in deliveries:
+            if " — " in d:
+                who, rest = d.split(" — ", 1)
+            else:
+                who, rest = d, ""
+            d_rows.append(
+                "<tr>"
+                f"{_td(who.strip(), align='left')}"
+                f"{_td(rest.strip(), align='left')}"
+                "</tr>\n"
+            )
+        parts.append(
+            "<table bordered striped>\n"
+            "<caption>Кому надіслано</caption>\n"
+            "<tr>"
+            f"{_th('Кому')}{_th('Розбіжність / Нове ГПВ / Режим')}"
+            "</tr>\n"
+            + "".join(d_rows)
+            + "</table>"
+        )
+
+    parts.append(_log_legend_html())
+    return _pack_rich_parts(parts, RICH_MSG_LIMIT)
 
 
 def main() -> int:
@@ -872,18 +1185,41 @@ def main() -> int:
     gpv_records = 0
     fetch_fail = 0
     sched_cache: Dict[str, Optional[dict]] = {}
+    group_reports: List[dict] = []
 
     try:
-        for (kind, loc_id), pairs in groups.items():
+        ordered = sorted(
+            groups.items(),
+            key=lambda it: (_city_name(it[1]) or str(it[0][1])).lower(),
+        )
+        for (kind, loc_id), pairs in ordered:
+            city_name = _city_name(pairs)
             if kind == "c":
+                city_id, otg_id = loc_id, 0
+                try:
+                    otg_id = int(
+                        (pairs[0][1].get("otg_id") or pairs[0][1].get("otgId") or 0)
+                    )
+                except (TypeError, ValueError, IndexError):
+                    otg_id = 0
                 outages, ok = fetch_accidents(http, city_id=loc_id)
             else:
+                city_id, otg_id = 0, loc_id
                 outages, ok = fetch_accidents(http, otg_id=loc_id)
             if not ok:
                 fetch_fail += 1
+                group_reports.append({
+                    "otg_id": otg_id,
+                    "city_id": city_id,
+                    "city_name": city_name,
+                    "fetch_ok": False,
+                    "addrs": len(pairs),
+                })
                 continue
             gpv = [o for o in outages if is_gpv_record(o)]
             gpv_records += len(gpv)
+            if not city_name:
+                city_name = _city_name(pairs, gpv)
             log.info(
                 "%s=%s accidents=%s gpv=%s addrs=%s",
                 "city" if kind == "c" else "otg",
@@ -892,6 +1228,11 @@ def main() -> int:
                 len(gpv),
                 len(pairs),
             )
+            loc_stats: Dict[str, int] = {}
+            detail_mismatch: List[str] = []
+            detail_appeared: List[str] = []
+            queued_mismatch = 0
+            queued_appeared = 0
             seen_addr = set()
             for user, addr in pairs:
                 tid = user.get("telegram_id")
@@ -907,6 +1248,13 @@ def main() -> int:
                 seen_addr.add(marker)
                 alerts, part = decide_address(db, addr, gpv, sched_cache=sched_cache)
                 _sum_stats(stats, part)
+                _sum_stats(loc_stats, part)
+                for dec in alerts:
+                    line = _decision_detail(dec)
+                    if dec.kind == "mismatch":
+                        detail_mismatch.append(line)
+                    else:
+                        detail_appeared.append(line)
                 if not alerts:
                     continue
                 already = {
@@ -918,8 +1266,33 @@ def main() -> int:
                     if d.get("dedup_key")
                 }
                 fresh = _fresh_decisions(alerts, already)
+                for dec in fresh:
+                    if dec.kind == "mismatch":
+                        queued_mismatch += len(dec.windows)
+                    else:
+                        queued_appeared += len(dec.windows)
                 if fresh:
                     pending.setdefault(tid, []).extend(fresh)
+            group_reports.append({
+                "otg_id": otg_id,
+                "city_id": city_id,
+                "city_name": city_name,
+                "fetch_ok": True,
+                "fetched": len(outages),
+                "gpv": len(gpv),
+                "addrs": len(pairs),
+                "match": loc_stats.get("match_windows", 0),
+                "mismatch": loc_stats.get("mismatch_windows", 0),
+                "appeared": loc_stats.get("appeared_windows", 0),
+                "skip_no_queue": loc_stats.get("skip_no_queue", 0),
+                "skip_no_sched": loc_stats.get("skip_no_sched", 0),
+                "queued_mismatch": queued_mismatch,
+                "queued_appeared": queued_appeared,
+                "detail_mismatch": detail_mismatch[:24],
+                "detail_mismatch_more": max(0, len(detail_mismatch) - 24),
+                "detail_appeared": detail_appeared[:24],
+                "detail_appeared_more": max(0, len(detail_appeared) - 24),
+            })
     finally:
         http.close()
 
@@ -1005,20 +1378,25 @@ def main() -> int:
                 if ok_any and not dry:
                     await asyncio.sleep(0.35)
 
-            summary = _human_summary(
+            n_mismatch = sum(1 for ds in pending.values() for d in ds if d.kind == "mismatch")
+            n_appeared = sum(1 for ds in pending.values() for d in ds if d.kind == "appeared")
+            n_events = n_mismatch + n_appeared
+            log_msgs = _gpv_run_summary(
+                group_reports,
                 users=len(users),
-                locations=len(groups),
-                fetch_fail=fetch_fail,
-                gpv_records=gpv_records,
-                stats=stats,
+                groups_checked=len(groups),
+                n_events=n_events,
+                n_mismatch=n_mismatch,
+                n_appeared=n_appeared,
                 sent=sent,
                 sent_sound=sent_sound,
                 sent_quiet=sent_quiet,
-                dry=dry,
+                stats=stats,
                 deliveries=deliveries,
+                dry=dry,
             )
             log.info(
-                "підсумок users=%s locations=%s gpv=%s match=%s mismatch=%s appeared=%s sent=%s",
+                "підсумок users=%s locations=%s gpv=%s match=%s mismatch=%s appeared=%s sent=%s fetch_fail=%s log_parts=%s",
                 len(users),
                 len(groups),
                 gpv_records,
@@ -1026,26 +1404,59 @@ def main() -> int:
                 stats.get("mismatch_windows", 0),
                 stats.get("appeared_windows", 0),
                 sent,
+                fetch_fail,
+                len(log_msgs),
             )
             log_chat = (
                 os.getenv("TELEGRAM_LOG_CHANNEL_ID")
                 or os.getenv("ADMIN_CHAT_ID")
                 or os.getenv("TELEGRAM_CHAT_ID")
             )
-            if log_chat and bot is not None and not dry:
-                thread = GPV_LOG_THREAD_ALERT_ID if sent else GPV_LOG_THREAD_ID
-                try:
-                    await bot.send_message(
-                        chat_id=int(log_chat),
-                        text=summary if len(summary) <= TG_TEXT_LIMIT else summary[:TG_TEXT_LIMIT],
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                        message_thread_id=thread,
-                    )
-                except Exception as e:
-                    log.warning("log channel fail thread=%s: %s", thread, e)
-            elif dry:
-                log.info("dry summary:\n%s", re.sub("<[^>]+>", "", summary))
+            if dry:
+                plain = re.sub("<[^>]+>", "", "\n\n".join(log_msgs))
+                log.info("dry summary:\n%s", plain)
+            elif log_chat and bot is not None:
+                # 155 — тихий підсумок (гілка черг)
+                # 17725 — є що розсилати
+                thread_id = GPV_LOG_THREAD_ALERT_ID if n_events > 0 else GPV_LOG_THREAD_ID
+                chat_id = int(log_chat)
+                for part_i, log_html in enumerate(log_msgs):
+                    try:
+                        await send_rich_html(
+                            bot_token,
+                            chat_id,
+                            log_html,
+                            message_thread_id=thread_id,
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "log channel rich fail part=%s/%s thread=%s len=%s: %s",
+                            part_i + 1,
+                            len(log_msgs),
+                            thread_id,
+                            len(log_html or ""),
+                            e,
+                        )
+                        if part_i == 0:
+                            try:
+                                plain = (
+                                    "✅ Перевірка ГПВ проти черг\n"
+                                    f"Підписників: {len(users)} · Локацій: {len(groups)}\n"
+                                    f"У розсилку: {n_events} "
+                                    f"(розбіжностей {n_mismatch}, нових ГПВ {n_appeared})\n"
+                                    f"Отримали: {sent} (звук {sent_sound}, тихо {sent_quiet})\n"
+                                    "(rich message не прийнято — див. Actions log)"
+                                )
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=plain,
+                                    disable_web_page_preview=True,
+                                    message_thread_id=thread_id,
+                                )
+                            except Exception as e2:
+                                log.warning("log channel plain fail: %s", e2)
+                    if part_i + 1 < len(log_msgs):
+                        await asyncio.sleep(0.35)
         finally:
             if bot is not None:
                 await bot.shutdown()
@@ -1220,6 +1631,76 @@ def _self_check() -> None:
     assert _fresh_decisions([sample], {key}) == []
     again = _fresh_decisions([sample], set())
     assert len(again) == 1 and again[0].windows == sample.windows
+    parts = _gpv_run_summary(
+        [
+            {
+                "fetch_ok": False,
+                "city_name": "Тест",
+                "city_id": 1,
+                "otg_id": 0,
+                "addrs": 2,
+            },
+            {
+                "fetch_ok": True,
+                "city_name": "Коростень",
+                "city_id": 430,
+                "otg_id": 1,
+                "fetched": 10,
+                "gpv": 4,
+                "match": 1,
+                "mismatch": 2,
+                "appeared": 1,
+                "skip_no_queue": 0,
+                "skip_no_sched": 3,
+                "queued_mismatch": 2,
+                "queued_appeared": 1,
+                "detail_mismatch": ["Кемського, 33 · 26.11.2026 · 12:30-15:00 (графік: 13:00-16:00)"],
+                "detail_appeared": ["Миру, 1 · 26.11.2026 · 13:00-16:00"],
+                "addrs": 5,
+            },
+            {
+                "fetch_ok": True,
+                "city_name": "Тихе",
+                "gpv": 2,
+                "match": 2,
+                "mismatch": 0,
+                "appeared": 0,
+                "queued_mismatch": 0,
+                "queued_appeared": 0,
+                "skip_no_queue": 0,
+                "skip_no_sched": 0,
+                "fetched": 2,
+                "detail_mismatch": [],
+                "detail_appeared": [],
+            },
+        ],
+        users=3,
+        groups_checked=3,
+        n_events=2,
+        n_mismatch=1,
+        n_appeared=1,
+        sent=1,
+        sent_sound=1,
+        sent_quiet=0,
+        stats={
+            "match_windows": 3,
+            "mismatch_windows": 2,
+            "appeared_windows": 1,
+            "skip_no_queue": 0,
+            "skip_no_sched": 3,
+            "skip_horizon": 0,
+            "skip_past": 0,
+        },
+        deliveries=["1 @user — розбіжність 1, нове ГПВ 1, зі звуком"],
+    )
+    blob = "\n".join(parts)
+    assert "<table" in blob and "Підсумок" in blob
+    assert "Локації з подіями" in blob and "Коростень" in blob
+    assert "Тихе" not in blob
+    assert "ЖОЕ не відповіло" in blob
+    assert "Деталі" in blob and "Кому надіслано" in blob
+    assert "Легенда" in blob
+    assert all(len(p) <= RICH_MSG_LIMIT for p in parts)
     print("self-check ok")
 
 
