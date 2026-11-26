@@ -1114,6 +1114,39 @@ def format_schedule_block_for_notify(
 
 
 TG_TEXT_LIMIT = 4096
+
+
+async def send_rich_html(
+    bot_token: str,
+    chat_id: int,
+    html_body: str,
+    *,
+    message_thread_id: int | None = None,
+    disable_notification: bool = False,
+) -> dict:
+    """Telegram Bot API 10.1+ sendRichMessage (таблиці / rich HTML).
+
+    Звичайний sendMessage + parse_mode=HTML таблиць НЕ підтримує —
+    саме через це лог приходив «обрізаним» plain-fallback.
+    """
+    payload: dict = {
+        "chat_id": chat_id,
+        "rich_message": {"html": html_body},
+    }
+    if message_thread_id is not None:
+        payload["message_thread_id"] = int(message_thread_id)
+    if disable_notification:
+        payload["disable_notification"] = True
+    url = f"https://api.telegram.org/bot{bot_token}/sendRichMessage"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, json=payload)
+        data = r.json()
+        if not data.get("ok"):
+            desc = data.get("description") or r.text
+            raise RuntimeError(f"sendRichMessage failed: {desc}")
+        return data
+
+
 _HTML_TAG_RE = re.compile(
     r"<(/?)(blockquote|b|u|s|i|code|pre|a|tg-spoiler|table|caption|tr|th|td)\b[^>]*>",
     re.IGNORECASE,
@@ -2157,18 +2190,16 @@ def _group_has_signal(rep: dict) -> bool:
 
 
 def _td(val, *, align: str | None = None) -> str:
-    """Комірка таблиці. Без вкладених тегів — Telegram Rich HTML їх часто відхиляє."""
+    """Комірка таблиці. Без вкладених тегів усередині — safer для Rich HTML."""
     s = html.escape(str(val))
     if align in ("left", "right", "center"):
         return f'<td align="{align}">{s}</td>'
     return f"<td>{s}</td>"
 
 
-def _th(val, *, align: str | None = None) -> str:
+def _th(val, *, align: str = "left") -> str:
     s = html.escape(str(val))
-    if align in ("left", "right", "center"):
-        return f'<th align="{align}">{s}</th>'
-    return f"<th>{s}</th>"
+    return f'<th align="{align}">{s}</th>'
 
 
 def _human_run_summary(
@@ -2379,17 +2410,19 @@ def _human_run_summary(
         + "<table bordered striped>"
         "<caption>Підсумок</caption>"
         "<tr>"
-        f"{_th('Показник', align='left')}{_th('Значення', align='right')}"
+        f"{_th('Показник')}{_th('Значення', align='right')}"
         "</tr>"
         "<tr>"
-        f"{_td('У розсилку', align='left')}{_td(n_events, align='right')}"
+        f"{_td('У розсилку', align='left')}{_td(n_events)}"
         "</tr>"
         "<tr>"
-        f"{_td('Отримали', align='left')}{_td(sent, align='right')}"
+        f"{_td('Отримали', align='left')}{_td(sent)}"
         "</tr>"
         "</table>"
         + "\n<i>Детальний звіт у файлі.</i>"
     )
+    if len(short) > TG_TEXT_LIMIT:
+        short = short[: TG_TEXT_LIMIT - 20].rstrip() + "\n…"
     return short, text
 
 
@@ -3173,32 +3206,33 @@ def main() -> int:
             )
 
             if log_chat:
+                # 153 — звичайна гілка «Аварії, ремонти крон»
+                # 17725 — коли є що розсилати (нові / скасування)
                 thread_id = 17725 if n_events > 0 else 153
                 chat_id = int(log_chat)
-                log_text = summary if len(summary) <= TG_TEXT_LIMIT else fit_telegram_html(summary)
                 try:
-                    # Rich HTML: <table bordered striped> + parse_mode=HTML
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=log_text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
+                    # Таблиці працюють ЛИШЕ через sendRichMessage (Bot API 10.1+),
+                    # не через sendMessage + parse_mode=HTML.
+                    await send_rich_html(
+                        bot_token,
+                        chat_id,
+                        summary,
                         message_thread_id=thread_id,
                     )
                 except Exception as e:
-                    # Якщо HTML/table відхилили — шлемо plain, щоб лог усе одно дійшов
                     log.warning(
-                        "log channel HTML fail thread=%s len=%s: %s — fallback plain",
+                        "log channel rich fail thread=%s len=%s: %s — fallback plain",
                         thread_id,
                         len(summary or ""),
                         e,
                     )
                     try:
                         plain = (
-                            f"✅ Перевірка відключень\n"
+                            "✅ Перевірка відключень\n"
                             f"Підписників: {len(users)} · Локацій: {groups_checked}\n"
                             f"У розсилку: {n_events} (нових {n_new}, скасувань {n_cancels})\n"
-                            f"Отримали: {sent} (звук {sent_sound}, тихо {sent_quiet})"
+                            f"Отримали: {sent} (звук {sent_sound}, тихо {sent_quiet})\n"
+                            "(деталі не вдалось відправити як rich message)"
                         )
                         await bot.send_message(
                             chat_id=chat_id,
