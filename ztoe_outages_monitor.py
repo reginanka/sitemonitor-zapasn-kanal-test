@@ -1114,6 +1114,8 @@ def format_schedule_block_for_notify(
 
 
 TG_TEXT_LIMIT = 4096
+# Rich Messages (sendRichMessage): до 32768 UTF-8 символів, до 500 блоків.
+RICH_MSG_LIMIT = 32768
 
 
 async def send_rich_html(
@@ -2202,6 +2204,83 @@ def _th(val, *, align: str = "left") -> str:
     return f'<th align="{align}">{s}</th>'
 
 
+def _log_legend_html() -> str:
+    """Легенда скорочень у таблицях логу (згортається через details)."""
+    return (
+        "<details open>"
+        "<summary>📖 Легенда позначок</summary>"
+        "<p>"
+        "<b>Підсумок:</b> У розсилку — події, які пішли підписникам; "
+        "Нових / Скасувань — окремо; Отримали — скільки людей реально прийняли повідомлення; "
+        "Зі звуком / тихо — з урахуванням quiet hours.<br/>"
+        "<b>Локації з подіями:</b><br/>"
+        "• <b>API</b> — скільки записів повернув ЖОЕ (аварії + плани)<br/>"
+        "• <b>Акт</b> — активних non-ГПВ інтервалів після агрегації по адресі+дню<br/>"
+        "• <b>Нов</b> — нові addr_day (ще не було в знімку)<br/>"
+        "• <b>Змін</b> — зміна періоду (min start / max end)<br/>"
+        "• <b>Fin</b> — кінець урізали і новий кінець уже минув (роботи завершили раніше)<br/>"
+        "• <b>Старт</b> — фактичний старт робіт (пізніший start з accidents)<br/>"
+        "• <b>Зник</b> — записи зникли з API до кінця плану (кандидати на скасування)<br/>"
+        "• <b>Скас</b> — скасування підтверджено (після CANCEL_MISS_RUNS пропусків)<br/>"
+        "• <b>Чек</b> — ще чекають повторної перевірки (miss &lt; порогу)<br/>"
+        "• <b>Збіг</b> — скільки активних подій збіглися з адресами підписників<br/>"
+        "• <b>→Ск</b> — скасувань, що пішли в розсилку конкретному підписнику<br/>"
+        "<b>Деталі:</b> збіг / покрито / пропущено — пояснення по конкретних адресах."
+        "</p>"
+        "</details>"
+    )
+
+
+def _pack_rich_parts(parts: List[str], limit: int = RICH_MSG_LIMIT) -> List[str]:
+    """Складає HTML-блоки логу в кілька rich-повідомлень ≤ limit.
+
+    Не обрізає і не кидає в .txt: при переповненні — нове повідомлення
+    з міткою «Продовження».
+    """
+    if not parts:
+        return []
+    msgs: List[str] = []
+    cur = ""
+    cont = "⚠️ <b>Продовження звіту:</b>"
+    for part in parts:
+        part = (part or "").strip()
+        if not part:
+            continue
+        # Один блок більший за ліміт — рідко (дуже довгий список адрес); ріжемо по рядках
+        if len(part) > limit:
+            if cur:
+                msgs.append(cur)
+                cur = ""
+            # розбити на шматки з запасом
+            chunk_budget = max(1000, limit - 80)
+            buf = ""
+            for line in part.split("\n"):
+                cand = line if not buf else buf + "\n" + line
+                if buf and len(cand) > chunk_budget:
+                    piece = buf if not msgs and not cur else f"{cont}\n\n{buf}"
+                    msgs.append(piece)
+                    buf = line
+                else:
+                    buf = cand
+            if buf:
+                piece = buf if not msgs else f"{cont}\n\n{buf}"
+                msgs.append(piece)
+            continue
+        sep = "\n\n" if cur else ""
+        candidate = f"{cur}{sep}{part}" if cur else part
+        if cur and len(candidate) > limit:
+            msgs.append(cur)
+            cur = f"{cont}\n\n{part}"
+            if len(cur) > limit:
+                msgs.append(cur)
+                cur = ""
+        else:
+            cur = candidate
+    if cur:
+        msgs.append(cur)
+    return msgs
+
+
 def _human_run_summary(
     reports: List[dict],
     *,
@@ -2214,10 +2293,12 @@ def _human_run_summary(
     sent_sound: int,
     sent_quiet: int,
     deliveries: Optional[List[str]] = None,
-) -> Tuple[str, Optional[str]]:
-    """Звіт у лог-групу через Telegram Rich HTML <table>.
+) -> List[str]:
+    """Звіт у лог-групу через Telegram Rich HTML (sendRichMessage).
 
-    Тихі локації без сигналу (лише unmatched / штиль) — не додаємо.
+    Тихі локації без сигналу — не додаємо.
+    Ліміт RICH_MSG_LIMIT (32768): при перевищенні ділимо на кілька
+    повідомлень, без .txt-вкладення.
     """
     signal_reps: List[dict] = []
     fail_reps: List[dict] = []
@@ -2241,7 +2322,6 @@ def _human_run_summary(
 
     parts: List[str] = [header]
 
-    # Підсумкова таблиця прогону
     parts.append(
         "<table bordered striped>"
         "<caption>Підсумок</caption>"
@@ -2331,7 +2411,6 @@ def _human_run_summary(
             + "</table>"
         )
 
-        # Деталі: збіг адрес / covered / skipped — друга таблиця, якщо є що показати
         detail_rows = []
         for rep in signal_reps:
             title = (rep.get("city_name") or "").strip() or f"id:{rep.get('city_id') or rep.get('otg_id')}"
@@ -2400,30 +2479,9 @@ def _human_run_summary(
             + "</table>"
         )
 
-    text = "\n".join(parts)
-    if len(text) <= TG_TEXT_LIMIT:
-        return text, None
+    parts.append(_log_legend_html())
+    return _pack_rich_parts(parts, RICH_MSG_LIMIT)
 
-    short = (
-        header
-        + "\n"
-        + "<table bordered striped>"
-        "<caption>Підсумок</caption>"
-        "<tr>"
-        f"{_th('Показник')}{_th('Значення', align='right')}"
-        "</tr>"
-        "<tr>"
-        f"{_td('У розсилку', align='left')}{_td(n_events)}"
-        "</tr>"
-        "<tr>"
-        f"{_td('Отримали', align='left')}{_td(sent)}"
-        "</tr>"
-        "</table>"
-        + "\n<i>Детальний звіт у файлі.</i>"
-    )
-    if len(short) > TG_TEXT_LIMIT:
-        short = short[: TG_TEXT_LIMIT - 20].rstrip() + "\n…"
-    return short, text
 
 
 def main() -> int:
@@ -3183,7 +3241,7 @@ def main() -> int:
                 )
                 await asyncio.sleep(0.35)
 
-            summary, attachment = _human_run_summary(
+            log_msgs = _human_run_summary(
                 group_reports,
                 users=len(users),
                 groups_checked=groups_checked,
@@ -3196,13 +3254,14 @@ def main() -> int:
                 deliveries=deliveries,
             )
             log.info(
-                "підсумок subscribers=%s locations=%s events=%s sent=%s sound=%s quiet=%s",
+                "підсумок subscribers=%s locations=%s events=%s sent=%s sound=%s quiet=%s log_parts=%s",
                 len(users),
                 groups_checked,
                 n_events,
                 sent,
                 sent_sound,
                 sent_quiet,
+                len(log_msgs),
             )
 
             if log_chat:
@@ -3210,49 +3269,44 @@ def main() -> int:
                 # 17725 — коли є що розсилати (нові / скасування)
                 thread_id = 17725 if n_events > 0 else 153
                 chat_id = int(log_chat)
-                try:
-                    # Таблиці працюють ЛИШЕ через sendRichMessage (Bot API 10.1+),
-                    # не через sendMessage + parse_mode=HTML.
-                    await send_rich_html(
-                        bot_token,
-                        chat_id,
-                        summary,
-                        message_thread_id=thread_id,
-                    )
-                except Exception as e:
-                    log.warning(
-                        "log channel rich fail thread=%s len=%s: %s — fallback plain",
-                        thread_id,
-                        len(summary or ""),
-                        e,
-                    )
+                for part_i, log_html in enumerate(log_msgs):
                     try:
-                        plain = (
-                            "✅ Перевірка відключень\n"
-                            f"Підписників: {len(users)} · Локацій: {groups_checked}\n"
-                            f"У розсилку: {n_events} (нових {n_new}, скасувань {n_cancels})\n"
-                            f"Отримали: {sent} (звук {sent_sound}, тихо {sent_quiet})\n"
-                            "(деталі не вдалось відправити як rich message)"
-                        )
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=plain,
-                            disable_web_page_preview=True,
-                            message_thread_id=thread_id,
-                        )
-                    except Exception as e2:
-                        log.warning("log channel plain fail: %s", e2)
-                if attachment:
-                    try:
-                        doc = BytesIO(attachment.encode("utf-8"))
-                        doc.name = "outages-log.txt"
-                        await bot.send_document(
-                            chat_id=chat_id,
-                            document=doc,
+                        # Таблиці — лише sendRichMessage (Bot API 10.1+).
+                        # Ліміт 32768; кілька частин замість .txt.
+                        await send_rich_html(
+                            bot_token,
+                            chat_id,
+                            log_html,
                             message_thread_id=thread_id,
                         )
                     except Exception as e:
-                        log.warning("log channel doc: %s", e)
+                        log.warning(
+                            "log channel rich fail part=%s/%s thread=%s len=%s: %s",
+                            part_i + 1,
+                            len(log_msgs),
+                            thread_id,
+                            len(log_html or ""),
+                            e,
+                        )
+                        if part_i == 0:
+                            try:
+                                plain = (
+                                    "✅ Перевірка відключень\n"
+                                    f"Підписників: {len(users)} · Локацій: {groups_checked}\n"
+                                    f"У розсилку: {n_events} (нових {n_new}, скасувань {n_cancels})\n"
+                                    f"Отримали: {sent} (звук {sent_sound}, тихо {sent_quiet})\n"
+                                    "(rich message не прийнято — див. Actions log)"
+                                )
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=plain,
+                                    disable_web_page_preview=True,
+                                    message_thread_id=thread_id,
+                                )
+                            except Exception as e2:
+                                log.warning("log channel plain fail: %s", e2)
+                    if part_i + 1 < len(log_msgs):
+                        await asyncio.sleep(0.35)
         finally:
             await bot.shutdown()
 
