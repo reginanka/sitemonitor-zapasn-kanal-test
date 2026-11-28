@@ -1387,6 +1387,7 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
     (гібрид і так бере статику; dynamic лише як підстраховка).
     """
     global _REM_STREETS_DYNAMIC, _REM_CITIES_DYNAMIC, _OBLAST_STREETS_DYNAMIC, _OBLAST_CITIES_DYNAMIC
+    global _PER_CITY_STREETS
     if not API_BASE or not accidents:
         return {}
 
@@ -1418,6 +1419,7 @@ def fetch_city_street_totals(accidents: List[dict]) -> Dict[Tuple[str, str], int
             continue
         per_city[cid] += 1
 
+    _PER_CITY_STREETS = dict(per_city)  # кеш для підрахунку ремонтів
     totals = city_street_totals_from(accidents, per_city)
     log_to_buffer(
         f"Довідник вулиць н.п.: {len(totals)} (streets={len(streets)})"
@@ -1660,6 +1662,49 @@ def is_currently_active(doc: dict, now: datetime | None = None) -> bool:
     return now <= end
 
 
+# Ремонти (режим «Ремонти» на мапі): активні зараз відключення, які НЕ є
+# аваріями (ГАВ/СГАВ) і НЕ є ГПВ — тобто планові/ремонтні.
+# Збираються тим самим проходом по /pw_accidents; логіка аварій/алертів не змінена.
+_REPAIRS: List[dict] = []
+# city id → кількість вулиць (кеш з /pw_streets; None — ще не завантажено)
+_PER_CITY_STREETS: Dict[int, int] | None = None
+
+
+def is_repair(doc: dict) -> bool:
+    """Ремонтне/планове відключення: не ГПВ і не аварія (ГАВ/СГАВ)."""
+    koment = (doc.get("koment") or doc.get("comment") or "").upper()
+    if "ГПВ" in koment:
+        return False
+    type_name = (
+        doc.get("type_name")
+        or doc.get("typeName")
+        or doc.get("typeOffName")
+        or ""
+    )
+    if isinstance(type_name, str):
+        tn = type_name.lower()
+        if "погодин" in tn or "гпв" in tn:
+            return False
+    try:
+        sub = int(doc.get("switchSubReason") or 0)
+    except (TypeError, ValueError):
+        sub = 0
+    if sub == 2:
+        return False  # ГПВ
+    return not is_real_accident(doc)
+
+
+def _collect_repairs(records: List[dict], now: datetime) -> None:
+    """Запам'ятовує активні ремонти з тих самих записів API."""
+    global _REPAIRS
+    try:
+        _REPAIRS = [x for x in records if is_repair(x) and is_currently_active(x, now)]
+        log_to_buffer(f"Ремонти (активні, не аварії/ГПВ): {len(_REPAIRS)}")
+    except Exception as e:
+        _REPAIRS = []
+        log_to_buffer(f"⚠️ Збір ремонтів не вдався: {e}")
+
+
 def _note_city_rems(accidents: List[dict]) -> None:
     """city id → РЕМ з усіх записів API, включно з ГПВ. Картку міста не чіпаємо."""
     global _CITY_REM_VOTES, _CITY_REM_NAMES
@@ -1706,6 +1751,7 @@ def fetch_all_accidents() -> List[dict]:
                 log_to_buffer(f"API: list → {len(data)} записів")
                 _note_city_rems(data)
                 now = datetime.now(timezone.utc)
+                _collect_repairs(data, now)
                 filtered = [
                     x for x in data
                     if is_real_accident(x) and is_currently_active(x, now)
@@ -1720,6 +1766,7 @@ def fetch_all_accidents() -> List[dict]:
                 log_to_buffer(f"API: pagination=false → {len(batch)} записів")
                 _note_city_rems(batch)
                 now = datetime.now(timezone.utc)
+                _collect_repairs(batch, now)
                 filtered = [
                     x for x in batch
                     if is_real_accident(x) and is_currently_active(x, now)
@@ -1753,6 +1800,7 @@ def fetch_all_accidents() -> List[dict]:
     _note_city_rems(items)
     raw_n = len(items)
     now = datetime.now(timezone.utc)
+    _collect_repairs(items, now)
     items = [
         a for a in items
         if is_real_accident(a) and is_currently_active(a, now)
@@ -2259,10 +2307,44 @@ def build_map_payload(
     return outages_data, summary_data, raions_data
 
 
+def build_repairs_block() -> Dict[str, Any] | None:
+    """
+    Блок `repairs` для outages.json (та сама структура, що й корінь):
+    updated_at, summary, raions, data. Якщо ремонтів немає — порожні
+    data/raions і summary з нулями. При помилці повертає None
+    (тоді блок просто не додається, аварійний режим не страждає).
+    """
+    try:
+        repairs = list(_REPAIRS)
+        totals: Dict[Tuple[str, str], int] = {}
+        if repairs:
+            if _PER_CITY_STREETS:
+                totals = city_street_totals_from(repairs, _PER_CITY_STREETS)
+            else:
+                totals = fetch_city_street_totals(repairs)
+        stats = aggregate(repairs, totals or None)
+        outages, summary, raions = build_map_payload(stats, totals or None)
+        log_to_buffer(
+            f"🛠 repairs для карти: records={stats['total_records']} "
+            f"streets={stats['total_streets']} cities={stats['total_cities']} "
+            f"н.п. у data={len(outages)} районів={len(raions)}"
+        )
+        return {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+            "raions": raions,
+            "data": outages,
+        }
+    except Exception as e:
+        log_to_buffer(f"⚠️ Блок repairs не сформовано: {e}")
+        return None
+
+
 def push_outages_to_github(
     outages_data: dict,
     summary_data: dict | None = None,
     raions_data: list | None = None,
+    repairs_data: dict | None = None,
 ) -> None:
     """
     Оновлює файл через GitHub Contents API.
@@ -2288,6 +2370,8 @@ def push_outages_to_github(
         payload["summary"] = summary_data
     if raions_data:
         payload["raions"] = raions_data
+    if repairs_data is not None:
+        payload["repairs"] = repairs_data
 
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     headers = {
@@ -2392,7 +2476,10 @@ def main() -> int:
         # оновлення карти (порожній стан)
         try:
             outages_data, summary_data, raions_data = build_map_payload(stats, None)
-            push_outages_to_github(outages_data, summary_data, raions_data)
+            push_outages_to_github(
+                outages_data, summary_data, raions_data,
+                repairs_data=build_repairs_block(),
+            )
         except Exception as e:
             log_to_buffer(f"❌ GitHub map push failed: {e}")
         # при порожньому API в канал не шлемо (база оновлена)
@@ -2456,7 +2543,10 @@ def main() -> int:
         outages_data, summary_data, raions_data = build_map_payload(
             stats, city_street_totals
         )
-        push_outages_to_github(outages_data, summary_data, raions_data)
+        push_outages_to_github(
+            outages_data, summary_data, raions_data,
+            repairs_data=build_repairs_block(),
+        )
     except Exception as e:
         log_to_buffer(f"❌ GitHub map push failed: {e}")
 
